@@ -42,7 +42,7 @@ class BunnyLink:
 class BunnyNode(Node):
     def __init__(self):
         super().__init__("bunny_node")
-        self.declare_parameter("host", "192.168.4.26")   # Bunny on Wi-Fi (wired link 192.168.7.2 removed 2026-09-27); self.declare_parameter("port", 7801)
+        self.declare_parameter("host", "192.168.4.26"); self.declare_parameter("port", 7801)   # Bunny on Wi-Fi (wired 192.168.7.2 gone 2026-09-27)
         self.link = BunnyLink(self.get_parameter("host").value, self.get_parameter("port").value)
         cb = ReentrantCallbackGroup(); self.cb = cb
         self.pub_status = self.create_publisher(String, "/bunny/status", 10)
