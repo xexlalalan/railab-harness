@@ -1,0 +1,9 @@
+float64[6] joints_rad
+int32 speed_percent       # 0 = node default
+float64 timeout_s         # 0 = node default
+---
+bool success
+string message
+float64[6] final_joints_rad
+---
+float64 max_joint_error_rad

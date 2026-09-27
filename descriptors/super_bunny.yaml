@@ -1,0 +1,22 @@
+# Module descriptor: Weighing Super Bunny (one file per module TYPE; per-device deltas live in calib/modules/<serial>.yaml)
+module: super_bunny
+version: 2
+frame:
+  # Module frame = main-tag frame re-oriented (DECIDED 2026-09-18 with the operator):
+  #   x = to the RIGHT as the camera sees the main tag (tag x), y = INTO the Bunny (= -tag z), z = UP (= tag y)
+  #   -> right-handed. Operator's numbers were given as (x left, y in, z up): only x is sign-flipped.
+  origin: main_tag_centre
+  from_main_tag_rpy_deg: [-90, 0, 0]      # p_tag = Rx(-90 deg) . p_module
+tags:
+  family: tag16h5
+  layout:
+    - {id: 5, role: main, size_mm: 35.8, white_mm: 48, xyz_mm: [0, 0, 0], rpy_deg: [0, 0, 0],
+       note: "front face, nearly vertical (normal 4 deg up); 35.8 mm from the range-scale test 2026-09-18 (camera backed off 120 mm along its axis: PnP slope 0.771 with 27.6 assumed); calipers pending"}
+    - {id: 3, role: platform, size_mm: 7.5, white_mm: 10, xyz_mm: [-24.6, 58.7, 174.9], rough_mm: 3, rpy_deg: [0, 0, 0],
+       faces: same_as_main, moves_along: [0, 0, 1],
+       note: "MEASURED 2026-09-18 night with the CORRECTED kinematic model (5-view cross, 0.5 mm uncertainty): -24.6 right, 58.7 behind the main-tag face, 174.9 up. The old-model value [17, 56, 212] was 40 mm off in x and z (j5 zero error). Platform z as found tonight; changes if the platform is moved"}
+    # - {id: ?, role: plate, size_mm: ?, xyz_mm: [?, ?, ?]}   # receiving plate (task IV, pending)
+footprint_mm: [420, 380, 600]
+handoffs: {}                               # dispenser_mount / vial_place: operator to supply (task IV)
+interface: {kind: tcp_json, discovery: static}
+requires: {shield: open}

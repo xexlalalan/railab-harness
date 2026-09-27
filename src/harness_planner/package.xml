@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>harness_planner</name>
+  <version>0.1.0</version>
+  <description>Compound operations (workflows) composed only from module services/actions: fill-to-mark, ...</description>
+  <maintainer email="xexlalalan@gmail.com">bunny-harness</maintainer>
+  <license>Proprietary</license>
+  <depend>rclpy</depend><depend>std_srvs</depend><depend>std_msgs</depend><depend>harness_msgs</depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

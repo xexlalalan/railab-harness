@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>harness_instrument</name>
+  <version>0.1.0</version>
+  <description>Bunny bridge node: the Bunny's harness_server (TCP/JSON) as ROS services and topics under /bunny.</description>
+  <maintainer email="xexlalalan@gmail.com">bunny-harness</maintainer>
+  <license>Proprietary</license>
+  <depend>rclpy</depend><depend>std_srvs</depend><depend>std_msgs</depend><depend>harness_msgs</depend>
+  <export><build_type>ament_python</build_type></export>
+</package>

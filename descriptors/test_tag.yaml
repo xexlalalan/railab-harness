@@ -1,0 +1,8 @@
+module: test_tag                            # the flat 32 mm calibration tag on the table (not a real module)
+version: 1
+tags:
+  family: tag16h5
+  layout:
+    - {id: 7, role: main, size_mm: 34.7, xyz_mm: [0, 0, 0], rpy_deg: [0, 0, 0]}
+footprint_mm: [60, 60, 1]
+handoffs: {}

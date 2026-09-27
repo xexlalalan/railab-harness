@@ -1,0 +1,20 @@
+model: piper MDH (pyAgxArm ROBOT_MDH_PRESET["piper"])
+joint_zero_offsets_rad:
+- 0.0
+- -0.02542480481091465
+- 0.014150517310384102
+- 0.00579682106037128
+- -0.12895553560801673
+- 0.0
+joint_zero_offsets_deg:
+- 0.0
+- -1.457
+- 0.811
+- 0.332
+- -7.389
+- 0.0
+note: 'theta_i = q_reported_i + mdh_offset_i + joint_zero_offset_i. j1, j6 fixed 0
+  (unobservable). COMBINED fit 2026-09-18 late: 76 samples of wall tag 8 from two
+  sessions (camera mounts A and B), one shared tag pose, one set of offsets; rms 2.2
+  mm. j5 is the robust one (-7.4..-7.5 in every fit); j2/j3 are weakly determined.'
+date: '2026-09-18T20:44:09'

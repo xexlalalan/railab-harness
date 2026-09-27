@@ -1,0 +1,6 @@
+float64 timeout_s         # wait this long for the next scan
+---
+bool success
+string code
+string name               # powder name from the Bunny's database, empty if unknown
+string message

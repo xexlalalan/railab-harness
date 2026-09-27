@@ -1,0 +1,6 @@
+float64 mm                # distance (relative) or position (absolute); + = camera DOWN
+bool absolute
+---
+bool success
+float64 z                 # position after the move (mm from the set zero)
+string message

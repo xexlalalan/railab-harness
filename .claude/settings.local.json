@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//mnt/c/**)",
+      "Bash(timeout 60 powershell.exe -NoProfile -Command \"wsl -d Ubuntu -e bash -lc 'cat /etc/os-release | head -2; python3 -V; which pip3; ls /usr/bin/python3.*'\")"
+    ],
+    "additionalDirectories": [
+      "/home/xexlalalan/dilute-to-volume-dev",
+      "/home/xexlalalan/bunny-dev"
+    ]
+  }
+}

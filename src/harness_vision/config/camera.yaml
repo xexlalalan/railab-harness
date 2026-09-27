@@ -1,0 +1,16 @@
+tag_node:
+  ros__parameters:
+    width: 1280
+    height: 720
+    fps: 30
+    family: "tag16h5"           # the lab tags are 16h5 (ID 7 on the test tag)
+    tag_size_m: 0.05            # Bunny tags (16h5): 50 mm black square (operator, 2026-09-17)
+    tag_sizes_ids: [7, 5, 3, 8]    # per-id overrides (black-square edge)
+    tag_sizes_m: [0.0347, 0.0358, 0.0075, 0.0347] # id 7 table tag 34.7 (stereo depth, square-on); id 5 bunny main 35.8 (range-scale test 2026-09-18); id 3 platform 7.5 (10 mm sticker x 6/8); calipers pending
+    center_fraction: 0.3333     # central square side = fraction of image height
+    min_size_px: 40             # "set" needs mean edge length within [min, max] px (standoff gate); 40 for the 7.5 mm platform tag
+    max_size_px: 260
+    image_rate_hz: 10.0         # /camera/image/compressed publish rate (with overlay)
+    jpeg_quality: 70
+    exposure_us: 0              # 0 = auto exposure
+    error_correction_rate: 0.0  # exact code match; 16h5 flips IDs (7 -> 5) with the OpenCV default 0.6

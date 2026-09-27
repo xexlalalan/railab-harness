@@ -1,0 +1,5 @@
+float64 mm                # open the V-blocks by this gap change (mm)
+---
+bool success
+float64 angle_deg         # motor multi-turn angle after the move
+string message

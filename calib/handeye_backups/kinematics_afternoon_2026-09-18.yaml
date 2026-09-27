@@ -1,0 +1,19 @@
+model: piper MDH (pyAgxArm ROBOT_MDH_PRESET["piper"])
+joint_zero_offsets_rad:
+- 0.0
+- -0.03300070279396688
+- 0.03430081061742209
+- 0.007932532457768239
+- -0.1305609950991892
+- 0.0
+joint_zero_offsets_deg:
+- 0.0
+- -1.891
+- 1.965
+- 0.455
+- -7.481
+- 0.0
+note: 'theta_i = q_reported_i + mdh_offset_i + joint_zero_offset_i. j1 and j6 fixed
+  at 0 (unobservable: absorbed by tag pose / hand-eye roll). Fitted 2026-09-18 from
+  52 tag-8 samples; residual 11.4 -> 1.6 mm rms.'
+date: '2026-09-18T16:02:43'

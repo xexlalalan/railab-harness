@@ -1,0 +1,12 @@
+# Flange pose in arm_base: x y z (m), roll pitch yaw (rad, fixed-axis XYZ as the PIPER reports it)
+float64[6] pose
+bool linear               # true = move_l (straight line), false = move_p (joint-interpolated to the pose)
+int32 speed_percent
+float64 timeout_s
+---
+bool success
+string message
+float64[6] final_pose
+---
+float64 position_error_m
+float64 orientation_error_rad

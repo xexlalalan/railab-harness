@@ -1,0 +1,6 @@
+int32[] joints            # joint numbers 1..6 (7 = gripper); empty = all six arm joints
+bool enable               # true = power (hold), false = release (free)
+---
+bool success
+bool[6] joints_enabled    # state after the call, from feedback
+string message

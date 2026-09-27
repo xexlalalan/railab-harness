@@ -1,0 +1,19 @@
+platform_view:
+  name: platform_view
+  date: '2026-09-18T02:36:25'
+  joints_rad:
+  - 0.28502972014319394
+  - 1.5212638826232976
+  - -1.0062695802373307
+  - -1.0074564041286869
+  - 0.33857642159438
+  - 1.1614118974471066
+  flange_xyzrpy:
+  - 0.326978
+  - 0.06917899999999999
+  - 0.27266599999999996
+  - -3.1195491451371042
+  - 0.9850812831181197
+  - 3.109373875597978
+  note: 'camera 91 mm from the Bunny platform tag 3, tip 40 mm clear; return with:
+    harness arm goto platform_view (move_pose then move_j snap)'

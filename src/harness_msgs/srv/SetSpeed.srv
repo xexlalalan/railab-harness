@@ -1,0 +1,4 @@
+int32 percent             # 1..100
+---
+bool success
+string message

@@ -1,0 +1,13 @@
+# Bunny Harness runtime
+pyAgxArm @ git+https://github.com/agilexrobotics/pyAgxArm.git@8cd90f9106219a156c3c0d7e58ee36d838a89baf
+python-can>=4.6
+numpy>=2.0            # frames, transforms, pose math
+scipy>=1.14           # scipy.spatial.transform.Rotation, least squares fits
+jsonschema>=4.23      # validate Opentrons Labware Schema v2 definitions
+pyyaml>=6.0           # config files (station map, calibration store)
+
+# development
+pytest>=8.3
+ruff>=0.6
+pyrealsense2>=2.56
+opencv-python-headless>=4.10

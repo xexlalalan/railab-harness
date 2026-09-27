@@ -1,0 +1,36 @@
+piper:
+  ros__parameters:
+    can_channel: "can0"
+    rate_hz: 100.0
+    default_speed_percent: 10
+    max_speed_percent: 30          # hard cap this sprint; raise deliberately
+    watchdog_s: 0.25               # feedback silence that triggers auto-disable
+    move_timeout_s: 30.0
+    max_joint_delta_rad: 1.2       # one goal may not ask any joint to jump further than this (~70 deg)
+    pose_max_joint_delta_rad: 1.2  # Cartesian move: freeze if any joint runs >1.2 rad from its start (IK branch flip guard, 2026-09-18)
+    joint_tol_rad: 0.01
+    pos_tol_m: 0.003
+    ang_tol_rad: 0.03
+    settle_samples: 5              # consecutive in-tolerance samples at 20 Hz
+    workspace_min: [-0.70, -0.70, -0.05]   # arm_base frame, metres (the floor is guarded by the tip check below, not by this box)
+    workspace_max: [ 0.70,  0.70,  0.90]
+    floor_enabled: true            # from 'ros2 run harness_calibration floor' 2026-09-17: 181 samples, 23x23 cm, rms 2.2 / max 4.8 mm
+    floor_plane: [-0.01221, -0.00446, 0.00453]   # base frame z = a*x + b*y + c (m); both 2026-09-18 drags with the 4-parameter wrist model: tilt 0.74 deg, rms 1.74 mm
+    tcp_offset_m: 0.1441           # finger set #3, gripper base face -> fingertip, from the floor fit; ruler check welcome
+    floor_margin_m: 0.015          # 10 mm requested safe space + 5 mm fit uncertainty; targets closer than this are refused
+    gripper_enabled: true
+    gripper_max_m: 0.0896          # = gripper_travel_m * gripper_scale
+    gripper_inverted: true         # fingers mounted reversed 2026-09-18: motor open = jaws closed
+    gripper_travel_m: 0.0896       # raw reading at zero gap; set 2026-09-19 from the operator-set 20.00 mm gap (raw 0.0696); was 0.0967
+    gripper_scale: 1.0             # physical gap per raw metre; set from a caliper measurement of the full-open gap
+    gripper_force: 1.0
+    gripper_tol_m: 0.002
+    gripper_timeout_s: 4.0
+    # --- corrected kinematic model (2026-09-18): harness FK/IK over the SDK MDH table + joint zero offsets
+    kinematics_file: /home/bunny-harness/bunny-harness-dev/calib/kinematics.yaml
+    kinematics_model: piper
+    ik_limit_margin_rad: 0.02
+    linear_step_m: 0.02
+    linear_step_rad: 0.1
+    pose_total_jump_rad: 2.5       # point-to-point move_pose: split into joint via points up to this total jump; beyond = refused
+    stall_s: 2.0                   # move fails fast if the joints stop short of the target for this long (controller limit clamp)

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# `harness <module> <command> ...` — every module operation from one shell command (see harness --help).
+# A background helper (tools/harness_cmd.py --serve) keeps the ROS clients alive, so a command answers at once.
+cd "$(dirname "$(readlink -f "$0")")/.."
+SOCK=/tmp/harness_cmd.sock
+case "$1" in
+  daemon-stop) pkill -f "harness_cmd.py --serve"; rm -f $SOCK; echo stopped; exit 0 ;;
+  arm)
+    case "$2" in
+      teach|locate) source rosenv.sh; exec ros2 run harness_calibration "$2" "${@:3}" ;;
+    esac ;;
+esac
+if [ ! -S $SOCK ] || ! pgrep -f "harness_cmd.py --serve" >/dev/null; then
+  ( source rosenv.sh; nohup python3 tools/harness_cmd.py --serve >/tmp/harness_cmd.log 2>&1 & )
+  for i in $(seq 1 50); do [ -S $SOCK ] && break; sleep 0.1; done
+  sleep 1.5   # first start only: let ROS discovery find the nodes
+fi
+exec python3 tools/harness_cmd.py "$@"

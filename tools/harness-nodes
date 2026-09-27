@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# harness-nodes start|stop|status — the module nodes on the harness PC and the harness server on the Bunny.
+cd "$(dirname "$(readlink -f "$0")")/.."
+source rosenv.sh 2>/dev/null
+start_bg() { pgrep -f "$2" >/dev/null && { echo "$1: already running"; return; }; setsid nohup $3 >/tmp/$1.log 2>&1 </dev/null & echo "$1: started"; }
+case "$1" in
+  start)
+    start_bg piper     "harness_arm/piper_nod[e]"        "ros2 launch harness_arm piper.launch.py"
+    start_bg camera    "harness_vision/tag_nod[e]"       "ros2 launch harness_vision camera.launch.py"
+    start_bg dtv_node  "harness_dtv/dtv_nod[e]"          "ros2 run harness_dtv dtv_node"
+    start_bg bunny_node "harness_instrument/bunny_nod[e]" "ros2 run harness_instrument bunny_node"
+    if ssh -o ConnectTimeout=3 bunny 'pgrep -f "main.py harnes[s]" >/dev/null'; then echo "bunny server: already running"
+    else ssh bunny 'cd ~/bunny-dev/python && setsid nohup ~/bunny-venv/bin/python3 -u main.py harness >~/harness_server.log 2>&1 </dev/null &' && echo "bunny server: started"; fi ;;
+  stop)
+    pkill -f "harness_dtv/dtv_nod[e]"; pkill -f "harness_instrument/bunny_nod[e]"; pkill -f "harness_cmd.py --serv[e]"
+    ssh -o ConnectTimeout=3 bunny 'pkill -f harness_serve[r]' ; echo "stopped dtv node, bunny node, CLI daemon, Bunny server (arm and camera nodes left running)" ;;
+  status)
+    timeout 10 ros2 node list 2>/dev/null; ssh -o ConnectTimeout=3 bunny 'pgrep -f "main.py harnes[s]" >/dev/null && echo "bunny server: running" || echo "bunny server: NOT running"' ;;
+  *) echo "usage: harness-nodes start|stop|status" ;;
+esac

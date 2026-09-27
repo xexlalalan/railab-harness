@@ -1,0 +1,8 @@
+float64 width_m           # target opening, 0 = closed
+float64 force             # 0..1 (SDK units), 0 = use default
+float64 timeout_s         # 0 = default
+---
+bool success              # reached width, or stalled on an object (see stalled)
+bool stalled              # width stopped changing before reaching target (object in the jaws)
+float64 width_m           # final width
+string message

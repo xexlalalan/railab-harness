@@ -1,0 +1,8 @@
+float64 target_g
+string material           # "powder" | "liquid"
+string powder_id          # optional, powder only; empty = measure the powder fresh (debug mode)
+---
+bool success
+string outcome            # finished | stopped | bottle empty | error text
+float64 actual_g
+string message

@@ -1,0 +1,7 @@
+int32 steps               # pump stepper steps, + = liquid out; a negative value pulls
+int32 rate                # steps/s, 0 = Bunny default
+bool wait                 # true = return when the pump has stopped
+---
+bool success
+int32 steps_done          # steps confirmed by the pump (wait=true) or accepted (wait=false)
+string message

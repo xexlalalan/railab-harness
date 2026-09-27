@@ -1,0 +1,22 @@
+model: piper MDH (pyAgxArm ROBOT_MDH_PRESET["piper"])
+joint_zero_offsets_rad:
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- -0.09331826343622325
+- 0.0
+joint_zero_offsets_deg:
+- 0.0
+- 0.0
+- 0.0
+- 0.0
+- -5.347
+- 0.0
+note: 'theta_i = q_reported_i + mdh_offset_i + joint_zero_offset_i. 2026-09-18 night:
+  j5 ONLY, from 48 samples of wall tag 8 over 6 clearly different arm postures taken
+  in one go (rms 2.6 mm; unseen-posture prediction 4.0 mm). Earlier -7.4 deg came
+  from single-posture data where camera tilt and j5 trade off; with 7 postures -7.4
+  misfits by 8.6 mm. Floor drags are flat between -5 and -7.5 (1.6-1.8 mm). j2..j4
+  not significant.'
+date: '2026-09-18T21:21:35'
