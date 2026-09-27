@@ -13,6 +13,6 @@ esac
 if [ ! -S $SOCK ] || ! pgrep -f "harness_cmd.py --serve" >/dev/null; then
   ( source rosenv.sh; nohup python3 tools/harness_cmd.py --serve >/tmp/harness_cmd.log 2>&1 & )
   for i in $(seq 1 50); do [ -S $SOCK ] && break; sleep 0.1; done
-  sleep 1.5   # first start only: let ROS discovery find the nodes
+  sleep 3     # first start only: let ROS discovery deliver the 2 Hz status topics
 fi
 exec python3 tools/harness_cmd.py "$@"
