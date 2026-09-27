@@ -10,7 +10,7 @@ case "$1" in
     start_bg dtv_node  "harness_dtv/dtv_nod[e]"          "ros2 run harness_dtv dtv_node"
     start_bg bunny_node "harness_instrument/bunny_nod[e]" "ros2 run harness_instrument bunny_node"
     if ssh -o ConnectTimeout=3 bunny 'pgrep -f "main.py harnes[s]" >/dev/null'; then echo "bunny server: already running"
-    else ssh bunny 'cd ~/bunny-dev/python && setsid nohup ~/bunny-venv/bin/python3 -u main.py harness >~/harness_server.log 2>&1 </dev/null &' && echo "bunny server: started"; fi ;;
+    else ssh bunny 'cd ~/bunny-dev/python && (setsid nohup ~/bunny-venv/bin/python3 -u main.py harness >~/harness_server.log 2>&1 </dev/null &); exit' && echo "bunny server: started"; fi ;;
   stop)
     pkill -f "harness_dtv/dtv_nod[e]"; pkill -f "harness_instrument/bunny_nod[e]"; pkill -f "harness_cmd.py --serv[e]"
     ssh -o ConnectTimeout=3 bunny 'pkill -f harness_serve[r]' ; echo "stopped dtv node, bunny node, CLI daemon, Bunny server (arm and camera nodes left running)" ;;
