@@ -6,3 +6,4 @@ ros-venv/
 __pycache__/
 *.pyc
 calib/*.bak
+src/harness_dtv
