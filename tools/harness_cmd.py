@@ -16,8 +16,8 @@ harness arm    teach ... | locate ...               (runs the calibration progra
 harness bunny  status | weight | tare | abort | barcode [timeout_s]
 harness bunny  housing open | close | release
 harness bunny  weigh-to <g> [powder|liquid] [powder_id]
-harness bunny  liquid push [rate] | pull [rate]        continuous flow until Ctrl-C (or harness bunny liquid stop)
-harness bunny  liquid dose <steps> [rate] | weigh <g> | suck | stop | pos   (dose: bounded, + out / - in)
+harness bunny  liquid push <steps> [rate] | pull <steps> [rate]   one continuous move (default 1200 steps/s)
+harness bunny  liquid weigh <g> | suck | stop | pos
 harness bunny  load begin | end
 harness bunny  gantry park | jog <dx> <dy> <dz_up>   (mm; not on a Bunny without a gantry)
 harness dtv    status | lines | frame [file.png]
@@ -146,24 +146,9 @@ def serve():
         if c == "liquid" and len(w) > 1:
             s = w[1]
             if s == "weigh" and len(w) > 2: return do_bunny(["weigh-to", w[2], "liquid"], out, cancelled)
-            if s in ("push", "pull"):
-                rate = int(float(w[2])) if len(w) > 2 else 0; d = 1 if s == "push" else -1
-                out("%s continuously%s ... Ctrl-C to stop" % ("pushing liquid out" if d > 0 else "pulling liquid back", " at %d steps/s" % rate if rate else ""))
-                t0 = time.time(); last_print = 0.0
-                try:
-                    while not cancelled():
-                        r, err = call(LiquidRun, "/bunny/liquid_run", LiquidRun.Request(rate=rate, direction=d), 5)
-                        if err or not r.success: return "FAILED " + (err or r.message)
-                        if time.time() - last_print > 1.0:
-                            last_print = time.time(); st = fresh("bunny", 3.0); p = (st or {}).get("pump") or {}
-                            out("%5.1fs  pump x=%s" % (time.time() - t0, p.get("x")))
-                        time.sleep(0.4)
-                finally:
-                    trig("/bunny/liquid_stop", 10)
-                return "OK stopped after %.1f s" % (time.time() - t0)
-            if s == "dose" and len(w) > 2:
-                steps = int(float(w[2])); rate = int(float(w[3])) if len(w) > 3 else 0
-                r, err = call(LiquidPush, "/bunny/liquid_push", LiquidPush.Request(steps=steps, rate=rate, wait=True), 120)
+            if s in ("push", "pull") and len(w) > 2:
+                steps = int(float(w[2])) * (1 if s == "push" else -1); rate = int(float(w[3])) if len(w) > 3 else 1200
+                r, err = call(LiquidPush, "/bunny/liquid_push", LiquidPush.Request(steps=steps, rate=rate, wait=True), abs(steps) / max(rate, 20) + 30)
                 if err: return "FAILED " + err
                 return ("OK %d steps" % r.steps_done) if r.success else "FAILED " + r.message
             if s in ("suck", "stop"): return trig("/bunny/liquid_" + s, 15)
