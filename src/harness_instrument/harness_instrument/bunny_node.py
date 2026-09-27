@@ -3,7 +3,7 @@
 
 Services (std_srvs/Trigger unless noted): housing_open, housing_close, housing_release, tare, abort,
 load_begin, load_end, liquid_suck, liquid_stop, gantry_park; weigh_to (WeighTo), liquid_push
-(LiquidPush), barcode_read (Barcode), gantry_jog (GantryJog), locate (Trigger).
+(LiquidPush), liquid_run (LiquidRun, continuous, caller re-calls every <1 s), barcode_read (Barcode), gantry_jog (GantryJog), locate (Trigger).
 Topics: /bunny/status (String, JSON, 2 Hz), /bunny/weight (Float64).
 Long operations block their service call; the node is multi-threaded so status and abort keep working.
 """
@@ -14,7 +14,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from std_srvs.srv import Trigger
 from std_msgs.msg import String, Float64
-from harness_msgs.srv import WeighTo, LiquidPush, Barcode, GantryJog
+from harness_msgs.srv import WeighTo, LiquidPush, LiquidRun, Barcode, GantryJog
 
 
 class BunnyLink:
@@ -54,6 +54,7 @@ class BunnyNode(Node):
             self.create_service(Trigger, "/bunny/" + name, self._trigger(name, long), callback_group=cb)
         self.create_service(WeighTo, "/bunny/weigh_to", self.weigh_to, callback_group=cb)
         self.create_service(LiquidPush, "/bunny/liquid_push", self.liquid_push, callback_group=cb)
+        self.create_service(LiquidRun, "/bunny/liquid_run", self.liquid_run, callback_group=cb)
         self.create_service(Barcode, "/bunny/barcode_read", self.barcode, callback_group=cb)
         self.create_service(GantryJog, "/bunny/gantry_jog", self.gantry_jog, callback_group=cb)
         self.online = False
@@ -92,6 +93,15 @@ class BunnyNode(Node):
             r = self.link.call("liquid_push", {"steps": req.steps, "rate": req.rate, "wait": req.wait},
                                timeout=60 if req.wait else 5)
             res.success = True; res.steps_done = int(r.get("steps", 0)); res.message = "ok"
+        except Exception as e:
+            res.success = False; res.message = str(e)
+        return res
+
+    def liquid_run(self, req, res):
+        """Continuous flow: the CALLER must repeat this at least every second, the Bunny stops otherwise."""
+        try:
+            self.link.call("liquid_run", {"rate": req.rate, "direction": req.direction}, timeout=5)
+            res.success = True; res.message = "flowing"
         except Exception as e:
             res.success = False; res.message = str(e)
         return res

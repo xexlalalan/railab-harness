@@ -21,7 +21,8 @@ Status: **have** = works today · **new** = to write.
 | `harness bunny housing open` / `close` / `release` | bunny | `/bunny/housing_open`, `/bunny/housing_close`, `/bunny/housing_release` | windshield motor (`windshield.py`) | have |
 | `harness bunny weigh-to <g> [powder\|liquid] [powder_id]` | bunny | `/bunny/weigh_to` (WeighTo) | dose by weight (`core.weighing_bunny`) | have |
 | `harness bunny liquid weigh <g>` | bunny | `/bunny/weigh_to` material=liquid | liquid dose by weight (`dispensing/liquid.py`) | have |
-| `harness bunny liquid push <steps> [rate]` / `pull` / `suck` / `stop` / `pos` | bunny | `/bunny/liquid_push` (LiquidPush), `/bunny/liquid_suck`, `/bunny/liquid_stop`, `/bunny/status` | pump stepper in steps (`pump.py`) | have |
+| `harness bunny liquid push [rate]` / `pull [rate]` | bunny | `/bunny/liquid_run` (LiquidRun, re-armed every 0.4 s; the Bunny stops 1 s after the last call) | continuous flow until Ctrl-C or `liquid stop` | have |
+| `harness bunny liquid dose <steps> [rate]` / `suck` / `stop` / `pos` | bunny | `/bunny/liquid_push` (LiquidPush), `/bunny/liquid_suck`, `/bunny/liquid_stop`, `/bunny/status` | bounded pump move in steps (`pump.py`) | have |
 | `harness bunny barcode [timeout_s]` | bunny | `/bunny/barcode_read` (Barcode) | wait for the next scan, selects the powder (`barcode_scanner.py`, `powder_db.py`) | have |
 | `harness bunny load begin` / `end` | bunny | `/bunny/load_begin`, `/bunny/load_end` | load handshake: weigh-to refused while a load is open | have |
 | `harness bunny abort` | bunny | `/bunny/abort` | stop dispensing and the pump (housing left holding) | have |

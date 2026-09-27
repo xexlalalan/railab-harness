@@ -1,0 +1,5 @@
+int32 rate                # steps/s (20..2000), 0 = Bunny default
+int32 direction           # +1 = liquid out (push), -1 = liquid in (pull)
+---
+bool success
+string message
