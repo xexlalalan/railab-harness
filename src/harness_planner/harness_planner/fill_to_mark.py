@@ -15,9 +15,10 @@ Image rows grow DOWNWARD; gap = surface lower edge row - ring row (positive = be
 Aborts (pump stopped, suck back): cancel, ring lost 1 s, ALARM (no surface after 20 % + tube),
 max_ml reached, surface not rising for stall_s, a module offline. Runs on a node that is being spun elsewhere (multi-threaded executor).
 """
-import time
+import os, time
 from collections import deque
 import numpy as np
+from sensor_msgs.msg import Image
 from std_srvs.srv import Trigger
 from harness_msgs.msg import FlaskLines
 from harness_msgs.srv import LiquidPush, LiquidRun
@@ -52,6 +53,22 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
     stop = node.create_client(Trigger, "/bunny/liquid_stop"); suck = node.create_client(Trigger, "/bunny/liquid_suck")
     pushed = 0.0; t_start = time.time(); k = P["steps_per_px"]; sum_steps = 0.0; sum_px = 0.0
     last = {"t": 0.0}
+    img = {"m": None}
+    sub_img = node.create_subscription(Image, "/dtv/image", lambda m: img.__setitem__("m", m), 2)
+    out_dir = os.path.expanduser("~/bunny-harness-dev/data/dtv/%s" % time.strftime("%Y%m%d_%H%M%S")); os.makedirs(out_dir, exist_ok=True)
+
+    def snap(tag, ring, m):
+        """save the latest camera frame with the locked ring (green) and the detected surface (red band, blue lower edge)"""
+        import cv2
+        im = img["m"]
+        if im is None: return
+        g = np.frombuffer(im.data, np.uint8).reshape(im.height, im.width); c = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+        cv2.line(c, (0, int(ring)), (c.shape[1], int(ring)), (0, 255, 0), 1)
+        if m is not None and m.surface_found:
+            cv2.rectangle(c, (m.x0, int(m.surf_top)), (m.x1, int(m.surf_bot)), (0, 0, 255), 1)
+            cv2.line(c, (m.x0, int(m.surf_low)), (m.x1, int(m.surf_low)), (255, 0, 0), 1)
+        cv2.putText(c, tag, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        path = os.path.join(out_dir, tag.replace(" ", "_").replace("/", "") + ".png"); cv2.imwrite(path, c); log("saved " + path)
 
     def frame():
         while latest["t"] <= last["t"]:
@@ -104,7 +121,9 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
             if watch: g = settled_gap(ring); log("gap %s" % g); continue
             g = settled_gap(ring)
             if g is None: raise RuntimeError("liquid surface lost after it was seen")
+            if g < 120: snap("gap %.0fpx pumped %.2fmL" % (g, pushed * UL_PER_STEP / 1000), ring, latest["m"])
             if g <= P["done_px"]:
+                snap("DONE gap %.0fpx" % g, ring, latest["m"])
                 return "AT THE MARK: gap %.1f px, pumped %.2f mL, learned %.1f steps/px" % (g, pushed * UL_PER_STEP / 1000, k)
             if best is None or g < best - 1: best, t_best = g, time.time()
             elif time.time() - t_best > P["stall_s"]: raise RuntimeError("surface not rising for %.0f s" % (time.time() - t_best))
@@ -123,4 +142,6 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
         if not watch:
             try: _call(node, stop, Trigger.Request(), 5); _call(node, suck, Trigger.Request(), 10)
             except Exception as e: log("WARNING: pump stop/suck-back failed: %s" % e)
-        node.destroy_subscription(sub); node.destroy_client(push); node.destroy_client(run_cli); node.destroy_client(stop); node.destroy_client(suck)
+        try: snap("final", ring, latest["m"])
+        except Exception: pass
+        node.destroy_subscription(sub); node.destroy_subscription(sub_img); node.destroy_client(push); node.destroy_client(run_cli); node.destroy_client(stop); node.destroy_client(suck)
