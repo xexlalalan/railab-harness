@@ -25,10 +25,7 @@ from harness_msgs.srv import LiquidPush, LiquidRun
 
 UL_PER_STEP = 0.556                      # Bunny water calibration (0.556 mg/step ~ 0.556 uL)
 P = dict(far_rate=600,            # continuous flow while no surface is in view
-         approach=0.6,            # like the Bunny's weigh loop: each move aims at this fraction of the remaining gap
-         steps_per_px=8.0,        # seed for the learned scale (2026-09-27 runs: 7.5-8.4 steps/px)
-         min_steps=4, max_move_steps=400,               # <= ~50 px per move: never jump to the mark in one go
-         rate_per_px=1.5, rate_min=40, rate_max=300,    # rate = gap * rate_per_px: the closer, the slower
+         kp=3.0, rate_min=30, rate_max=800,             # P control: rate (steps/s) = kp * gap (px), clamped
          settle_s=1.0, done_px=1.0, stall_s=30.0, lock_frames=10)
 
 
@@ -51,7 +48,7 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
     sub = node.create_subscription(FlaskLines, "/dtv/lines", lambda m: latest.update(m=m, t=time.time()), 10)
     push = node.create_client(LiquidPush, "/bunny/liquid_push"); run_cli = node.create_client(LiquidRun, "/bunny/liquid_run")
     stop = node.create_client(Trigger, "/bunny/liquid_stop"); suck = node.create_client(Trigger, "/bunny/liquid_suck")
-    pushed = 0.0; t_start = time.time(); k = P["steps_per_px"]; sum_steps = 0.0; sum_px = 0.0
+    pushed = 0.0; t_start = time.time(); t_arm = 0.0
     last = {"t": 0.0}
     img = {"m": None}
     sub_img = node.create_subscription(Image, "/dtv/image", lambda m: img.__setitem__("m", m), 2)
@@ -115,29 +112,32 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
             if not r.success: raise RuntimeError("Bunny refused flow: " + r.message)
             if not flowing: flowing = True; t_flow = time.time()
         if flowing: _call(node, stop, Trigger.Request(), 5); time.sleep(P["settle_s"])
-        # 3. approach: shrinking moves, slower as it gets closer
-        best = None; t_best = time.time()
+        # 3. approach: continuous flow, rate proportional to the remaining gap (P control, re-set every frame)
+        log("approach: continuous flow, rate = %.1f steps/s per px, %d..%d steps/s" % (P["kp"], P["rate_min"], P["rate_max"]))
+        best = None; t_best = time.time(); rate_now = 0; t_flow = time.time(); n_frame = 0
         while True:
-            if watch: g = settled_gap(ring); log("gap %s" % g); continue
-            g = settled_gap(ring)
-            if g is None: raise RuntimeError("liquid surface lost after it was seen")
-            snap("gap %.0fpx pumped %.2fmL" % (g, pushed * UL_PER_STEP / 1000), ring, latest["m"])
+            m = frame(); g = gap_of(m, ring); now = time.time()
+            if rate_now: pushed += rate_now * (now - t_flow)
+            t_flow = now
+            if watch: log("gap %s" % g); continue
+            if g is None:
+                _call(node, stop, Trigger.Request(), 5); rate_now = 0
+                raise RuntimeError("liquid surface lost after it was seen")
+            n_frame += 1
+            if n_frame % 5 == 0 or g < 30: log("%6.1fs  gap %6.1f px  rate %3d steps/s  pumped %.2f mL" % (now - t_start, g, rate_now, pushed * UL_PER_STEP / 1000))
             if g <= P["done_px"]:
-                snap("DONE gap %.0fpx" % g, ring, latest["m"])
-                return "AT THE MARK: gap %.1f px, pumped %.2f mL, learned %.1f steps/px" % (g, pushed * UL_PER_STEP / 1000, k)
-            if best is None or g < best - 1: best, t_best = g, time.time()
-            elif time.time() - t_best > P["stall_s"]: raise RuntimeError("surface not rising for %.0f s" % (time.time() - t_best))
+                _call(node, stop, Trigger.Request(), 5); rate_now = 0; time.sleep(P["settle_s"])
+                g2 = settled_gap(ring); snap("DONE gap %.1fpx" % (g2 if g2 is not None else g), ring, latest["m"])
+                return "AT THE MARK: gap %.1f px after settling, pumped %.2f mL" % (g2 if g2 is not None else g, pushed * UL_PER_STEP / 1000)
+            if best is None or g < best - 1: best, t_best = g, now
+            elif now - t_best > P["stall_s"]: raise RuntimeError("surface not rising for %.0f s" % (now - t_best))
             if pushed * UL_PER_STEP / 1000 >= max_ml: raise RuntimeError("max %.1f mL reached without reaching the mark" % max_ml)
-            n = int(max(P["min_steps"], min(P["max_move_steps"], P["approach"] * g * k)))
-            rate = int(min(P["rate_max"], max(P["rate_min"], g * P["rate_per_px"])))
-            r = _call(node, push, LiquidPush.Request(steps=n, rate=rate, wait=True), n / rate + 20)
-            if not r.success: raise RuntimeError("Bunny refused push: " + r.message)
-            pushed += r.steps_done; time.sleep(P["settle_s"])
-            g2 = settled_gap(ring)
-            log("%6.1fs  gap %6.1f -> %s px  move %d steps @ %d/s  pumped %.2f mL  k=%.1f steps/px" % (
-                time.time() - t_start, g, "%.1f" % g2 if g2 is not None else "--", n, rate, pushed * UL_PER_STEP / 1000, k))
-            if g2 is not None and g - g2 > 2:                          # learn the scale as a ratio of sums (like steps/mg)
-                sum_steps += r.steps_done; sum_px += (g - g2); k = sum_steps / sum_px
+            want = int(min(P["rate_max"], max(P["rate_min"], P["kp"] * g)))
+            if rate_now == 0 or abs(want - rate_now) >= max(2, 0.05 * rate_now) or now - t_arm > 0.5:
+                r = _call(node, run_cli, LiquidRun.Request(rate=want, direction=1), 5)     # also re-arms the 1 s dead-man
+                if not r.success: raise RuntimeError("Bunny refused flow: " + r.message)
+                rate_now = want; t_arm = now
+            if g < 150 and n_frame % 10 == 0: snap("gap %.0fpx rate %d" % (g, rate_now), ring, latest["m"])
     finally:
         if not watch:
             try: _call(node, stop, Trigger.Request(), 5); _call(node, suck, Trigger.Request(), 10)
