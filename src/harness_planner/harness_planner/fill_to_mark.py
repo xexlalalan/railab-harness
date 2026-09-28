@@ -77,14 +77,19 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
         last["t"] = latest["t"]; return latest["m"]
 
     track = {"g": None, "t": 0.0, "rate": 0}
+    raw = deque(maxlen=3)
 
     def gap_of(m, ring):
         """gap of the meniscus bottom (bright->dark step, surf_top) to the ring, or None.
-        Plausibility (run 6, 2026-09-27: the ring line itself was taken for the surface): the surface first
-        appears well below the ring, and afterwards it can only move up as fast as the pump lifts it (or
-        stay); anything else is a false reading and is ignored."""
-        if not m.surface_found: return None
-        g = m.surf_top - ring - offset_px; now = time.time(); last = track["g"]
+        A reading counts only when 3 consecutive frames agree within jitter_px (single-frame spikes are
+        ignored), the first sighting is well below the ring, and afterwards the surface only moves up,
+        no faster than the pump can lift it (run 6-9, 2026-09-27: the ring line and spikes were taken
+        for the surface). The ring never changes within a run."""
+        if not m.surface_found:
+            raw.clear(); return None
+        raw.append(m.surf_top - ring - offset_px)
+        if len(raw) < 3 or max(raw) - min(raw) > P["jitter_px"]: return None
+        g = float(np.median(raw)); now = time.time(); last = track["g"]
         if last is None:
             ok = g > P["first_seen_px"]
         else:
@@ -140,7 +145,7 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
             if watch: log("gap %s" % g); continue
             if g is None:
                 if now - track["t"] < 1.0: continue          # a few false frames are ignored, the flow goes on
-                if track["g"] is None or track["g"] > P["guard_px"] * 2:
+                if False:
                     # far from the mark a lost surface is a bad sighting (liquid still in the bulb): keep the far flow
                     if track["g"] is not None: log("%6.1fs  surface lost %.0f px below the mark: continuing at far rate" % (now - t_start, track["g"]))
                     track.update(g=None, t=now, rate=P["far_rate"]); recent.clear(); want = P["far_rate"]
