@@ -26,6 +26,7 @@ from harness_msgs.srv import LiquidPush, LiquidRun
 UL_PER_STEP = 0.556                      # Bunny water calibration (0.556 mg/step ~ 0.556 uL)
 P = dict(far_rate=600,            # continuous flow while no surface is in view
          kp=3.0, rate_min=30, rate_max=800,             # P control: rate (steps/s) = kp * gap (px), clamped
+         steps_per_px=8.0, guard_px=60,                 # dead-reckoning guard inside guard_px of the mark (runs 2-4: 7.5-8.4 steps/px)
          settle_s=1.0, done_px=1.0, stall_s=30.0, lock_frames=10)
 
 
@@ -75,7 +76,8 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
         last["t"] = latest["t"]; return latest["m"]
 
     def gap_of(m, ring):
-        return (m.surf_low - ring - offset_px) if m.surface_found else None
+        # the meniscus bottom is the bright->dark step (surf_top); the dark band under it (surf_low) drifts (run 5, 2026-09-27)
+        return (m.surf_top - ring - offset_px) if m.surface_found else None
 
     def settled_gap(ring, n=3):
         """median gap of n fresh frames; None if the surface is not in view"""
@@ -114,7 +116,7 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
         if flowing: _call(node, stop, Trigger.Request(), 5); time.sleep(P["settle_s"])
         # 3. approach: continuous flow, rate proportional to the remaining gap (P control, re-set every frame)
         log("approach: continuous flow, rate = %.1f steps/s per px, %d..%d steps/s" % (P["kp"], P["rate_min"], P["rate_max"]))
-        best = None; t_best = time.time(); rate_now = 0; t_flow = time.time(); n_frame = 0; recent = deque(maxlen=3)
+        best = None; t_best = time.time(); rate_now = 0; t_flow = time.time(); n_frame = 0; recent = deque(maxlen=3); budget = None; spent = 0.0; t_last = time.time()
         while True:
             m = frame(); g = gap_of(m, ring); now = time.time()
             if g is not None:                      # one bad frame must not burst the pump: control on the median of 3
@@ -134,6 +136,15 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
             if best is None or g < best - 1: best, t_best = g, now
             elif now - t_best > P["stall_s"]: raise RuntimeError("surface not rising for %.0f s" % (now - t_best))
             if pushed * UL_PER_STEP / 1000 >= max_ml: raise RuntimeError("max %.1f mL reached without reaching the mark" % max_ml)
+            # dead-reckoning guard: never push more than the measured gap physically needs (k steps/px, +30 %)
+            # before stopping to re-measure; a wrong surface reading then costs at most one re-measure, not an overfill
+            if g < P["guard_px"]:
+                if budget is None: budget = P["steps_per_px"] * g * 1.3; spent = 0.0
+                spent += rate_now * (now - t_last)
+                if spent >= budget:
+                    _call(node, stop, Trigger.Request(), 5); rate_now = 0; time.sleep(P["settle_s"])
+                    log("%6.1fs  budget spent (%d steps for %.0f px): re-measuring" % (now - t_start, spent, g)); budget = None; recent.clear(); continue
+            t_last = now
             want = int(min(P["rate_max"], max(P["rate_min"], P["kp"] * g)))
             if rate_now == 0 or abs(want - rate_now) >= max(2, 0.05 * rate_now) or now - t_arm > 0.5:
                 r = _call(node, run_cli, LiquidRun.Request(rate=want, direction=1), 5)     # also re-arms the 1 s dead-man
