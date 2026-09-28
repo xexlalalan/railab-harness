@@ -1,0 +1,6 @@
+int32 mode                # 0 pressure, 1 capacitive, 2 both
+float64 timeout_s         # 0 = 20 s
+float64 speed_mm_s        # Z speed during detection, 0 = 10 mm/s
+---
+bool success
+string message

@@ -23,6 +23,8 @@ harness bunny  gantry park | jog <dx> <dy> <dz_up>   (mm; not on a Bunny without
 harness dtv    status | lines | frame [file.png]
 harness dtv    z rel <mm> | move <mm> | zero | home | stop   (+ = camera DOWN)
 harness dtv    v clamp | open <mm> | release | home
+harness pipette status | home | stop | eject | aspirate <ul> [ul/s] [pre_ul] | dispense <ul> [ul/s] [blow_ul]
+harness pipette lld [mode] [timeout_s] [mm/s] | z home | stop | move <mm> | rel <mm>
 harness run    dilute-to-volume [--flask-ml 25] [--tube-ml 0.06] [--max-ml N] [--offset-px 0] [--ring-row R] [--watch]   (alias: fill-to-mark)
 harness daemon-stop"""
 
@@ -36,7 +38,7 @@ def serve():
     from std_msgs.msg import String
     from sensor_msgs.msg import Image
     from harness_msgs.msg import ArmStatus, GripperStatus, FlaskLines
-    from harness_msgs.srv import SetGripper, MoveZ, MoveV, WeighTo, LiquidPush, LiquidRun, Barcode, GantryJog
+    from harness_msgs.srv import SetGripper, MoveZ, MoveV, WeighTo, LiquidPush, LiquidRun, Barcode, GantryJog, Volume, Lld
     from harness_msgs.action import MovePose, MoveJ
     from harness_planner import fill_to_mark
 
@@ -45,6 +47,7 @@ def serve():
     n.create_subscription(GripperStatus, "/arm/gripper_status", lambda m: last.__setitem__("grip", m), 10)
     n.create_subscription(String, "/bunny/status", lambda m: last.__setitem__("bunny", (json.loads(m.data), time.time())), 10)
     n.create_subscription(String, "/dtv/status", lambda m: last.__setitem__("dtv", (json.loads(m.data), time.time())), 10)
+    n.create_subscription(String, "/pipette/status", lambda m: last.__setitem__("pipette", (json.loads(m.data), time.time())), 10)
     n.create_subscription(FlaskLines, "/dtv/lines", lambda m: last.__setitem__("lines", (m, time.time())), 10)
     n.create_subscription(Image, "/dtv/image", lambda m: last.__setitem__("image", m), 2)
     ac_pose = ActionClient(n, MovePose, "/arm/move_pose"); ac_j = ActionClient(n, MoveJ, "/arm/move_j")
@@ -202,6 +205,29 @@ def serve():
                 return ("OK " if r.success else "FAILED ") + r.message
         return "FAILED unknown dtv command; see harness --help"
 
+    # ------------------------------------------------------------------ pipette
+    def do_pipette(w, out, cancelled):
+        w = w or ["?"]; c = w[0]; f = lambda i, d: float(w[i]) if len(w) > i else d
+        if c == "status":
+            st = fresh("pipette", 3.0)
+            return "OK " + json.dumps(st) if st else "FAILED no /pipette/status (pipette node running?)"
+        if c in ("home", "stop", "eject"): return trig("/pipette/" + c, 130)
+        if c in ("aspirate", "dispense") and len(w) > 1:
+            r, err = call(Volume, "/pipette/" + c, Volume.Request(ul=f(1, 0), rate=f(2, 0), extra=f(3, 0)), 130)
+            if err: return "FAILED " + err
+            return ("OK " if r.success else "FAILED ") + r.message
+        if c == "lld":
+            r, err = call(Lld, "/pipette/lld", Lld.Request(mode=int(f(1, 0)), timeout_s=f(2, 0), speed_mm_s=f(3, 0)), 130)
+            if err: return "FAILED " + err
+            return ("OK " if r.success else "FAILED ") + r.message
+        if c == "z" and len(w) > 1:
+            if w[1] in ("home", "stop"): return trig("/pipette/z_" + w[1], 10)
+            if w[1] in ("move", "rel") and len(w) > 2:
+                r, err = call(MoveZ, "/pipette/z_move", MoveZ.Request(mm=float(w[2]), absolute=(w[1] == "move")), 10)
+                if err: return "FAILED " + err
+                return ("OK " if r.success else "FAILED ") + r.message
+        return "FAILED unknown pipette command; see harness --help"
+
     # ------------------------------------------------------------------ run
     def do_run(w, out, cancelled):
         w = w or ["?"]
@@ -219,7 +245,7 @@ def serve():
     def handle(line, out, cancelled):
         w = line.split()
         if not w or w[0] in ("--help", "help", "-h"): return "OK\n" + USAGE
-        return {"arm": do_arm, "bunny": do_bunny, "dtv": do_dtv, "run": do_run}.get(w[0], lambda *a: "FAILED unknown group; see harness --help")(w[1:], out, cancelled)
+        return {"arm": do_arm, "bunny": do_bunny, "dtv": do_dtv, "pipette": do_pipette, "run": do_run}.get(w[0], lambda *a: "FAILED unknown group; see harness --help")(w[1:], out, cancelled)
 
     def conn(c):
         with c:

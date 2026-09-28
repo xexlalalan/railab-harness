@@ -21,6 +21,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/LiquidRun.srv"
   "srv/Barcode.srv"
   "srv/GantryJog.srv"
+  "srv/Volume.srv"
+  "srv/Lld.srv"
   "action/MoveJ.action"
   "action/MovePose.action"
   DEPENDENCIES std_msgs geometry_msgs builtin_interfaces

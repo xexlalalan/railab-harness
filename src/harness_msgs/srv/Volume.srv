@@ -1,0 +1,6 @@
+float64 ul                # volume, microlitres
+float64 rate              # ul/s, 0 = default (100)
+float64 extra             # aspirate: pre-aspiration air ul; dispense: blow-back ul
+---
+bool success
+string message

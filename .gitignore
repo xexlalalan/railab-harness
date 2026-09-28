@@ -8,3 +8,4 @@ __pycache__/
 calib/*.bak
 src/harness_dtv
 .claude/
+src/harness_pipette

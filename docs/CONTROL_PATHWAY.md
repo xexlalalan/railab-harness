@@ -2,7 +2,7 @@
 
 One pathway: ROS 2 on the harness PC. The `harness` command (`tools/harness`, linked into `~/bin`, works from any directory), scripts and any GUI only call the interfaces below; only a module's node touches its hardware. The Bunny runs no ROS: its own app in harness mode (`python3 main.py harness`, Bunny repo `python/harness_server.py`, GUI not shown) owns its UART/scale/scanner and serves TCP/JSON on port 7801 to the `/bunny` node.
 
-Start/stop everything: `harness-nodes start | stop | status` (arm + camera nodes, dtv node, bunny node, Bunny server). `harness --help` prints the command list.
+Start/stop everything: `harness-nodes start | stop | status` (arm + camera nodes, dtv node, bunny node, pipette node, Bunny server). The `/pipette` node lives in the liquid-pipette repo (`ros/harness_pipette`, symlinked into `src/`), like `/dtv`. `harness --help` prints the command list.
 
 Status: **have** = works today · **new** = to write.
 
