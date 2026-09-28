@@ -40,7 +40,7 @@ def _call(node, cli, req, timeout):
     return fut.result()
 
 
-def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, watch=False, cancelled=lambda: False):
+def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring_row=None, watch=False, cancelled=lambda: False):
     """Returns a result string; raises RuntimeError on abort (an ALARM is a RuntimeError starting with 'ALARM').
     The ring row is measured ONCE before dosing and kept (the flask does not move); dosing is the Bunny's
     weigh-to scheme: move = approach * remaining gap * learned steps/px, settle, re-measure, repeat."""
@@ -75,9 +75,12 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, watc
             if time.time() - t0 > 3: raise RuntimeError("no frames on /dtv/lines (dtv node running?)")
             time.sleep(0.05)
         # 1. lock the ring
-        rows = [m.ring_row for m in (frame() for _ in range(P["lock_frames"])) if m.ring_found]
-        if len(rows) < P["lock_frames"] // 2: raise RuntimeError("ring mark not found reliably before dosing")
-        ring = float(np.median(rows)); log("ring locked at row %.1f (spread %.1f px)" % (ring, np.ptp(rows)))
+        if ring_row is not None:
+            ring = float(ring_row); log("ring row given by the operator: %.1f" % ring)
+        else:
+            rows = [m.ring_row for m in (frame() for _ in range(P["lock_frames"])) if m.ring_found]
+            if len(rows) < P["lock_frames"] // 2: raise RuntimeError("ring mark not found reliably before dosing")
+            ring = float(np.median(rows)); log("ring locked at row %.1f (spread %.1f px)" % (ring, np.ptp(rows)))
         if not watch: _call(node, stop, Trigger.Request(), 5)       # proves the Bunny link before pumping
         # 2. far phase: continuous flow until the surface is in view
         flowing = False; t_flow = 0.0

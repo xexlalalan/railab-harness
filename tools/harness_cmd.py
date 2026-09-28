@@ -23,7 +23,7 @@ harness bunny  gantry park | jog <dx> <dy> <dz_up>   (mm; not on a Bunny without
 harness dtv    status | lines | frame [file.png]
 harness dtv    z rel <mm> | move <mm> | zero | home | stop   (+ = camera DOWN)
 harness dtv    v clamp | open <mm> | release | home
-harness run    dilute-to-volume [--flask-ml 25] [--tube-ml 0.06] [--max-ml N] [--offset-px 0] [--watch]   (alias: fill-to-mark)
+harness run    dilute-to-volume [--flask-ml 25] [--tube-ml 0.06] [--max-ml N] [--offset-px 0] [--ring-row R] [--watch]   (alias: fill-to-mark)
 harness daemon-stop"""
 
 
@@ -210,6 +210,7 @@ def serve():
             try:
                 return "OK " + fill_to_mark.run(n, out, flask_ml=float(kv.get("flask-ml", 25)), tube_ml=float(kv.get("tube-ml", 0.06)),
                                                 max_ml=float(kv["max-ml"]) if "max-ml" in kv else None, offset_px=float(kv.get("offset-px", 0)),
+                                                ring_row=float(kv["ring-row"]) if "ring-row" in kv else None,
                                                 watch="watch" in kv, cancelled=cancelled)
             except RuntimeError as e:
                 return "FAILED " + str(e)
