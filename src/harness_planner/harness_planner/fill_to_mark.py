@@ -1,5 +1,10 @@
-"""Fill the volumetric flask to its ring mark: the Bunny's liquid pump (/bunny/liquid_push) doses in
-small bounded chunks while the dtv camera (/dtv/lines) watches the liquid surface climb to the ring.
+"""Dilute to volume: the Bunny's liquid doser fills the volumetric flask to its ring mark while the
+dtv camera (/dtv/lines) watches the liquid surface climb to the ring.
+
+Pre-condition: the flask arrives at least 80 % full. While no surface is in view the doser runs
+continuously with the camera checked every frame (~10 Hz); if 20 % of the flask volume plus the
+tube's liquid volume has been pushed and still no surface is seen, the run stops with an ALARM:
+the reservoir is empty or the flask was not pre-filled.
 
 Image rows grow DOWNWARD; gap = surface lower edge row - ring row (positive = below the mark).
   surface not in view  continuous flow at far_rate       (/bunny/liquid_run, re-armed every 0.4 s)
@@ -7,8 +12,8 @@ Image rows grow DOWNWARD; gap = surface lower edge row - ring row (positive = be
   gap > fine_px        continuous flow at fine_rate
   else                 bounded pushes of fine_steps, then wait settle_s (drops land, the surface settles)
   gap <= stop_px       STOP, suck back
-Aborts (pump stopped, suck back): cancel, ring lost 1 s, max_ml reached, surface not rising over
-stall_steps, a module offline. Runs on a node that is being spun elsewhere (multi-threaded executor).
+Aborts (pump stopped, suck back): cancel, ring lost 1 s, ALARM (no surface after 20 % + tube),
+max_ml reached, surface not rising for stall_s, a module offline. Runs on a node that is being spun elsewhere (multi-threaded executor).
 """
 import time
 from collections import deque
@@ -31,8 +36,10 @@ def _call(node, cli, req, timeout):
     return fut.result()
 
 
-def run(node, log, max_ml=5.0, offset_px=0.0, watch=False, cancelled=lambda: False):
-    """Returns a result string; raises RuntimeError on abort."""
+def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, watch=False, cancelled=lambda: False):
+    """Returns a result string; raises RuntimeError on abort (an ALARM is a RuntimeError starting with 'ALARM')."""
+    unseen_limit_ml = 0.2 * flask_ml + tube_ml          # flask must be >= 80 % full on arrival
+    max_ml = max_ml if max_ml is not None else 0.3 * flask_ml
     latest = {"m": None, "t": 0.0}
     sub = node.create_subscription(FlaskLines, "/dtv/lines", lambda m: latest.update(m=m, t=time.time()), 10)
     push = node.create_client(LiquidPush, "/bunny/liquid_push"); run_cli = node.create_client(LiquidRun, "/bunny/liquid_run")
@@ -82,7 +89,11 @@ def run(node, log, max_ml=5.0, offset_px=0.0, watch=False, cancelled=lambda: Fal
             if gap is not None:
                 if best_gap is None or gap < best_gap - 2: best_gap, t_best = gap, now
                 elif now - t_best > P["stall_s"]: raise RuntimeError("surface not rising for %.0f s" % (now - t_best))
-            if pushed >= max_steps: raise RuntimeError("max %.1f mL reached without reaching the mark" % max_ml)
+            pushed_ml = (pushed + (flow["rate"] * (now - flow["t"]) if flow["rate"] else 0)) * UL_PER_STEP / 1000
+            if not m.surface_found and pushed_ml >= unseen_limit_ml:
+                raise RuntimeError("ALARM: pushed %.2f mL (20%% of %.0f mL + %.2f mL tube) and still no liquid surface in view: "
+                                   "reservoir empty or flask not pre-filled to 80%%" % (pushed_ml, flask_ml, tube_ml))
+            if pushed_ml >= max_ml: raise RuntimeError("max %.1f mL reached without reaching the mark" % max_ml)
             if gap is None:                 want = P["far_rate"]
             elif gap > P["coarse_px"]:      want = P["coarse_rate"]
             elif gap > P["fine_px"]:        want = P["fine_rate"]

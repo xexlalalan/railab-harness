@@ -23,7 +23,7 @@ harness bunny  gantry park | jog <dx> <dy> <dz_up>   (mm; not on a Bunny without
 harness dtv    status | lines | frame [file.png]
 harness dtv    z rel <mm> | move <mm> | zero | home | stop   (+ = camera DOWN)
 harness dtv    v clamp | open <mm> | release | home
-harness run    fill-to-mark [--max-ml 5] [--offset-px 0] [--watch]
+harness run    dilute-to-volume [--flask-ml 25] [--tube-ml 0.06] [--max-ml N] [--offset-px 0] [--watch]   (alias: fill-to-mark)
 harness daemon-stop"""
 
 
@@ -205,14 +205,15 @@ def serve():
     # ------------------------------------------------------------------ run
     def do_run(w, out, cancelled):
         w = w or ["?"]
-        if w[0] == "fill-to-mark":
+        if w[0] in ("dilute-to-volume", "fill-to-mark"):
             pos, kv = opts(w[1:])
             try:
-                return "OK " + fill_to_mark.run(n, out, max_ml=float(kv.get("max-ml", 5)), offset_px=float(kv.get("offset-px", 0)),
+                return "OK " + fill_to_mark.run(n, out, flask_ml=float(kv.get("flask-ml", 25)), tube_ml=float(kv.get("tube-ml", 0.06)),
+                                                max_ml=float(kv["max-ml"]) if "max-ml" in kv else None, offset_px=float(kv.get("offset-px", 0)),
                                                 watch="watch" in kv, cancelled=cancelled)
             except RuntimeError as e:
                 return "FAILED " + str(e)
-        return "FAILED unknown workflow; available: fill-to-mark"
+        return "FAILED unknown workflow; available: dilute-to-volume"
 
     def handle(line, out, cancelled):
         w = line.split()
