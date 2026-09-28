@@ -27,7 +27,7 @@ UL_PER_STEP = 0.556                      # Bunny water calibration (0.556 mg/ste
 P = dict(far_rate=600,            # continuous flow while no surface is in view
          kp=3.0, rate_min=30, rate_max=800,             # P control: rate (steps/s) = kp * gap (px), clamped
          steps_per_px=8.0, guard_px=60,                 # dead-reckoning guard inside guard_px of the mark (runs 2-4: 7.5-8.4 steps/px)
-         first_seen_px=15, jitter_px=12,                 # plausibility of a surface reading (see gap_of)
+         first_seen_px=15, jitter_px=12, wait_s=8.0,                 # plausibility of a surface reading (see gap_of)
          settle_s=1.0, done_px=1.0, stall_s=30.0, lock_frames=10)
 
 
@@ -135,7 +135,7 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
         if flowing: _call(node, stop, Trigger.Request(), 5); time.sleep(P["settle_s"])
         # 3. approach: continuous flow, rate proportional to the remaining gap (P control, re-set every frame)
         log("approach: continuous flow, rate = %.1f steps/s per px, %d..%d steps/s" % (P["kp"], P["rate_min"], P["rate_max"]))
-        best = None; t_best = time.time(); rate_now = 0; t_flow = time.time(); n_frame = 0; recent = deque(maxlen=3); budget = None; spent = 0.0; t_last = time.time()
+        best = None; t_best = time.time(); rate_now = 0; t_flow = time.time(); n_frame = 0; recent = deque(maxlen=3); budget = None; spent = 0.0; t_last = time.time(); pushed_at_track = pushed; t_wait = time.time()
         while True:
             m = frame(); g = gap_of(m, ring); now = time.time()
             if g is not None:                      # one bad frame must not burst the pump: control on the median of 3
@@ -144,19 +144,22 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
             t_flow = now
             if watch: log("gap %s" % g); continue
             if g is None:
-                if now - track["t"] < 1.0: continue          # a few false frames are ignored, the flow goes on
-                if False:
-                    # far from the mark a lost surface is a bad sighting (liquid still in the bulb): keep the far flow
-                    if track["g"] is not None: log("%6.1fs  surface lost %.0f px below the mark: continuing at far rate" % (now - t_start, track["g"]))
-                    track.update(g=None, t=now, rate=P["far_rate"]); recent.clear(); want = P["far_rate"]
-                    r = _call(node, run_cli, LiquidRun.Request(rate=want, direction=1), 5)
-                    if not r.success: raise RuntimeError("Bunny refused flow: " + r.message)
-                    rate_now = want; t_arm = now
-                    if pushed * UL_PER_STEP / 1000 >= unseen_limit_ml + 0.5:
-                        raise RuntimeError("ALARM: %.2f mL pushed without a steady liquid surface in the neck" % (pushed * UL_PER_STEP / 1000))
+                # the surface is unreadable (the falling stream disturbs it). Far from the mark, dead-reckoning is
+                # trusted: the pump may run blind for what the last reading allows down to 2*guard_px above... i.e.
+                # (last gap - 2*guard_px) * steps_per_px steps. Then it stops and waits for the surface to settle.
+                allow = max(0.0, (track["g"] - 2 * P["guard_px"]) * P["steps_per_px"])
+                if rate_now and (now - track["t"] < 1.0 or pushed - pushed_at_track < allow):
+                    if now - t_arm > 0.4:
+                        r = _call(node, run_cli, LiquidRun.Request(rate=rate_now, direction=1), 5); t_arm = now
+                        if not r.success: raise RuntimeError("Bunny refused flow: " + r.message)
                     continue
-                _call(node, stop, Trigger.Request(), 5); rate_now = 0
-                raise RuntimeError("liquid surface lost after it was seen")
+                if rate_now:
+                    _call(node, stop, Trigger.Request(), 5); rate_now = 0; raw.clear(); t_wait = now; budget = None
+                    log("%6.1fs  surface unreadable: pump stopped, waiting for it to settle" % (now - t_start)); continue
+                if now - t_wait > P["wait_s"]:
+                    raise RuntimeError("liquid surface lost for %.0f s after it was seen" % P["wait_s"])
+                continue
+            pushed_at_track = pushed
             n_frame += 1
             if n_frame % 5 == 0 or g < 30: log("%6.1fs  gap %6.1f px  rate %3d steps/s  pumped %.2f mL" % (now - t_start, g, rate_now, pushed * UL_PER_STEP / 1000))
             if g <= P["done_px"]:
