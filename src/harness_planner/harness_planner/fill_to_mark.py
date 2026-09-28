@@ -27,6 +27,7 @@ UL_PER_STEP = 0.556                      # Bunny water calibration (0.556 mg/ste
 P = dict(far_rate=600,            # continuous flow while no surface is in view
          kp=3.0, rate_min=30, rate_max=800,             # P control: rate (steps/s) = kp * gap (px), clamped
          steps_per_px=8.0, guard_px=60,                 # dead-reckoning guard inside guard_px of the mark (runs 2-4: 7.5-8.4 steps/px)
+         first_seen_px=15, jitter_px=6,                 # plausibility of a surface reading (see gap_of)
          settle_s=1.0, done_px=1.0, stall_s=30.0, lock_frames=10)
 
 
@@ -75,9 +76,22 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
             time.sleep(0.01)
         last["t"] = latest["t"]; return latest["m"]
 
+    track = {"g": None, "t": 0.0, "rate": 0}
+
     def gap_of(m, ring):
-        # the meniscus bottom is the bright->dark step (surf_top); the dark band under it (surf_low) drifts (run 5, 2026-09-27)
-        return (m.surf_top - ring - offset_px) if m.surface_found else None
+        """gap of the meniscus bottom (bright->dark step, surf_top) to the ring, or None.
+        Plausibility (run 6, 2026-09-27: the ring line itself was taken for the surface): the surface first
+        appears well below the ring, and afterwards it can only move up as fast as the pump lifts it (or
+        stay); anything else is a false reading and is ignored."""
+        if not m.surface_found: return None
+        g = m.surf_top - ring - offset_px; now = time.time(); last = track["g"]
+        if last is None:
+            ok = g > P["first_seen_px"]
+        else:
+            max_rise = track["rate"] * (now - track["t"]) / P["steps_per_px"] + P["jitter_px"]
+            ok = (last - max_rise) <= g <= (last + P["jitter_px"])
+        if not ok: return None
+        track.update(g=g, t=now); return g
 
     def settled_gap(ring, n=3):
         """median gap of n fresh frames; None if the surface is not in view"""
@@ -112,7 +126,7 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
                                    "reservoir empty or flask not pre-filled to 80%%" % (pushed * UL_PER_STEP / 1000, flask_ml, tube_ml))
             r = _call(node, run_cli, LiquidRun.Request(rate=P["far_rate"], direction=1), 5)       # re-arms the 1 s dead-man
             if not r.success: raise RuntimeError("Bunny refused flow: " + r.message)
-            if not flowing: flowing = True; t_flow = time.time()
+            if not flowing: flowing = True; t_flow = time.time(); track["rate"] = P["far_rate"]
         if flowing: _call(node, stop, Trigger.Request(), 5); time.sleep(P["settle_s"])
         # 3. approach: continuous flow, rate proportional to the remaining gap (P control, re-set every frame)
         log("approach: continuous flow, rate = %.1f steps/s per px, %d..%d steps/s" % (P["kp"], P["rate_min"], P["rate_max"]))
@@ -125,6 +139,7 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
             t_flow = now
             if watch: log("gap %s" % g); continue
             if g is None:
+                if now - track["t"] < 1.0: continue          # a few false frames are ignored, the flow goes on
                 _call(node, stop, Trigger.Request(), 5); rate_now = 0
                 raise RuntimeError("liquid surface lost after it was seen")
             n_frame += 1
@@ -149,7 +164,7 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
             if rate_now == 0 or abs(want - rate_now) >= max(2, 0.05 * rate_now) or now - t_arm > 0.5:
                 r = _call(node, run_cli, LiquidRun.Request(rate=want, direction=1), 5)     # also re-arms the 1 s dead-man
                 if not r.success: raise RuntimeError("Bunny refused flow: " + r.message)
-                rate_now = want; t_arm = now
+                rate_now = want; t_arm = now; track["rate"] = want
             if g < 150 and n_frame % 10 == 0: snap("gap %.0fpx rate %d" % (g, rate_now), ring, latest["m"])
     finally:
         if not watch:
