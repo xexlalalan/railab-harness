@@ -114,9 +114,11 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
         if flowing: _call(node, stop, Trigger.Request(), 5); time.sleep(P["settle_s"])
         # 3. approach: continuous flow, rate proportional to the remaining gap (P control, re-set every frame)
         log("approach: continuous flow, rate = %.1f steps/s per px, %d..%d steps/s" % (P["kp"], P["rate_min"], P["rate_max"]))
-        best = None; t_best = time.time(); rate_now = 0; t_flow = time.time(); n_frame = 0
+        best = None; t_best = time.time(); rate_now = 0; t_flow = time.time(); n_frame = 0; recent = deque(maxlen=3)
         while True:
             m = frame(); g = gap_of(m, ring); now = time.time()
+            if g is not None:                      # one bad frame must not burst the pump: control on the median of 3
+                recent.append(g); g = float(np.median(recent))
             if rate_now: pushed += rate_now * (now - t_flow)
             t_flow = now
             if watch: log("gap %s" % g); continue
