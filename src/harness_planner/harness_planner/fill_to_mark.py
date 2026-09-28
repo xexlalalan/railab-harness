@@ -27,7 +27,7 @@ UL_PER_STEP = 0.556                      # Bunny water calibration (0.556 mg/ste
 P = dict(far_rate=600,            # continuous flow while no surface is in view
          kp=3.0, rate_min=30, rate_max=800,             # P control: rate (steps/s) = kp * gap (px), clamped
          steps_per_px=8.0, guard_px=60,                 # dead-reckoning guard inside guard_px of the mark (runs 2-4: 7.5-8.4 steps/px)
-         first_seen_px=15, jitter_px=6,                 # plausibility of a surface reading (see gap_of)
+         first_seen_px=15, jitter_px=12,                 # plausibility of a surface reading (see gap_of)
          settle_s=1.0, done_px=1.0, stall_s=30.0, lock_frames=10)
 
 
@@ -140,9 +140,9 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
             if watch: log("gap %s" % g); continue
             if g is None:
                 if now - track["t"] < 1.0: continue          # a few false frames are ignored, the flow goes on
-                if track["g"] is not None and track["g"] > P["guard_px"] * 2:
+                if track["g"] is None or track["g"] > P["guard_px"] * 2:
                     # far from the mark a lost surface is a bad sighting (liquid still in the bulb): keep the far flow
-                    log("%6.1fs  surface lost %.0f px below the mark: continuing at far rate" % (now - t_start, track["g"]))
+                    if track["g"] is not None: log("%6.1fs  surface lost %.0f px below the mark: continuing at far rate" % (now - t_start, track["g"]))
                     track.update(g=None, t=now, rate=P["far_rate"]); recent.clear(); want = P["far_rate"]
                     r = _call(node, run_cli, LiquidRun.Request(rate=want, direction=1), 5)
                     if not r.success: raise RuntimeError("Bunny refused flow: " + r.message)
