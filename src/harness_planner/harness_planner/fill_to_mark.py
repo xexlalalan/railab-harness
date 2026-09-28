@@ -140,6 +140,16 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
             if watch: log("gap %s" % g); continue
             if g is None:
                 if now - track["t"] < 1.0: continue          # a few false frames are ignored, the flow goes on
+                if track["g"] is not None and track["g"] > P["guard_px"] * 2:
+                    # far from the mark a lost surface is a bad sighting (liquid still in the bulb): keep the far flow
+                    log("%6.1fs  surface lost %.0f px below the mark: continuing at far rate" % (now - t_start, track["g"]))
+                    track.update(g=None, t=now, rate=P["far_rate"]); recent.clear(); want = P["far_rate"]
+                    r = _call(node, run_cli, LiquidRun.Request(rate=want, direction=1), 5)
+                    if not r.success: raise RuntimeError("Bunny refused flow: " + r.message)
+                    rate_now = want; t_arm = now
+                    if pushed * UL_PER_STEP / 1000 >= unseen_limit_ml + 0.5:
+                        raise RuntimeError("ALARM: %.2f mL pushed without a steady liquid surface in the neck" % (pushed * UL_PER_STEP / 1000))
+                    continue
                 _call(node, stop, Trigger.Request(), 5); rate_now = 0
                 raise RuntimeError("liquid surface lost after it was seen")
             n_frame += 1
