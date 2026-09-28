@@ -25,11 +25,11 @@ from harness_msgs.srv import LiquidPush, LiquidRun
 
 UL_PER_STEP = 0.556                      # Bunny water calibration (0.556 mg/step ~ 0.556 uL)
 P = dict(far_rate=600,            # continuous flow while no surface is in view
-         approach=0.8,            # like the Bunny's weigh loop: each move aims at this fraction of the remaining gap
-         steps_per_px=10.0,       # seed for the learned scale (2026-09-27 run: ~180 px per mL = 10 steps/px)
-         min_steps=4, max_move_steps=1500,
-         rate_per_px=4.0, rate_min=60, rate_max=800,   # rate = gap * rate_per_px: the closer, the slower
-         settle_s=0.8, done_px=1.0, stall_s=20.0, lock_frames=10)
+         approach=0.6,            # like the Bunny's weigh loop: each move aims at this fraction of the remaining gap
+         steps_per_px=8.0,        # seed for the learned scale (2026-09-27 runs: 7.5-8.4 steps/px)
+         min_steps=4, max_move_steps=400,               # <= ~50 px per move: never jump to the mark in one go
+         rate_per_px=1.5, rate_min=40, rate_max=300,    # rate = gap * rate_per_px: the closer, the slower
+         settle_s=1.0, done_px=1.0, stall_s=30.0, lock_frames=10)
 
 
 def _call(node, cli, req, timeout):
@@ -121,7 +121,7 @@ def run(node, log, flask_ml=25.0, tube_ml=0.06, max_ml=None, offset_px=0.0, ring
             if watch: g = settled_gap(ring); log("gap %s" % g); continue
             g = settled_gap(ring)
             if g is None: raise RuntimeError("liquid surface lost after it was seen")
-            if g < 120: snap("gap %.0fpx pumped %.2fmL" % (g, pushed * UL_PER_STEP / 1000), ring, latest["m"])
+            snap("gap %.0fpx pumped %.2fmL" % (g, pushed * UL_PER_STEP / 1000), ring, latest["m"])
             if g <= P["done_px"]:
                 snap("DONE gap %.0fpx" % g, ring, latest["m"])
                 return "AT THE MARK: gap %.1f px, pumped %.2f mL, learned %.1f steps/px" % (g, pushed * UL_PER_STEP / 1000, k)
