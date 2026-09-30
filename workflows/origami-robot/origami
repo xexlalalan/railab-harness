@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Supervisor for the origami-robot demo: type a step number, the matching NN_*.sh runs.
+#   ./origami          interactive: "step> 3"  runs 03_*.sh; "q" quits
+#   ./origami 3 [args] one step and exit (exit code = the step's)
+cd "$(dirname "$(readlink -f "$0")")"
+run_step() {
+  local n; n=$(printf "%02d" "$1" 2>/dev/null) || { echo "not a number: $1"; return 2; }
+  local s=$(ls ${n}_*.sh 2>/dev/null | head -1)
+  [ -n "$s" ] || { echo "no step $1"; return 2; }
+  echo "=== step $1: $s ${*:2}"; bash "./$s" "${@:2}"; local rc=$?
+  echo "=== step $1 $([ $rc = 0 ] && echo DONE || echo FAILED rc=$rc)"; return $rc
+}
+if [ $# -gt 0 ]; then run_step "$@"; exit $?; fi
+echo "steps:"; for f in [0-9][0-9]_*.sh; do echo "  ${f%%_*}  $(sed -n 2p "$f" | sed 's/^# //')"; done
+while read -rp "step> " line; do
+  [ -z "$line" ] && continue; [ "$line" = q ] && break
+  run_step $line || true
+done
