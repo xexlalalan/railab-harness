@@ -54,6 +54,7 @@ class BunnyNode(Node):
             self.create_service(Trigger, "/bunny/" + name, self._trigger(name, long), callback_group=cb)
         self.create_service(WeighTo, "/bunny/weigh_to", self.weigh_to, callback_group=cb)
         self.create_service(LiquidPush, "/bunny/liquid_push", self.liquid_push, callback_group=cb)
+        self.create_service(LiquidPush, "/bunny/platform", self.platform, callback_group=cb)
         self.create_service(LiquidRun, "/bunny/liquid_run", self.liquid_run, callback_group=cb)
         self.create_service(Barcode, "/bunny/barcode_read", self.barcode, callback_group=cb)
         self.create_service(GantryJog, "/bunny/gantry_jog", self.gantry_jog, callback_group=cb)
@@ -93,6 +94,15 @@ class BunnyNode(Node):
             r = self.link.call("liquid_push", {"steps": req.steps, "rate": req.rate, "wait": req.wait},
                                timeout=60 if req.wait else 5)
             res.success = True; res.steps_done = int(r.get("steps", 0)); res.message = "ok"
+        except Exception as e:
+            res.success = False; res.message = str(e)
+        return res
+
+    def platform(self, req, res):
+        """platform lift by req.steps (signed, 0 = read); res.steps_done = resulting position."""
+        try:
+            r = self.link.call("platform", {"steps": req.steps}, timeout=5)
+            res.success = True; res.steps_done = int(r.get("pos", 0)); res.message = "ok"
         except Exception as e:
             res.success = False; res.message = str(e)
         return res

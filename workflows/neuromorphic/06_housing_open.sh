@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-# 8: pipette ejects its tip
+# 6: open the Bunny housing
 source "$(dirname "$0")/lib.sh"
-step pipette eject
+step bunny housing open

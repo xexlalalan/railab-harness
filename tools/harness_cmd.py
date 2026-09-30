@@ -17,6 +17,7 @@ harness bunny  status | weight | tare | abort | barcode [timeout_s]
 harness bunny  housing open | close | release
 harness bunny  weigh-to <g> [powder|liquid] [powder_id]
 harness bunny  liquid push <steps> [rate] | pull <steps> [rate]   one continuous move (default 1200 steps/s)
+harness bunny  platform [±steps]                    move the weighing platform lift by steps (none = read position)
 harness bunny  liquid weigh <g> | suck | stop | pos
 harness bunny  load begin | end
 harness bunny  gantry park | jog <dx> <dy> <dz_up>   (mm; not on a Bunny without a gantry)
@@ -158,6 +159,10 @@ def serve():
             if s == "pos":
                 st = fresh("bunny", 3.0)
                 return "OK " + json.dumps(st.get("pump")) if st else "FAILED no /bunny/status"
+        if c == "platform":
+            r, err = call(LiquidPush, "/bunny/platform", LiquidPush.Request(steps=int(float(w[1])) if len(w) > 1 else 0, rate=0, wait=False), 10)
+            if err: return "FAILED " + err
+            return ("OK platform at %d steps" % r.steps_done) if r.success else "FAILED " + r.message
         if c == "load" and len(w) > 1 and w[1] in ("begin", "end"): return trig("/bunny/load_" + w[1], 10)
         if c == "gantry" and len(w) > 1:
             if w[1] == "park": return trig("/bunny/gantry_park", 90)
