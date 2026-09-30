@@ -3,6 +3,9 @@
 cd "$(dirname "$(readlink -f "$0")")/.."
 source rosenv.sh 2>/dev/null
 start_bg() { pgrep -f "$2" >/dev/null && { echo "$1: already running"; return; }; setsid nohup $3 >/tmp/$1.log 2>&1 </dev/null & echo "$1: started"; }
+# The Bunny app (GUI, or `main.py harness` headless) serves port 7801 itself; it is started on the Bunny, not from here.
+bunny_check() { timeout 3 bash -c "</dev/tcp/${BUNNY_HOST:-192.168.7.2}/7801" 2>/dev/null && echo "bunny server: reachable" || echo "bunny server: NOT reachable (start the Bunny app)"; }
+
 case "$1" in
   start)
     start_bg piper     "harness_arm/piper_nod[e]"        "ros2 launch harness_arm piper.launch.py"
@@ -10,12 +13,11 @@ case "$1" in
     start_bg dtv_node  "harness_dtv/dtv_nod[e]"          "ros2 run harness_dtv dtv_node"
     start_bg bunny_node "harness_instrument/bunny_nod[e]" "ros2 run harness_instrument bunny_node"
     start_bg pipette_node "harness_pipette/pipette_nod[e]" "ros2 run harness_pipette pipette_node"
-    if ssh -o ConnectTimeout=3 bunny 'pgrep -f "^\S*bunny-venv/bin/python3 -u main.py harness" >/dev/null'; then echo "bunny server: already running"
-    else ssh bunny 'cd ~/bunny-dev/python && (setsid nohup ~/bunny-venv/bin/python3 -u main.py harness >~/harness_server.log 2>&1 </dev/null &); exit' && echo "bunny server: started"; fi ;;
+    bunny_check ;;
   stop)
     pkill -f "harness_dtv/dtv_nod[e]"; pkill -f "harness_instrument/bunny_nod[e]"; pkill -f "harness_pipette/pipette_nod[e]"; pkill -f "harness_cmd.py --serv[e]"
-    ssh -o ConnectTimeout=3 bunny 'pkill -f harness_serve[r]' ; echo "stopped dtv node, bunny node, pipette node, CLI daemon, Bunny server (arm and camera nodes left running)" ;;
+    echo "stopped dtv node, bunny node, pipette node, CLI daemon (arm, camera nodes and the Bunny app left running)" ;;
   status)
-    timeout 10 ros2 node list 2>/dev/null; ssh -o ConnectTimeout=3 bunny 'pgrep -f "^\S*bunny-venv/bin/python3 -u main.py harness" >/dev/null && echo "bunny server: running" || echo "bunny server: NOT running"' ;;
+    timeout 10 ros2 node list 2>/dev/null; bunny_check ;;
   *) echo "usage: harness-nodes start|stop|status" ;;
 esac
