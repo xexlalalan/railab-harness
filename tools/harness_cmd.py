@@ -160,7 +160,8 @@ def serve():
                 st = fresh("bunny", 3.0)
                 return "OK " + json.dumps(st.get("pump")) if st else "FAILED no /bunny/status"
         if c == "platform":
-            r, err = call(LiquidPush, "/bunny/platform", LiquidPush.Request(steps=int(float(w[1])) if len(w) > 1 else 0, rate=0, wait=False), 10)
+            steps = int(float(w[1])) if len(w) > 1 else 0    # firmware 5 ms/step; wait for the move plus slack
+            r, err = call(LiquidPush, "/bunny/platform", LiquidPush.Request(steps=steps, rate=0, wait=False), 10 + abs(steps) * 0.005)
             if err: return "FAILED " + err
             return ("OK platform at %d steps" % r.steps_done) if r.success else "FAILED " + r.message
         if c == "load" and len(w) > 1 and w[1] in ("begin", "end"): return trig("/bunny/load_" + w[1], 10)

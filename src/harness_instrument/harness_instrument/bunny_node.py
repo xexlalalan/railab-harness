@@ -101,7 +101,7 @@ class BunnyNode(Node):
     def platform(self, req, res):
         """platform lift by req.steps (signed, 0 = read); res.steps_done = resulting position."""
         try:
-            r = self.link.call("platform", {"steps": req.steps}, timeout=5)
+            r = self.link.call("platform", {"steps": req.steps}, timeout=5 + abs(req.steps) * 0.005)
             res.success = True; res.steps_done = int(r.get("pos", 0)); res.message = "ok"
         except Exception as e:
             res.success = False; res.message = str(e)
