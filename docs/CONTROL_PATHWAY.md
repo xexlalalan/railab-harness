@@ -18,7 +18,7 @@ Status: **have** = works today · **new** = to write.
 | `harness arm teach ...` / `locate ...` | arm + camera | `harness_calibration teach`, `locate` programs | find a module's tag, store its pose | have |
 | `harness bunny status` | bunny | `/bunny/status` (String JSON) | housing, weight, pump, dispensing, powder, link | have |
 | `harness bunny weight` / `tare` | bunny | `/bunny/weight` (Float64), `/bunny/tare` | scale (`scale_link.py`, `core.tare`) | have |
-| `harness bunny housing open` / `close` / `release` | bunny | `/bunny/housing_open`, `/bunny/housing_close`, `/bunny/housing_release` | windshield motor (`windshield.py`) | have |
+| `harness bunny housing open` / `close` / `half` / `release` | bunny | `/bunny/housing_open`, `/bunny/housing_close`, `/bunny/housing_half` (10° short of closed, holding), `/bunny/housing_release` | windshield motor (`windshield.py`) | have |
 | `harness bunny weigh-to <g> [powder\|liquid] [powder_id]` | bunny | `/bunny/weigh_to` (WeighTo) | dose by weight (`core.weighing_bunny`) | have |
 | `harness bunny liquid weigh <g>` | bunny | `/bunny/weigh_to` material=liquid | liquid dose by weight (`dispensing/liquid.py`) | have |
 | `harness bunny liquid push [rate]` / `pull [rate]` | bunny | `/bunny/liquid_run` (LiquidRun, re-armed every 0.4 s; the Bunny stops 1 s after the last call) | continuous flow until Ctrl-C or `liquid stop` | have |

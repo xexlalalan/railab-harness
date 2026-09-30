@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """/bunny — bridge to the Bunny's harness_server (bunny_side/harness_server.py) over TCP/JSON.
 
-Services (std_srvs/Trigger unless noted): housing_open, housing_close, housing_release, tare, abort,
+Services (std_srvs/Trigger unless noted): housing_open, housing_close, housing_half, housing_release, tare, abort,
 load_begin, load_end, liquid_suck, liquid_stop, gantry_park; weigh_to (WeighTo), liquid_push
 (LiquidPush), liquid_run (LiquidRun, continuous, caller re-calls every <1 s), barcode_read (Barcode), gantry_jog (GantryJog), locate (Trigger).
 Topics: /bunny/status (String, JSON, 2 Hz), /bunny/weight (Float64).
@@ -48,7 +48,7 @@ class BunnyNode(Node):
         self.pub_status = self.create_publisher(String, "/bunny/status", 10)
         self.pub_weight = self.create_publisher(Float64, "/bunny/weight", 10)
         self.create_timer(0.5, self.tick, callback_group=cb)
-        for name, long in (("housing_open", 60), ("housing_close", 60), ("housing_release", 5), ("tare", 60),
+        for name, long in (("housing_open", 60), ("housing_close", 60), ("housing_half", 60), ("housing_release", 5), ("tare", 60),
                            ("abort", 5), ("load_begin", 5), ("load_end", 5), ("liquid_suck", 10), ("liquid_stop", 5),
                            ("gantry_park", 60), ("locate", 60)):
             self.create_service(Trigger, "/bunny/" + name, self._trigger(name, long), callback_group=cb)

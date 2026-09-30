@@ -14,7 +14,7 @@ harness arm    move-pose <x> <y> <z> <roll> <pitch> <yaw> [--joint] [--speed N] 
 harness arm    move-j <j1..j6 deg> [--speed N]
 harness arm    teach ... | locate ...               (runs the calibration programs)
 harness bunny  status | weight | tare | abort | barcode [timeout_s]
-harness bunny  housing open | close | release
+harness bunny  housing open | close | half | release
 harness bunny  weigh-to <g> [powder|liquid] [powder_id]
 harness bunny  liquid push <steps> [rate] | pull <steps> [rate]   one continuous move (default 1200 steps/s)
 harness bunny  platform [±steps]                    move the weighing platform lift by steps (none = read position)
@@ -135,7 +135,7 @@ def serve():
             st = fresh("bunny", 3.0)
             return "OK %.4f g" % st["weight_g"] if st and st.get("weight_g") is not None else "FAILED no scale reading"
         if c in ("tare", "abort"): return trig("/bunny/" + c, 90)
-        if c == "housing" and len(w) > 1 and w[1] in ("open", "close", "release"): return trig("/bunny/housing_" + w[1], 90)
+        if c == "housing" and len(w) > 1 and w[1] in ("open", "close", "half", "release"): return trig("/bunny/housing_" + w[1], 90)
         if c == "barcode":
             t = float(w[1]) if len(w) > 1 else 30.0; out("scan a label within %.0f s ..." % t)
             r, err = call(Barcode, "/bunny/barcode_read", Barcode.Request(timeout_s=t), t + 5)
