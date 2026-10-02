@@ -43,7 +43,10 @@ def serve():
     from harness_msgs.action import MovePose, MoveJ
     from harness_planner import fill_to_mark
 
-    rclpy.init(); n = Node("harness_cli"); last = {}
+    # No rclpy signal handlers: a Ctrl-C in the terminal that first started this daemon must not
+    # shut the ROS context down under a still-running daemon ("rcl node's context is invalid").
+    from rclpy.signals import SignalHandlerOptions
+    rclpy.init(signal_handler_options=SignalHandlerOptions.NO); n = Node("harness_cli"); last = {}
     n.create_subscription(ArmStatus, "/arm/status", lambda m: last.__setitem__("arm", m), 10)
     n.create_subscription(GripperStatus, "/arm/gripper_status", lambda m: last.__setitem__("grip", m), 10)
     n.create_subscription(String, "/bunny/status", lambda m: last.__setitem__("bunny", (json.loads(m.data), time.time())), 10)
