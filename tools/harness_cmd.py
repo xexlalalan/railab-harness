@@ -23,7 +23,7 @@ harness bunny  load begin | end
 harness bunny  gantry park | jog <dx> <dy> <dz_up>   (mm; not on a Bunny without a gantry)
 harness dtv    status | lines | frame [file.png]
 harness dtv    z rel <mm> | move <mm> | zero | home | stop   (+ = camera DOWN)
-harness dtv    v clamp | open <mm> | release | home
+harness dtv    v clamp | open <mm> | max | release | home   (max = fully open; needs a home first)
 harness pipette status | home | stop | eject | aspirate <ul> [ul/s] [pre_ul] | dispense <ul> [ul/s] [blow_ul]
 harness pipette lld [mode] [timeout_s] [mm/s] | z home | stop | move <mm> | rel <mm>
 harness run    dilute-to-volume [--flask-ml 25] [--tube-ml 0.06] [--max-ml N] [--offset-px 0] [--ring-row R] [--watch]   (alias: fill-to-mark)
@@ -205,8 +205,8 @@ def serve():
             if s in ("zero", "home", "stop"): return trig("/dtv/z_" + {"zero": "set_zero"}.get(s, s), 130)
         if c == "v" and len(w) > 1:
             s = w[1]
-            if s in ("clamp", "release", "home"):
-                if s != "release": out("V-blocks %s ..." % ("closing" if s == "clamp" else "homing"))
+            if s in ("clamp", "release", "home", "max"):
+                if s != "release": out("V-blocks %s ..." % {"clamp": "closing", "home": "homing", "max": "opening fully"}[s])
                 return trig("/dtv/v_" + s, 200)
             if s == "open" and len(w) > 2:
                 r, err = call(MoveV, "/dtv/v_open", MoveV.Request(mm=float(w[2])), 40)

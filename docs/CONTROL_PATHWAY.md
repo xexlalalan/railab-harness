@@ -2,7 +2,7 @@
 
 One pathway: ROS 2 on the harness PC. The `harness` command (`tools/harness`, linked into `~/bin`, works from any directory), scripts and any GUI only call the interfaces below; only a module's node touches its hardware. The Bunny runs no ROS: its own app in harness mode (`python3 main.py harness`, Bunny repo `python/harness_server.py`, GUI not shown) owns its UART/scale/scanner and serves TCP/JSON on port 7801 to the `/bunny` node.
 
-Start/stop everything: `harness-nodes start | stop | status` (arm + camera nodes, dtv node, bunny node, pipette node, Bunny server). The `/pipette` node lives in the liquid-pipette repo (`ros/harness_pipette`, symlinked into `src/`), like `/dtv`. `harness --help` prints the command list.
+Start/stop everything: `harness-nodes start | stop | status | restart piper|camera|dtv|bunny|pipette` (restart = pkill that node, then start it again; logs in `/tmp/<name>.log`) (arm + camera nodes, dtv node, bunny node, pipette node, Bunny server). The `/pipette` node lives in the liquid-pipette repo (`ros/harness_pipette`, symlinked into `src/`), like `/dtv`. `harness --help` prints the command list.
 
 Status: **have** = works today · **new** = to write.
 
@@ -31,7 +31,7 @@ Status: **have** = works today · **new** = to write.
 | `harness dtv lines` / `frame [file.png]` | dtv | `/dtv/lines` (FlaskLines), `/dtv/image` | neck edges, ring row, surface rows, gap (`find_lines.py`, `flask_camera.py`) | have |
 | `harness dtv z rel <mm>` / `move <mm>` / `zero` / `stop` (+ = camera DOWN) | dtv | `/dtv/z_move` (MoveZ), `/dtv/z_set_zero`, `/dtv/z_stop` | camera Z stepper (Teensy `Z REL/MOVE/SETZERO/STOP`) | have |
 | `harness dtv z home` | dtv | `/dtv/z_home` | Z zero switch (not installed: answers ERR) | new (hardware) |
-| `harness dtv v clamp` / `open <mm>` / `release` / `home` | dtv | `/dtv/v_clamp`, `/dtv/v_open` (MoveV), `/dtv/v_release`, `/dtv/v_home` | V-block BLDC via 0xA4 position moves, stop at \|current\| > 1.5 A (`teensy.py`) | have |
+| `harness dtv v clamp` / `open <mm>` / `max` / `release` / `home` | dtv | `/dtv/v_clamp`, `/dtv/v_open` (MoveV), `/dtv/v_max` (fully open, to the stop found by `home`), `/dtv/v_release`, `/dtv/v_home` | V-block BLDC via 0xA4 position moves, stop at \|current\| > 1.5 A (`teensy.py`) | have |
 | `harness run fill-to-mark [--max-ml 5] [--offset-px 0] [--watch]` | planner | `harness_planner.fill_to_mark` over `/dtv/lines` + `/bunny/liquid_push` | dose until the surface reaches the ring, suck back; Ctrl-C stops the pump | have |
 | `harness run place-head` / `pick-head` | planner | — | arm puts the dispenser head on / off the Bunny at a taught pose | new |
 | `harness run weigh-receiver` | planner | — | housing open → arm place → load end → weigh-to → arm pick | new |
