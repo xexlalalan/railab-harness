@@ -682,4 +682,4 @@ Nodes: `/arm` (harness_arm), `/bunny` (harness_instrument/bunny_node — TCP/JSO
 harness mode, `python3 main.py harness`, Bunny repo `python/harness_server.py`; spec section "Harness Control Interface" there), `/dtv` (harness_dtv, lives in the
 dilute-to-volume repo, symlinked into `src/`). Compound operations: `harness_planner` (fill_to_mark).
 New interfaces in harness_msgs: FlaskLines, MoveZ, MoveV, WeighTo, LiquidPush, Barcode, GantryJog.
-`tools/harness-nodes start|stop|status` starts everything. Command ↔ module ↔ function table: **`docs/CONTROL_PATHWAY.md`**.
+`harness nodes start|stop|status|restart <node>` manages the node processes (was `tools/harness-nodes` until 2026-10-09). Command ↔ module ↔ function table: **`docs/CONTROL_PATHWAY.md`**.

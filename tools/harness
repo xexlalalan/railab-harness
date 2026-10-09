@@ -1,9 +1,40 @@
 #!/usr/bin/env bash
 # `harness <module> <command> ...` — every module operation from one shell command (see harness --help).
 # A background helper (tools/harness_cmd.py --serve) keeps the ROS clients alive, so a command answers at once.
+# `harness nodes ...` manages the node processes themselves (no ROS, no daemon): the one thing that must
+# work when nothing else runs.
 cd "$(dirname "$(readlink -f "$0")")/.."
 SOCK=/tmp/harness_cmd.sock
+
+# ---------------------------------------------------------------- node processes
+# name | pgrep pattern | start command   (one node per line; restart/log names use the first field)
+NODES="piper|harness_arm/piper_nod[e]|ros2 launch harness_arm piper.launch.py
+camera|harness_vision/tag_nod[e]|ros2 launch harness_vision camera.launch.py
+dtv|harness_dtv/dtv_nod[e]|ros2 run harness_dtv dtv_node
+bunny|harness_instrument/bunny_nod[e]|ros2 run harness_instrument bunny_node
+pipette|harness_pipette/pipette_nod[e]|ros2 run harness_pipette pipette_node"
+start_bg() { pgrep -f "$2" >/dev/null && { echo "$1: already running"; return; }; setsid nohup $3 >/tmp/$1.log 2>&1 </dev/null & echo "$1: started"; }
+kill_node() { pkill -f "$2" && echo "$1: stopped" || echo "$1: was not running"; }
+each_node() { while IFS='|' read -r n p c; do "$1" "$n" "$p" "$c"; done <<<"$NODES"; }
+# The Bunny app (GUI, or `main.py harness` headless) serves port 7801 itself; it is started on the Bunny, not from here.
+bunny_check() { timeout 3 bash -c "</dev/tcp/${BUNNY_HOST:-192.168.7.2}/7801" 2>/dev/null && echo "bunny server: reachable" || echo "bunny server: NOT reachable (start the Bunny app)"; }
+nodes() {
+  source rosenv.sh 2>/dev/null
+  case "$1" in
+    start)   each_node start_bg; bunny_check ;;
+    stop)    for n in dtv bunny pipette; do kill_node "$n" "$(grep "^$n|" <<<"$NODES" | cut -d'|' -f2)"; done
+             pkill -f "harness_cmd.py --serv[e]" && echo "CLI daemon: stopped"
+             echo "(arm, camera nodes and the Bunny app left running)" ;;
+    restart) line=$(grep "^$2|" <<<"$NODES") || { echo "usage: harness nodes restart piper|camera|dtv|bunny|pipette"; exit 2; }
+             IFS='|' read -r n p c <<<"$line"; kill_node "$n" "$p"; sleep 2; start_bg "$n" "$p" "$c" ;;
+    status)  timeout 10 ros2 node list 2>/dev/null; bunny_check ;;
+    *)       echo "usage: harness nodes start|stop|status|restart piper|camera|dtv|bunny|pipette"; exit 2 ;;
+  esac
+}
+
+# ---------------------------------------------------------------- commands
 case "$1" in
+  nodes) nodes "${@:2}"; exit $? ;;
   daemon-stop) pkill -f "harness_cmd.py --serve"; rm -f $SOCK; echo stopped; exit 0 ;;
   arm)
     case "$2" in
