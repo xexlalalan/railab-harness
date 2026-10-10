@@ -1,8 +1,10 @@
-float64 volume_ml         # liquid volume to dispense
-float64 density_g_per_ml  # 0 = the Bunny's configured density (water 1.0); the Bunny doses the equivalent mass by weight
+float64 volume_ml         # liquid volume to dispense, OPEN-LOOP (no scale): the Bunny converts it to pump steps
+float64 density_g_per_ml  # 0 = the Bunny's configured density (water 1.0)
+int32 rate                # pump steps/s, 0 = Bunny default
 ---
 bool success
-string outcome            # finished | stopped | bottle empty | error text
-float64 target_g          # mass target the Bunny derived from the volume
-float64 actual_g
+int32 steps               # pump steps actually pushed (net of suck-back re-advance)
+int32 steps_planned
+float64 target_g          # approx. mass the volume corresponds to
+float64 actual_ml         # steps pushed converted back to mL
 string message

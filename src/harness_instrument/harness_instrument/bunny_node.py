@@ -4,7 +4,7 @@
 Services (std_srvs/Trigger unless noted): housing_open, housing_close, housing_half, housing_release, tare, abort,
 load_begin, load_end, liquid_suck, liquid_stop, gantry_park; weigh_to (WeighTo), liquid_push
 (LiquidPush), liquid_run (LiquidRun, continuous, caller re-calls every <1 s), dispense_volume (DispenseVolume: liquid by volume,
-the Bunny converts it to a mass target with its density and doses by weight), barcode_read (Barcode), gantry_jog (GantryJog), locate (Trigger).
+open-loop: the Bunny converts it to pump steps with its liquid profile, no scale), barcode_read (Barcode), gantry_jog (GantryJog), locate (Trigger).
 Topics: /bunny/status (String, JSON, 2 Hz), /bunny/weight (Float64).
 Long operations block their service call; the node is multi-threaded so status and abort keep working.
 """
@@ -92,14 +92,16 @@ class BunnyNode(Node):
         return res
 
     def dispense_volume(self, req, res):
+        """Open-loop volume dose: the Bunny turns mL into pump steps with its liquid profile (no scale)."""
         try:
-            args = {"volume_ml": req.volume_ml}
+            args = {"volume_ml": req.volume_ml, "rate": req.rate}
             if req.density_g_per_ml > 0: args["density_g_per_ml"] = req.density_g_per_ml
-            r = self.link.call("dispense_volume", args, timeout=1800)
-            res.outcome = r.get("outcome", ""); res.actual_g = float(r.get("actual_g") or 0.0); res.target_g = float(r.get("target_g") or 0.0)
-            res.success = res.outcome == "finished"; res.message = json.dumps(r)
+            r = self.link.call("dispense_volume", args, timeout=600)
+            res.steps = int(r.get("steps", 0)); res.steps_planned = int(r.get("steps_planned", 0))
+            res.target_g = float(r.get("target_g") or 0.0); res.actual_ml = float(r.get("actual_ml") or 0.0)
+            res.success = res.steps > 0 and res.steps >= res.steps_planned; res.message = json.dumps(r)
         except Exception as e:
-            res.success = False; res.outcome = "error"; res.message = str(e)
+            res.success = False; res.message = str(e)
         return res
 
     def liquid_push(self, req, res):
