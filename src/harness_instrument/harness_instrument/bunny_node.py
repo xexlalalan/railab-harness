@@ -83,8 +83,10 @@ class BunnyNode(Node):
 
     def weigh_to(self, req, res):
         try:
-            r = self.link.call("weigh_to", {"target_g": req.target_g, "material": req.material or "powder",
-                                            "powder_id": req.powder_id}, timeout=1800)
+            args = {"target_g": req.target_g, "material": req.material or "powder"}
+            if req.powder_id:                  # a barcode id, or a powder NAME the Bunny looks up in its database
+                args["powder_name" if not req.powder_id.strip().isdigit() else "powder_id"] = req.powder_id.strip()
+            r = self.link.call("weigh_to", args, timeout=1800)
             res.outcome = r.get("outcome", ""); res.actual_g = float(r.get("actual_g") or 0.0)
             res.success = res.outcome == "finished"; res.message = json.dumps(r)
         except Exception as e:

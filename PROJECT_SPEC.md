@@ -683,3 +683,19 @@ harness mode, `python3 main.py harness`, Bunny repo `python/harness_server.py`; 
 dilute-to-volume repo, symlinked into `src/`). Compound operations: `harness_planner` (fill_to_mark).
 New interfaces in harness_msgs: FlaskLines, MoveZ, MoveV, WeighTo, LiquidPush, Barcode, GantryJog.
 `harness nodes start|stop|status|restart <node>` manages the node processes (was `tools/harness-nodes` until 2026-10-09). Command ↔ module ↔ function table: **`docs/CONTROL_PATHWAY.md`**.
+
+## 2026-10-10 — External planner interface (workflow server) — CONTRACT
+
+An external orchestrator drives the harness by **workflow + step number** over the cell network (RJ45 to the PC, `192.168.7.1`; any interface). Server: `tools/workflow_server.py`, process `workflows` under `harness nodes`, **TCP port 7802**, newline-delimited JSON, one request per connection.
+
+| Request | Reply lines |
+|---|---|
+| `{"cmd":"run","workflow":"origami","step":4,"args":["4.803"]}` | `{"event":"started",...,"script":"04_…sh"}`, then `{"event":"output","line":"…"}` for every line the step prints, then **`{"event":"finish","workflow":"origami","step":4,"ok":true,"rc":0,"seconds":41.2,"finished_at":"…"}`**; connection closed. While another step runs: `{"event":"refused","reason":"busy","workflow":…,"step":…}` |
+| `{"cmd":"status"}` | `{"busy":true,"workflow":…,"step":…,"since_s":12.0,"last":{…}}` or `{"busy":false,"last":{…finish fields…}}` — the second way to learn the harness is free |
+| `{"cmd":"list","workflow":"origami"}` | `{"workflow":"origami","steps":[{"step":1,"script":…,"title":…},…]}` |
+| `{"cmd":"stop"}` | SIGINT to the running step (cancels the `harness` call in flight; a Bunny dispense already running needs `harness bunny abort`) |
+| anything else | `{"error":"…"}` |
+
+Rules: one step at a time (the planner serialises; a `run` while busy is refused, never queued); `ok` = the step script's exit status 0 = every `harness` call in it answered OK; the step keeps running to its end if the planner disconnects (its finish is then visible in `status.last`). A workflow is `workflows/<dir>/` with a supervisor executable named after it (`origami`, `neuromorphic`); steps are `NN_*.sh`, line 2 is the title. The CLI daemon now splits commands with `shlex`, so quoted arguments (`"Citric Acid"`) reach the node whole; `weigh-to` accepts a powder **name** (the bunny node sends a non-numeric id as `powder_name`, the Bunny resolves it in its database — Bunny spec "Harness Control Interface").
+
+Origami steps rewritten to the operator's 2026-10-10 list (see `docs/CONTROL_PATHWAY.md`).

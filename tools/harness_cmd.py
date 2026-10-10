@@ -4,7 +4,7 @@ nodes, so every shell command costs only the service call. tools/harness starts 
 (--serve) and sends one line over a unix socket; the daemon streams reply lines and closes the
 connection; the last line starts with OK or FAILED.
 """
-import json, math, os, socket, sys, threading, time
+import json, math, os, shlex, socket, sys, threading, time
 
 SOCK = "/tmp/harness_cmd.sock"
 
@@ -15,7 +15,7 @@ harness arm    move-j <j1..j6 deg> [--speed N]
 harness arm    teach ... | locate ...               (runs the calibration programs)
 harness bunny  status | weight | tare | abort | barcode [timeout_s]
 harness bunny  housing open | close | half | release
-harness bunny  weigh-to <g> [powder|liquid] [powder_id]
+harness bunny  weigh-to <g> [powder|liquid] [powder id or "name"]
 harness bunny  liquid push <steps> [rate] | pull <steps> [rate]   one continuous move (default 1200 steps/s)
 harness bunny  platform [±steps]                    move the weighing platform lift by steps (none = read position)
 harness bunny  liquid weigh <g> | volume <mL> [g/mL] [rate] | suck | stop | pos   (volume = open-loop pump steps from the liquid profile, no scale)
@@ -27,7 +27,7 @@ harness dtv    v clamp | open <mm> | max | release | home   (max = fully open; n
 harness pipette status | home | stop | eject | aspirate <ul> [ul/s] [pre_ul] | dispense <ul> [ul/s] [blow_ul]
 harness pipette lld [mode] [timeout_s] [mm/s] | z home | stop | move <mm> | rel <mm>
 harness run    dilute-to-volume [--flask-ml 25] [--tube-ml 0.06] [--max-ml N] [--offset-px 0] [--ring-row R] [--watch]   (alias: fill-to-mark)
-harness nodes  start | stop | status | restart piper|camera|dtv|bunny|pipette   (node processes; no daemon involved)
+harness nodes  start | stop | status | restart piper|camera|dtv|bunny|pipette|workflows   (node processes; no daemon involved)
 harness daemon-stop                                 (next harness call starts a fresh daemon = reloads harness_cmd.py)"""
 
 
@@ -259,7 +259,7 @@ def serve():
         return "FAILED unknown workflow; available: dilute-to-volume"
 
     def handle(line, out, cancelled):
-        w = line.split()
+        w = shlex.split(line)          # quoted words survive ("Citric Acid")
         if not w or w[0] in ("--help", "help", "-h"): return "OK\n" + USAGE
         return {"arm": do_arm, "bunny": do_bunny, "dtv": do_dtv, "pipette": do_pipette, "run": do_run}.get(w[0], lambda *a: "FAILED unknown group; see harness --help")(w[1:], out, cancelled)
 
@@ -308,6 +308,6 @@ if __name__ == "__main__":
     if sys.argv[1:2] == ["--serve"]:
         serve()
     else:
-        r = client(" ".join(sys.argv[1:]))
+        r = client(shlex.join(sys.argv[1:]))
         if r is None: print("daemon not running"); sys.exit(3)
         sys.exit(1 if r.startswith("FAILED") else 0)

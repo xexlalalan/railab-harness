@@ -2,7 +2,7 @@
 
 One pathway: ROS 2 on the harness PC. The `harness` command (`tools/harness`, linked into `~/bin`, works from any directory), scripts and any GUI only call the interfaces below; only a module's node touches its hardware. The Bunny runs no ROS: its own app in harness mode (`python3 main.py harness`, Bunny repo `python/harness_server.py`, GUI not shown) owns its UART/scale/scanner and serves TCP/JSON on port 7801 to the `/bunny` node.
 
-Start/stop everything: `harness nodes start | stop | status | restart piper|camera|dtv|bunny|pipette` (restart = pkill that node, then start it again; logs in `/tmp/<name>.log`; replaces `harness-nodes`, removed 2026-10-09) (arm + camera nodes, dtv node, bunny node, pipette node, Bunny server). The `/pipette` node lives in the liquid-pipette repo (`ros/harness_pipette`, symlinked into `src/`), like `/dtv`. `harness --help` prints the command list.
+Start/stop everything: `harness nodes start | stop | status | restart piper|camera|dtv|bunny|pipette|workflows` (restart = pkill that node, then start it again; logs in `/tmp/<name>.log`; replaces `harness-nodes`, removed 2026-10-09) (arm + camera nodes, dtv node, bunny node, pipette node, Bunny server). The `/pipette` node lives in the liquid-pipette repo (`ros/harness_pipette`, symlinked into `src/`), like `/dtv`. `harness --help` prints the command list.
 
 Status: **have** = works today · **new** = to write.
 
@@ -19,7 +19,7 @@ Status: **have** = works today · **new** = to write.
 | `harness bunny status` | bunny | `/bunny/status` (String JSON) | housing, weight, pump, dispensing, powder, link | have |
 | `harness bunny weight` / `tare` | bunny | `/bunny/weight` (Float64), `/bunny/tare` | scale (`scale_link.py`, `core.tare`) | have |
 | `harness bunny housing open` / `close` / `half` / `release` | bunny | `/bunny/housing_open`, `/bunny/housing_close`, `/bunny/housing_half` (10° short of closed, holding), `/bunny/housing_release` | windshield motor (`windshield.py`) | have |
-| `harness bunny weigh-to <g> [powder\|liquid] [powder_id]` | bunny | `/bunny/weigh_to` (WeighTo) | dose by weight (`core.weighing_bunny`) | have |
+| `harness bunny weigh-to <g> [powder\|liquid] [powder id or "name"]` | bunny | `/bunny/weigh_to` (WeighTo) | dose by weight (`core.weighing_bunny`) | have |
 | `harness bunny liquid weigh <g>` | bunny | `/bunny/weigh_to` material=liquid | liquid dose by weight (`dispensing/liquid.py`) | have |
 | `harness bunny liquid volume <mL> [g/mL] [rate]` | bunny | `/bunny/dispense_volume` (DispenseVolume) | liquid dose by volume, **open-loop** (receiver not on the scale): the Bunny converts mL → g → pump steps with its liquid profile (`steps_per_mg`, water 0.556 µL/step), pushes, sucks back | have |
 | `harness bunny liquid push [rate]` / `pull [rate]` | bunny | `/bunny/liquid_run` (LiquidRun, re-armed every 0.4 s; the Bunny stops 1 s after the last call) | continuous flow until Ctrl-C or `liquid stop` | have |
@@ -36,3 +36,7 @@ Status: **have** = works today · **new** = to write.
 | `harness run fill-to-mark [--max-ml 5] [--offset-px 0] [--watch]` | planner | `harness_planner.fill_to_mark` over `/dtv/lines` + `/bunny/liquid_push` | dose until the surface reaches the ring, suck back; Ctrl-C stops the pump | have |
 | `harness run place-head` / `pick-head` | planner | — | arm puts the dispenser head on / off the Bunny at a taught pose | new |
 | `harness run weigh-receiver` | planner | — | housing open → arm place → load end → weigh-to → arm pick | new |
+
+## External planner → workflow steps (2026-10-10)
+
+`tools/workflow_server.py` (process `workflows` in `harness nodes`) listens on **TCP 7802** (the PC's RJ45 `192.168.7.1` and Wi-Fi) for newline-delimited JSON and runs one step script at a time: `{"cmd":"run","workflow":"origami","step":4,"args":[]}` → `started`, one `output` event per printed line, then **`finish`** (`ok`, `rc`, `seconds`) and the connection closes. `{"cmd":"status"}` → `{"busy": true|false, ...}` from any other connection at any time. Also `list` and `stop`. Full contract in `PROJECT_SPEC.md` "External planner interface". Steps: `workflows/origami-robot/` 1 housing open · 2 half · 3 close · 4 tare + 4.803 g "Citric Acid" · 5 tare + 20 g liquid by weight · 6 dilute-to-volume (clamp, fill, open 10 mm) · 7 9 mL liquid by volume · 8 pipette aspirate 1000 µL @500 µL/s, 1 µL pre · 9 dispense 1000 @500, 100 µL post · 10 tip eject.

@@ -12,7 +12,8 @@ NODES="piper|harness_arm/piper_nod[e]|ros2 launch harness_arm piper.launch.py
 camera|harness_vision/tag_nod[e]|ros2 launch harness_vision camera.launch.py
 dtv|harness_dtv/dtv_nod[e]|ros2 run harness_dtv dtv_node
 bunny|harness_instrument/bunny_nod[e]|ros2 run harness_instrument bunny_node
-pipette|harness_pipette/pipette_nod[e]|ros2 run harness_pipette pipette_node"
+pipette|harness_pipette/pipette_nod[e]|ros2 run harness_pipette pipette_node
+workflows|tools/workflow_serve[r].py|python3 tools/workflow_server.py"
 start_bg() {
   pgrep -f "$2" >/dev/null && { echo "$1: already running"; return; }
   setsid nohup $3 >/tmp/$1.log 2>&1 </dev/null &
@@ -27,13 +28,13 @@ nodes() {
   source rosenv.sh 2>/dev/null
   case "$1" in
     start)   each_node start_bg; bunny_check ;;
-    stop)    for n in dtv bunny pipette; do kill_node "$n" "$(grep "^$n|" <<<"$NODES" | cut -d'|' -f2)"; done
+    stop)    for n in dtv bunny pipette workflows; do kill_node "$n" "$(grep "^$n|" <<<"$NODES" | cut -d'|' -f2)"; done
              pkill -f "harness_cmd.py --serv[e]" && echo "CLI daemon: stopped"
              echo "(arm, camera nodes and the Bunny app left running)" ;;
-    restart) line=$(grep "^$2|" <<<"$NODES") || { echo "usage: harness nodes restart piper|camera|dtv|bunny|pipette"; exit 2; }
+    restart) line=$(grep "^$2|" <<<"$NODES") || { echo "usage: harness nodes restart piper|camera|dtv|bunny|pipette|workflows"; exit 2; }
              IFS='|' read -r n p c <<<"$line"; kill_node "$n" "$p"; sleep 2; start_bg "$n" "$p" "$c" ;;
     status)  timeout 10 ros2 node list 2>/dev/null; bunny_check ;;
-    *)       echo "usage: harness nodes start|stop|status|restart piper|camera|dtv|bunny|pipette"; exit 2 ;;
+    *)       echo "usage: harness nodes start|stop|status|restart piper|camera|dtv|bunny|pipette|workflows"; exit 2 ;;
   esac
 }
 
