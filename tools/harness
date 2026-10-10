@@ -13,7 +13,12 @@ camera|harness_vision/tag_nod[e]|ros2 launch harness_vision camera.launch.py
 dtv|harness_dtv/dtv_nod[e]|ros2 run harness_dtv dtv_node
 bunny|harness_instrument/bunny_nod[e]|ros2 run harness_instrument bunny_node
 pipette|harness_pipette/pipette_nod[e]|ros2 run harness_pipette pipette_node"
-start_bg() { pgrep -f "$2" >/dev/null && { echo "$1: already running"; return; }; setsid nohup $3 >/tmp/$1.log 2>&1 </dev/null & echo "$1: started"; }
+start_bg() {
+  pgrep -f "$2" >/dev/null && { echo "$1: already running"; return; }
+  setsid nohup $3 >/tmp/$1.log 2>&1 </dev/null &
+  for i in $(seq 1 60); do pgrep -f "$2" >/dev/null && { echo "$1: started"; return; }; sleep 0.25; done   # ros2 launch needs a few s before the node process exists: a second start in that window would double it
+  echo "$1: launched, node process not seen within 15 s (see /tmp/$1.log)"
+}
 kill_node() { pkill -f "$2" && echo "$1: stopped" || echo "$1: was not running"; }
 each_node() { while IFS='|' read -r n p c; do "$1" "$n" "$p" "$c"; done <<<"$NODES"; }
 # The Bunny app (GUI, or `main.py harness` headless) serves port 7801 itself; it is started on the Bunny, not from here.
