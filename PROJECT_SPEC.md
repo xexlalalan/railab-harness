@@ -690,7 +690,7 @@ An external orchestrator drives the harness by **workflow + step number** over t
 
 | Request | Reply lines |
 |---|---|
-| `{"cmd":"run","step":4}` (optional `"workflow":"origami"` — default is the server's, `--workflow`; optional `"args":["4.803"]` = positional arguments for the step script, overriding its defaults) | `{"event":"started",...,"script":"04_…sh"}`, then `{"event":"output","line":"…"}` for every line the step prints, then **`{"event":"finish","workflow":"origami","step":4,"ok":true,"rc":0,"seconds":41.2,"finished_at":"…"}`**; connection closed. While another step runs: `{"event":"refused","reason":"busy","workflow":…,"step":…}` |
+| `{"cmd":"run","step":4}` (optional `"workflow":"origami"` — default is the server's, `--workflow`; the steps are fixed, no arguments — operator 2026-10-10) | `{"event":"started",...,"script":"04_…sh"}`, then `{"event":"output","line":"…"}` for every line the step prints, then **`{"event":"finish","workflow":"origami","step":4,"ok":true,"rc":0,"seconds":41.2,"finished_at":"…"}`**; connection closed. While another step runs: `{"event":"refused","reason":"busy","workflow":…,"step":…}` |
 | `{"cmd":"status"}` | `{"busy":true,"workflow":…,"step":…,"since_s":12.0,"last":{…}}` or `{"busy":false,"last":{…finish fields…}}` — the second way to learn the harness is free |
 | `{"cmd":"list"}` (optional `"workflow"`) | `{"workflow":"origami","steps":[{"step":1,"script":…,"title":…},…]}` |
 | `{"cmd":"stop"}` | SIGINT to the running step (cancels the `harness` call in flight; a Bunny dispense already running needs `harness bunny abort`) |

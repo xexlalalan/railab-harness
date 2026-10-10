@@ -4,9 +4,8 @@
 One request per line, replies are JSON lines on the same connection; a `run` streams the step's
 output and ends with a "finish" event, then the connection closes. One step runs at a time.
 "workflow" is optional everywhere: it defaults to the server's workflow (--workflow, default origami).
-"args" is optional: positional arguments for the step script, overriding its defaults (step 5 args ["25"] = 25 g).
 
-  {"cmd": "run", "step": 4}            (or "workflow": "origami", "args": ["4.803"])
+  {"cmd": "run", "step": 4}            (or with "workflow": "origami")
       -> {"event": "started", "workflow": "origami", "step": 4, "script": "04_citric_acid_4_803g.sh"}
       -> {"event": "output", "line": ">>> harness bunny tare"}          (every line the step prints)
       -> {"event": "finish", "workflow": "origami", "step": 4, "ok": true, "rc": 0, "seconds": 41.2}
@@ -65,7 +64,7 @@ class Handler(socketserver.StreamRequestHandler):
                 wf = str(req.get("workflow") or DEFAULT_WORKFLOW)
                 self.send({"workflow": wf, "steps": steps_of(workflow_dir(wf))})
             elif cmd == "run":
-                self.run(str(req.get("workflow") or DEFAULT_WORKFLOW), int(req["step"]), [str(a) for a in req.get("args") or []])
+                self.run(str(req.get("workflow") or DEFAULT_WORKFLOW), int(req["step"]))
             elif cmd == "stop":
                 self.send(self.stop())
             else:
@@ -91,7 +90,7 @@ class Handler(socketserver.StreamRequestHandler):
         os.killpg(p.pid, signal.SIGINT)
         return {"ok": True, "stopped": {"workflow": b["workflow"], "step": b["step"]}}
 
-    def run(self, wf, step, args):
+    def run(self, wf, step):
         d = workflow_dir(wf)
         script = next((s for s in steps_of(d) if s["step"] == step), None)
         if script is None:
@@ -100,13 +99,13 @@ class Handler(socketserver.StreamRequestHandler):
             if state["busy"]:
                 self.send({"event": "refused", "reason": "busy", "workflow": state["busy"]["workflow"], "step": state["busy"]["step"]}); return
             env = dict(os.environ, PATH=os.path.expanduser("~/bin") + ":" + os.environ.get("PATH", ""))
-            p = subprocess.Popen(["bash", os.path.join(d, script["script"])] + args, cwd=d, env=env,
+            p = subprocess.Popen(["bash", os.path.join(d, script["script"])], cwd=d, env=env,
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                  text=True, bufsize=1, start_new_session=True)
             state["busy"] = {"workflow": wf, "step": step, "t0": time.time()}; state["proc"] = p
         t0 = time.time()
         self.send({"event": "started", "workflow": wf, "step": step, "script": script["script"]})
-        print("%s run %s %d %s" % (time.strftime("%H:%M:%S"), wf, step, args), flush=True)
+        print("%s run %s %d" % (time.strftime("%H:%M:%S"), wf, step), flush=True)
         try:
             for out in p.stdout:
                 out = out.rstrip("\n")
