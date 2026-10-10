@@ -18,7 +18,7 @@ harness bunny  housing open | close | half | release
 harness bunny  weigh-to <g> [powder|liquid] [powder_id]
 harness bunny  liquid push <steps> [rate] | pull <steps> [rate]   one continuous move (default 1200 steps/s)
 harness bunny  platform [±steps]                    move the weighing platform lift by steps (none = read position)
-harness bunny  liquid weigh <g> | suck | stop | pos
+harness bunny  liquid weigh <g> | volume <mL> [g/mL] | suck | stop | pos   (volume = mass target via density, dosed by weight)
 harness bunny  load begin | end
 harness bunny  gantry park | jog <dx> <dy> <dz_up>   (mm; not on a Bunny without a gantry)
 harness dtv    status | lines | frame [file.png]
@@ -40,7 +40,7 @@ def serve():
     from std_msgs.msg import String
     from sensor_msgs.msg import Image
     from harness_msgs.msg import ArmStatus, GripperStatus, FlaskLines
-    from harness_msgs.srv import SetGripper, MoveZ, MoveV, WeighTo, LiquidPush, LiquidRun, Barcode, GantryJog, Volume, Lld
+    from harness_msgs.srv import SetGripper, MoveZ, MoveV, WeighTo, LiquidPush, LiquidRun, Barcode, GantryJog, Volume, Lld, DispenseVolume
     from harness_msgs.action import MovePose, MoveJ
     from harness_planner import fill_to_mark
 
@@ -154,6 +154,12 @@ def serve():
         if c == "liquid" and len(w) > 1:
             s = w[1]
             if s == "weigh" and len(w) > 2: return do_bunny(["weigh-to", w[2], "liquid"], out, cancelled)
+            if s == "volume" and len(w) > 2:
+                req = DispenseVolume.Request(volume_ml=float(w[2]), density_g_per_ml=float(w[3]) if len(w) > 3 else 0.0)
+                out("dispensing %.3f mL of liquid by weight ... (harness bunny abort to stop)" % req.volume_ml)
+                r, err = call(DispenseVolume, "/bunny/dispense_volume", req, 1800)
+                if err: return "FAILED " + err
+                return ("OK " if r.success else "FAILED ") + "%s, target %.4f g, scale %.4f g" % (r.outcome, r.target_g, r.actual_g)
             if s in ("push", "pull") and len(w) > 2:
                 steps = int(float(w[2])) * (1 if s == "push" else -1); rate = int(float(w[3])) if len(w) > 3 else 1200
                 r, err = call(LiquidPush, "/bunny/liquid_push", LiquidPush.Request(steps=steps, rate=rate, wait=True), abs(steps) / max(rate, 20) + 30)

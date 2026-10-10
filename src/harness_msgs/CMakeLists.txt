@@ -17,6 +17,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "srv/MoveZ.srv"
   "srv/MoveV.srv"
   "srv/WeighTo.srv"
+  "srv/DispenseVolume.srv"
   "srv/LiquidPush.srv"
   "srv/LiquidRun.srv"
   "srv/Barcode.srv"

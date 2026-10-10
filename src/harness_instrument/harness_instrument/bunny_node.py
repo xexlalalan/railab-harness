@@ -3,7 +3,8 @@
 
 Services (std_srvs/Trigger unless noted): housing_open, housing_close, housing_half, housing_release, tare, abort,
 load_begin, load_end, liquid_suck, liquid_stop, gantry_park; weigh_to (WeighTo), liquid_push
-(LiquidPush), liquid_run (LiquidRun, continuous, caller re-calls every <1 s), barcode_read (Barcode), gantry_jog (GantryJog), locate (Trigger).
+(LiquidPush), liquid_run (LiquidRun, continuous, caller re-calls every <1 s), dispense_volume (DispenseVolume: liquid by volume,
+the Bunny converts it to a mass target with its density and doses by weight), barcode_read (Barcode), gantry_jog (GantryJog), locate (Trigger).
 Topics: /bunny/status (String, JSON, 2 Hz), /bunny/weight (Float64).
 Long operations block their service call; the node is multi-threaded so status and abort keep working.
 """
@@ -14,7 +15,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from std_srvs.srv import Trigger
 from std_msgs.msg import String, Float64
-from harness_msgs.srv import WeighTo, LiquidPush, LiquidRun, Barcode, GantryJog
+from harness_msgs.srv import WeighTo, LiquidPush, LiquidRun, Barcode, GantryJog, DispenseVolume
 
 
 class BunnyLink:
@@ -54,6 +55,7 @@ class BunnyNode(Node):
             self.create_service(Trigger, "/bunny/" + name, self._trigger(name, long), callback_group=cb)
         self.create_service(WeighTo, "/bunny/weigh_to", self.weigh_to, callback_group=cb)
         self.create_service(LiquidPush, "/bunny/liquid_push", self.liquid_push, callback_group=cb)
+        self.create_service(DispenseVolume, "/bunny/dispense_volume", self.dispense_volume, callback_group=cb)
         self.create_service(LiquidPush, "/bunny/platform", self.platform, callback_group=cb)
         self.create_service(LiquidRun, "/bunny/liquid_run", self.liquid_run, callback_group=cb)
         self.create_service(Barcode, "/bunny/barcode_read", self.barcode, callback_group=cb)
@@ -84,6 +86,17 @@ class BunnyNode(Node):
             r = self.link.call("weigh_to", {"target_g": req.target_g, "material": req.material or "powder",
                                             "powder_id": req.powder_id}, timeout=1800)
             res.outcome = r.get("outcome", ""); res.actual_g = float(r.get("actual_g") or 0.0)
+            res.success = res.outcome == "finished"; res.message = json.dumps(r)
+        except Exception as e:
+            res.success = False; res.outcome = "error"; res.message = str(e)
+        return res
+
+    def dispense_volume(self, req, res):
+        try:
+            args = {"volume_ml": req.volume_ml}
+            if req.density_g_per_ml > 0: args["density_g_per_ml"] = req.density_g_per_ml
+            r = self.link.call("dispense_volume", args, timeout=1800)
+            res.outcome = r.get("outcome", ""); res.actual_g = float(r.get("actual_g") or 0.0); res.target_g = float(r.get("target_g") or 0.0)
             res.success = res.outcome == "finished"; res.message = json.dumps(r)
         except Exception as e:
             res.success = False; res.outcome = "error"; res.message = str(e)
