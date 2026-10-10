@@ -3,15 +3,17 @@
 
 One request per line, replies are JSON lines on the same connection; a `run` streams the step's
 output and ends with a "finish" event, then the connection closes. One step runs at a time.
+"workflow" is optional everywhere: it defaults to the server's workflow (--workflow, default origami).
+"args" is optional: positional arguments for the step script, overriding its defaults (step 5 args ["25"] = 25 g).
 
-  {"cmd": "run", "workflow": "origami", "step": 4, "args": ["4.803"]}
+  {"cmd": "run", "step": 4}            (or "workflow": "origami", "args": ["4.803"])
       -> {"event": "started", "workflow": "origami", "step": 4, "script": "04_citric_acid_4_803g.sh"}
       -> {"event": "output", "line": ">>> harness bunny tare"}          (every line the step prints)
       -> {"event": "finish", "workflow": "origami", "step": 4, "ok": true, "rc": 0, "seconds": 41.2}
       -> {"event": "refused", "reason": "busy", "workflow": "origami", "step": 3}   (while another step runs)
   {"cmd": "status"}  -> {"busy": true, "workflow": "origami", "step": 4, "since_s": 12.0, "last": {...}}
                      -> {"busy": false, "last": {"workflow": ..., "step": ..., "ok": ..., "rc": ..., "seconds": ..., "finished_at": ...}}
-  {"cmd": "list", "workflow": "origami"}  -> {"workflow": "origami", "steps": [{"step": 1, "script": "01_housing_open.sh", "title": "open the Bunny housing"}, ...]}
+  {"cmd": "list"}    -> {"workflow": "origami", "steps": [{"step": 1, "script": "01_housing_open.sh", "title": "open the Bunny housing"}, ...]}
   {"cmd": "stop"}    -> {"ok": true, "stopped": {...}}   SIGINT to the running step (the `harness` call in flight is cancelled;
                                                           a Bunny dispense in progress keeps going until `harness bunny abort`)
 Errors: {"error": "..."}.  A workflow is a directory workflows/<dir>/ whose supervisor executable is named <workflow>
@@ -20,6 +22,7 @@ Errors: {"error": "..."}.  A workflow is a directory workflows/<dir>/ whose supe
 import glob, json, os, signal, socketserver, subprocess, sys, threading, time
 
 PORT = int(os.environ.get("WORKFLOW_PORT", 7802))
+DEFAULT_WORKFLOW = "origami"
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKFLOWS = os.path.join(ROOT, "workflows")
 
@@ -59,10 +62,10 @@ class Handler(socketserver.StreamRequestHandler):
             if cmd == "status":
                 self.send(self.status())
             elif cmd == "list":
-                d = workflow_dir(str(req["workflow"]))
-                self.send({"workflow": req["workflow"], "steps": steps_of(d)})
+                wf = str(req.get("workflow") or DEFAULT_WORKFLOW)
+                self.send({"workflow": wf, "steps": steps_of(workflow_dir(wf))})
             elif cmd == "run":
-                self.run(str(req["workflow"]), int(req["step"]), [str(a) for a in req.get("args") or []])
+                self.run(str(req.get("workflow") or DEFAULT_WORKFLOW), int(req["step"]), [str(a) for a in req.get("args") or []])
             elif cmd == "stop":
                 self.send(self.stop())
             else:
@@ -127,8 +130,12 @@ class Server(socketserver.ThreadingTCPServer):
 
 
 def main():
+    global DEFAULT_WORKFLOW
+    if "--workflow" in sys.argv:
+        DEFAULT_WORKFLOW = sys.argv[sys.argv.index("--workflow") + 1]
+    workflow_dir(DEFAULT_WORKFLOW)
     srv = Server(("0.0.0.0", PORT), Handler)
-    print("workflow server on port %d, workflows in %s" % (PORT, WORKFLOWS), flush=True)
+    print("workflow server on port %d, default workflow %s, workflows in %s" % (PORT, DEFAULT_WORKFLOW, WORKFLOWS), flush=True)
     srv.serve_forever()
 
 
