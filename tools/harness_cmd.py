@@ -150,7 +150,8 @@ def serve():
             out("dispensing %.3f g of %s ... (harness bunny abort to stop)" % (req.target_g, req.material))
             r, err = call(WeighTo, "/bunny/weigh_to", req, 1800)
             if err: return "FAILED " + err
-            return ("OK " if r.success else "FAILED ") + "%s, scale %.4f g" % (r.outcome, r.actual_g)
+            return ("OK " if r.success else "FAILED ") + "%s, scale %.4f g" % (r.outcome, r.actual_g) + \
+                (": " + r.message if r.outcome == "error" else "")    # the Bunny's reason, e.g. "busy: ..."
         if c == "liquid" and len(w) > 1:
             s = w[1]
             if s == "weigh" and len(w) > 2: return do_bunny(["weigh-to", w[2], "liquid"], out, cancelled)
