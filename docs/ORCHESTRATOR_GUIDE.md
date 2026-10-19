@@ -63,6 +63,8 @@ One line, from any connection, at any time (also while a step is running):
 | 8 | pipette aspirates 1000 µL at 500 µL/s with 1 µL pre-aspirated air |
 | 9 | pipette dispenses 1000 µL at 500 µL/s with 100 µL blow-out |
 | 10 | pipette ejects its tip |
+| 11 | Bunny platform up 500 steps |
+| 12 | Bunny platform down 500 steps |
 
 Steps take no arguments. What must be physically in place before each step (receiver on the scale, flask in the V-blocks, tip on the pipette) is the orchestrator's responsibility — the harness does not check it.
 
