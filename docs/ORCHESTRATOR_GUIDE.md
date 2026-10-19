@@ -20,7 +20,7 @@ Check it is alive: `echo '{"cmd":"status"}' | nc 192.168.7.1 7802` → `{"busy":
 Runs step `N` of the (fixed) workflow and streams its progress. Reply lines, in order:
 
 ```json
-{"event": "started", "workflow": "origami", "step": 4, "script": "04_citric_acid_4_803g.sh"}
+{"event": "started", "workflow": "origami", "step": 4, "script": "04_citric_acid_48mg.sh"}
 {"event": "output", "line": ">>> harness bunny tare"}
 {"event": "output", "line": "OK ..."}
 ...
@@ -56,7 +56,7 @@ One line, from any connection, at any time (also while a step is running):
 | 1 | open the Bunny housing (windshield) |
 | 2 | half-close the housing (10° short of closed) |
 | 3 | close the housing |
-| 4 | tare the scale, then weigh **4.803 g of "Citric Acid"** powder into the receiver on the scale |
+| 4 | tare the scale, then weigh **48 mg of "Citric Acid"** powder into the receiver on the scale |
 | 5 | tare, then dose **20 g of liquid** by weight into the receiver on the scale |
 | 6 | dilute-to-volume: V-blocks clamp the flask, the liquid doser fills to the ring mark under the camera, V-blocks open 10 mm |
 | 7 | dose **9 mL of liquid** by volume (open-loop pump steps; the receiver need not be on the scale) |

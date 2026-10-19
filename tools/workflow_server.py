@@ -6,7 +6,7 @@ output and ends with a "finish" event, then the connection closes. One step runs
 "workflow" is optional everywhere: it defaults to the server's workflow (--workflow, default origami).
 
   {"cmd": "run", "step": 4}            (or with "workflow": "origami")
-      -> {"event": "started", "workflow": "origami", "step": 4, "script": "04_citric_acid_4_803g.sh"}
+      -> {"event": "started", "workflow": "origami", "step": 4, "script": "04_citric_acid_48mg.sh"}
       -> {"event": "output", "line": ">>> harness bunny tare"}          (every line the step prints)
       -> {"event": "finish", "workflow": "origami", "step": 4, "ok": true, "rc": 0, "seconds": 41.2}
       -> {"event": "refused", "reason": "busy", "workflow": "origami", "step": 3}   (while another step runs)
