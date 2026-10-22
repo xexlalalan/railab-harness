@@ -684,6 +684,8 @@ dilute-to-volume repo, symlinked into `src/`). Compound operations: `harness_pla
 New interfaces in harness_msgs: FlaskLines, MoveZ, MoveV, WeighTo, LiquidPush, Barcode, GantryJog.
 `harness nodes start|stop|status|restart <node>` manages the node processes (was `tools/harness-nodes` until 2026-10-09). Command ↔ module ↔ function table: **`docs/CONTROL_PATHWAY.md`**.
 
+**2026-10-21 — `harness nodes start` / `restart piper` check `can0` first.** A PC reboot leaves `can0` DOWN (the boot-time CAN config is still not installed) and the arm node died at start with `no PIPER feedback on can0` while every other node came up. Now `can_up` in `tools/harness` reads `ip -details link show can0`: up at 1 Mbps → nothing; down → `sudo ip link set can0 type can bitrate 1000000 && sudo ip link set can0 up` (sudo prompts for the password in the operator's terminal; without a terminal or with sudo refused the arm node is **not** started and the message says so); no interface → adapter unplugged, arm node not started. `CAN_IF` overrides the interface name. Other nodes start regardless.
+
 ## 2026-10-10 — External planner interface (workflow server) — CONTRACT
 
 An external orchestrator drives the harness by **workflow + step number** over the cell network (RJ45 to the PC, `192.168.7.1`; any interface). Server: `tools/workflow_server.py`, process `workflows` under `harness nodes`, **TCP port 7802**, newline-delimited JSON, one request per connection.

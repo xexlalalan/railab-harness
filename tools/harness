@@ -14,8 +14,22 @@ dtv|harness_dtv/dtv_nod[e]|ros2 run harness_dtv dtv_node
 bunny|harness_instrument/bunny_nod[e]|ros2 run harness_instrument bunny_node
 pipette|harness_pipette/pipette_nod[e]|ros2 run harness_pipette pipette_node
 workflows|tools/workflow_serve[r].py|python3 tools/workflow_server.py"
+# The arm node owns can0 and dies at start if the interface is down (every PC reboot leaves it down until the
+# boot-time CAN config exists). can_up brings it up at 1 Mbps; `ip link set` needs root, so sudo asks for the
+# password in the terminal when it is not cached (no terminal = it fails and the arm node is not started).
+CAN_IF=${CAN_IF:-can0}
+can_up() {
+  local st; st=$(ip -details link show "$CAN_IF" 2>/dev/null) || { echo "$CAN_IF: no such interface (CAN adapter unplugged? lsusb | grep 1d50:606f)"; return 1; }
+  grep -q " state UP " <<<"$st" && grep -q "bitrate 1000000" <<<"$st" && { echo "$CAN_IF: up @1 Mbps"; return 0; }
+  echo "$CAN_IF: down -- bringing it up at 1 Mbps (needs sudo)"
+  sudo ip link set "$CAN_IF" down 2>/dev/null
+  sudo ip link set "$CAN_IF" type can bitrate 1000000 && sudo ip link set "$CAN_IF" up || { echo "$CAN_IF: could not bring it up (sudo refused or no terminal for the password)"; return 1; }
+  ip -details link show "$CAN_IF" | grep -q " state UP " && { echo "$CAN_IF: up @1 Mbps"; return 0; }
+  echo "$CAN_IF: still down after ip link set up"; return 1
+}
 start_bg() {
   pgrep -f "$2" >/dev/null && { echo "$1: already running"; return; }
+  [ "$1" = piper ] && ! can_up && { echo "piper: NOT started ($CAN_IF down)"; return; }
   setsid nohup $3 >/tmp/$1.log 2>&1 </dev/null &
   for i in $(seq 1 60); do pgrep -f "$2" >/dev/null && { echo "$1: started"; return; }; sleep 0.25; done   # ros2 launch needs a few s before the node process exists: a second start in that window would double it
   echo "$1: launched, node process not seen within 15 s (see /tmp/$1.log)"
