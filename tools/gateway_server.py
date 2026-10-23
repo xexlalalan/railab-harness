@@ -173,7 +173,9 @@ class Gateway:
         import numpy as np
         from harness_vision.geom import T_from_pose_msg
         m, q = self.fresh("tags", 1.0), self.joints_rad()
-        out = {"online": m is not None, "handeye": self.he_info, "tags": []}
+        last = self.last.get("tags")
+        out = {"online": m is not None, "handeye": self.he_info, "tags": [],
+               "age_s": round(time.time() - last[1], 1) if last else None}      # None = no camera frame since the gateway started
         if m is None or q is None or self.Tfc is None:
             return out
         Tbc = self.kin.fk(q) @ self.Tfc
