@@ -21,6 +21,7 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   {"cmd": "teach.plan_views", "args": {"from_model_deg": [...6], "backoff_mm": 40, "tilt_deg": 1.5}}   dry run
   {"cmd": "teach.fine", "args": {"tag_id": 7, "black_mm": 37.5, "tilt_deg": 3, "views_model_deg": {...}}}   job: the cross
   {"cmd": "arm.follow_joints", "args": {"waypoints_model_deg": [[...6], ...]}}   job: a planner's joint path
+  {"cmd": "arm.move_linear", "args": {"delta_mm": [0, 0, 100], "speed_percent": 10}}   job: fingertip straight by delta
 
 The gateway owns no hardware: it is an rclpy client of the module nodes, like harness_cmd.py. Releasing the
 arm is the explicit arm.release (operator 2026-10-23; before that it was CLI-only). `stop` is accepted from
@@ -86,7 +87,7 @@ class Gateway:
         from std_msgs.msg import String
         from sensor_msgs.msg import JointState
         from harness_msgs.msg import ArmStatus, GripperStatus, TagArray
-        from harness_msgs.action import FollowTrajectory, MoveJ
+        from harness_msgs.action import FollowTrajectory, MoveJ, MovePose
         from harness_arm.kinematics import PiperKinematics, JOINT_LIMITS_RAD
 
         with open(PIPER_YAML) as f:
@@ -102,9 +103,10 @@ class Gateway:
         n.create_subscription(JointState, "/joint_states", put("joints"), 10)
         n.create_subscription(String, "/bunny/status", lambda m: self.last.__setitem__("bunny", (json.loads(m.data), time.time())), 10)
         n.create_subscription(TagArray, "/camera/tags", put("tags"), 10)
-        self.MoveJ, self.FollowTrajectory = MoveJ, FollowTrajectory
+        self.MoveJ, self.FollowTrajectory, self.MovePose = MoveJ, FollowTrajectory, MovePose
         self.ac_j = ActionClient(n, MoveJ, "/arm/move_j")
         self.ac_t = ActionClient(n, FollowTrajectory, "/arm/follow_trajectory")
+        self.ac_p = ActionClient(n, MovePose, "/arm/move_pose")
         self.clients = {}
         self.hc = None                       # HarnessClient for teach.fine (created on first use)
         self.load_handeye()
@@ -368,6 +370,45 @@ class Gateway:
             raise RuntimeError(r.message)
         return {"success": True, "message": r.message, "seconds": round(r.seconds, 1),
                 "max_tracking_error_deg": round(math.degrees(r.max_tracking_error_rad), 2), "plan": tr.report}
+
+    def move_linear(self, delta_mm, speed, abort):
+        """arm.move_linear: the fingertip (and the gripper base with it: the orientation stays) on a straight line by
+        delta_mm in the arm base frame — the node's /arm/move_pose linear (its IK, floor, workspace, jump checks)."""
+        import numpy as np
+        from harness_arm.kinematics import xyzrpy_from_T
+        q = self.joints_rad()
+        if q is None:
+            raise RuntimeError("no arm feedback")
+        st = self.fresh("arm", 1.0)
+        if st is None or not st.all_enabled:
+            raise RuntimeError("the arm is not holding: press Hold first")
+        T = self.kin.fk(q)
+        T[:3, 3] += np.array(delta_mm, float) / 1000.0
+        if not self.ac_p.wait_for_server(timeout_sec=3.0):
+            raise RuntimeError("/arm/move_pose not available")
+        g = self.MovePose.Goal(pose=[float(v) for v in xyzrpy_from_T(T)], linear=True, speed_percent=int(speed), timeout_s=60.0)
+        gf = self.ac_p.send_goal_async(g)
+        t0 = time.time()
+        while not gf.done():
+            if time.time() - t0 > 5:
+                raise RuntimeError("goal not accepted in time")
+            time.sleep(0.01)
+        gh = gf.result()
+        if not gh.accepted:
+            raise RuntimeError("rejected by the arm node (busy, fault, teach mode or not enabled)")
+        rf = gh.get_result_async()
+        while not rf.done():
+            if abort.is_set():
+                gh.cancel_goal_async()
+                raise RuntimeError(JOB.get("why") or "aborted - arm frozen")
+            if time.time() - t0 > 90:
+                gh.cancel_goal_async()
+                raise RuntimeError("the straight move did not end in time - arm frozen")
+            time.sleep(0.05)
+        r = rf.result().result
+        if not r.success:
+            raise RuntimeError(r.message)
+        return {"success": True, "message": r.message, "delta_mm": [float(v) for v in delta_mm]}
 
     # ------------------------------------------------------------------ arm model
     def tip_and_clearance(self, q):
@@ -746,6 +787,13 @@ class Conn(socketserver.StreamRequestHandler):
             tid, black = int(a["tag_id"]), float(a.get("black_mm") or 0.0)
             tilt, views = float(a.get("tilt_deg") or 3.0), a.get("views_model_deg") or None
             return self.job("teach.fine", lambda ev: gw.fine(tid, black, ev, tilt, views))
+        if cmd == "arm.move_linear":
+            self.need("control")
+            d = [float(v) for v in a.get("delta_mm") or []]
+            if len(d) != 3 or math.sqrt(sum(v * v for v in d)) > 300.0:
+                raise ValueError("delta_mm needs x y z (mm), at most 300 mm long")
+            speed = max(1, min(int(gw.P.get("max_speed_percent", 30)), int(a.get("speed_percent") or 10)))
+            return self.job("arm.move_linear", lambda ev: gw.move_linear(d, speed, ev))
         if cmd == "arm.follow_joints":
             self.need("control")
             wps, label = a.get("waypoints_model_deg"), str(a.get("label") or "")
