@@ -46,6 +46,7 @@ HOLDER_STALE_S = 10.0     # a control holder silent this long (no ping, no comma
 JOINTS = ["joint%d" % i for i in range(1, 7)]
 ARM_ACTIONS = ("/arm/move_j", "/arm/move_pose", "/arm/follow_trajectory")
 HANDEYE_ACCEPT_RMS_MM = 3.0      # calib.handeye installs a new calibration only at or below this rms
+HANDEYE_SETTLE_S = 3.0           # wait after every hand-eye move before the images (operator: the arm shakes ~3 s)
 TEACH_VEL_RAD_S, TEACH_ACC_RAD_S2 = 0.35, 0.7     # arm.follow_joints: joint speed / acceleration of the path
 FOLLOW_START_TOL_RAD = 0.1       # its first waypoint: this close to where the arm is
 FOLLOW_CLAMP_RAD = math.radians(3.0)   # waypoints beyond the controller limits by up to this are clamped inside
@@ -411,7 +412,8 @@ def handeye_job(tid, abort):
     new = os.path.join(ROOT, "calib", "handeye_new.yaml")
     if os.path.exists(new):
         os.remove(new)
-    cmd = ["ros2", "run", "harness_calibration", "handeye", "--tag-id", str(int(tid)), "--accept-mm", "6.0", "--out", new]
+    cmd = ["ros2", "run", "harness_calibration", "handeye", "--tag-id", str(int(tid)), "--accept-mm", "6.0",
+           "--settle", str(HANDEYE_SETTLE_S), "--out", new]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True,
                          bufsize=1, env=dict(os.environ, PYTHONUNBUFFERED="1"), start_new_session=True)
     JOB["proc"] = p

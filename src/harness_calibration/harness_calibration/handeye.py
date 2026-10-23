@@ -141,7 +141,8 @@ def main():
     ap.add_argument("--tilt-deg", type=float, default=15.0)
     ap.add_argument("--frames", type=int, default=20, help="detections averaged per viewpoint")
     ap.add_argument("--roll-deg", type=float, default=20.0)
-    ap.add_argument("--settle", type=float, default=1.0, help="fixed wait before the stillness check")
+    ap.add_argument("--settle", type=float, default=3.0,
+                    help="fixed wait after every move before the stillness check (operator 2026-10-23: the arm shakes ~3 s after it stops)")
     ap.add_argument("--speed", type=int, default=10)
     ap.add_argument("--out", default=os.path.expanduser("~/bunny-harness-dev/calib/handeye.yaml"))
     ap.add_argument("--check-convention", action="store_true")
