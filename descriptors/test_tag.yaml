@@ -1,8 +1,10 @@
 module: test_tag                            # the flat 32 mm calibration tag on the table (not a real module)
-version: 1
+version: 2
+# 2026-10-23: id 7 is the Weighing Bunny's body tag now (the twin's tag list) -- no table tag is registered here any
+# more; two tags with the same id on the bench would be mistaken for each other. The wall tag 8 (hand-eye reference,
+# 34.7 mm) needs no descriptor.
 tags:
   family: tag16h5
-  layout:
-    - {id: 7, role: main, size_mm: 34.7, xyz_mm: [0, 0, 0], rpy_deg: [0, 0, 0]}
+  layout: []
 footprint_mm: [60, 60, 1]
 handoffs: {}

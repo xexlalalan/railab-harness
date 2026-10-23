@@ -241,6 +241,36 @@ def plan_path_run(kin, path: CartesianPath, q_now, duration_s: float, lim: Limit
     return traj
 
 
+def plan_joint_path(kin, waypoints, lim: Limits, rate_hz: float = 100.0, t_min: float = 0.8) -> Trajectory:
+    """A joint path from a planner (rad, K x 6, the first = where the arm is; PROJECT_SPEC.md
+    "2026-10-23 — Release, hand-eye and tag teaching"): each segment a STRAIGHT line in joint space —
+    what a collision-checked joint path assumes between its waypoints — timed as a minimum-jerk move
+    within lim's joint speed / acceleration, at rest at every waypoint. Validated like every other
+    trajectory; raises PlanError naming the sample."""
+    W = np.asarray(waypoints, float)
+    if W.ndim != 2 or W.shape[1] != 6 or len(W) < 2:
+        raise PlanError("a joint path needs at least 2 waypoints of 6 joints")
+    ts, qs, segs, t_off = [], [], [], 0.0
+    for k in range(len(W) - 1):
+        if float(np.abs(W[k + 1] - W[k]).max()) < 1e-6:
+            continue
+        t, q = min_jerk(W[k], W[k + 1], lim.max_joint_vel_rad_s, lim.max_joint_acc_rad_s2, rate_hz, t_min=t_min)
+        if ts:                                    # the segment boundary sample is the previous segment's last
+            t, q = t[1:], q[1:]
+        i0 = sum(len(x) for x in ts)
+        ts.append(t + t_off)
+        qs.append(q)
+        segs.append((f"segment {k + 1}", i0, i0 + len(t)))
+        t_off = float(ts[-1][-1])
+    if not ts:
+        raise PlanError("the path does not move")
+    traj = Trajectory(np.concatenate(ts), np.vstack(qs), segs, {})
+    traj.report = validate(kin, traj, lim)
+    traj.report.update({"segments": len(segs), "samples": len(traj.t), "rate_hz": rate_hz,
+                        "duration_s": round(traj.duration, 2)})
+    return traj
+
+
 def validate(kin, traj: Trajectory, lim: Limits, at=None, L=None, ramp=None, loop=None,
              duration_s=None) -> dict:
     """Check every sample; raise PlanError naming the first violation; return a summary."""

@@ -18,7 +18,7 @@ sys.path[:0] = [os.path.join(ROOT, "src", "harness_arm"), os.path.join(ROOT, "sr
 
 from harness_arm.kinematics import PiperKinematics                       # noqa: E402
 from harness_planner.trajectory import (CartesianPath, Limits, PlanError, flange_T, min_jerk,   # noqa: E402
-                                        plan_path_run, smooth_fraction)
+                                        plan_joint_path, plan_path_run, smooth_fraction)
 
 # pyAgxArm ROBOT_MDH_PRESET["piper"] (the arm node loads it from the SDK; copied so the tests need no SDK)
 MDH = ((0.123, 0.0, 0.0, 0.0), (0.0, 0.0, -1.5707963267948966, -3.0058060377846343),
@@ -131,3 +131,34 @@ def test_flange_frame_convention():
     assert np.allclose(T[:3, 2], [1, 0, 0]) and np.allclose(T[:3, 0], [0, 0, -1])     # z = approach, x = -up
     assert np.allclose(T[:3, 3], [0.5 - 0.1441, 0.0, 0.3])
     assert np.isclose(np.linalg.det(T[:3, :3]), 1.0)                                  # right-handed
+
+
+def test_joint_path_passes_its_waypoints_in_straight_lines_within_the_limits(kin, lim):
+    """plan_joint_path (2026-10-23, the twin's collision-checked transit between tags): every segment a
+    straight line in joint space, at rest at every waypoint, speed / acceleration inside the limits."""
+    import dataclasses
+    slow = dataclasses.replace(lim, max_joint_vel_rad_s=0.35, max_joint_acc_rad_s2=0.7)
+    W = np.array([Q_PARK, [0.3, 0.6, -0.8, 0.1, 0.4, 0.2], [0.6, 0.9, -1.0, 0.0, 0.5, 0.0]])
+    tr = plan_joint_path(kin, W, slow)
+    assert np.allclose(tr.q[0], W[0]) and np.allclose(tr.q[-1], W[-1])
+    assert [s[0] for s in tr.segments] == ["segment 1", "segment 2"]
+    for k, (_, i0, i1) in enumerate(tr.segments):
+        seg = tr.q[i0 - (1 if i0 else 0):i1]
+        assert np.allclose(seg[-1], W[k + 1])
+        d = W[k + 1] - W[k]
+        f = (seg - W[k]) @ d / (d @ d)                    # every sample on the straight line W[k] -> W[k+1]
+        assert np.abs(seg - (W[k] + np.outer(f, d))).max() < 1e-9
+    v = np.abs(np.diff(tr.q, axis=0) / np.diff(tr.t)[:, None])
+    assert v.max() <= 0.35 * 1.001
+    assert tr.report["min_floor_clearance_mm"] > 15
+
+
+def test_joint_path_refusals(kin, lim):
+    with pytest.raises(PlanError, match="at least 2 waypoints"):
+        plan_joint_path(kin, [Q_PARK], lim)
+    with pytest.raises(PlanError, match="does not move"):
+        plan_joint_path(kin, [Q_PARK, Q_PARK], lim)
+    beyond = list(Q_PARK)
+    beyond[4] = math.radians(75)                          # j5 clamps at 70 deg
+    with pytest.raises(PlanError, match="joint 5"):
+        plan_joint_path(kin, [Q_PARK, beyond], lim)

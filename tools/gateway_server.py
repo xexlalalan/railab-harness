@@ -15,27 +15,40 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
       LIVE driving from the twin's sliders: answered at once; the LATEST target wins — the gateway moves the
       fingertip there (straight line, /arm/move_pose, the node's IK / floor / workspace checks) as soon as the
       current move ends, then the next latest one. Progress in the state event: control.jog.
+  v2 (2026-10-23, spec "Release, hand-eye and tag teaching through the gateway"):
+  {"cmd": "arm.release"}                                  joints 1-6 limp (the gripper keeps holding)
+  {"cmd": "calib.handeye", "args": {"tag_id": 8}}         job: hand-eye around where the arm holds; state.calib
+  {"cmd": "teach.fine", "args": {"tag_id": 7, "black_mm": 37.5}}   job: five-view cross on the tag in view
+  {"cmd": "arm.follow_joints", "args": {"waypoints_model_deg": [[...6], ...]}}   job: a planner's joint path
 
-The gateway owns no hardware: it is an rclpy client of the module nodes, like harness_cmd.py. There is
-deliberately NO arm release / disable command. `stop` is accepted from anyone. The controller's connection
-is a dead-man: silent for DEADMAN_S (or closed) while its motion runs -> the goal is cancelled (the arm
-freezes, stays enabled) and the control lease is dropped.
+The gateway owns no hardware: it is an rclpy client of the module nodes, like harness_cmd.py. Releasing the
+arm is the explicit arm.release (operator 2026-10-23; before that it was CLI-only). `stop` is accepted from
+anyone. The controller's connection is a dead-man: silent for DEADMAN_S (or closed) while its motion or job
+runs -> the goal is cancelled / the job aborted (the arm freezes, stays enabled) and the control lease is dropped.
 
   python3 tools/gateway_server.py          serve (process `gateway` under `harness nodes`)
   python3 tools/gateway_server.py --key    create the shared key if missing, print it (`harness gateway key`)
 """
-import json, math, os, secrets, socketserver, sys, threading, time
+import json, math, os, secrets, signal, socketserver, subprocess, sys, threading, time
 
 PORT = int(os.environ.get("GATEWAY_PORT", 7803))
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KEY_FILE = os.path.expanduser("~/.config/railab-harness/gateway.key")
 PIPER_YAML = os.path.join(ROOT, "src", "harness_arm", "config", "piper.yaml")
+# the calibration / planner packages from source, so a new module there needs no colcon rebuild
+sys.path[:0] = [os.path.join(ROOT, "src", "harness_calibration"), os.path.join(ROOT, "src", "harness_planner")]
 KIN_FILE = os.path.join(ROOT, "calib", "kinematics.yaml")
-VERSION = 1
+HANDEYE_FILE = os.path.join(ROOT, "calib", "handeye.yaml")
+TEACH_TAGS = os.path.join(ROOT, "calib", "teach", "tags.yaml")      # teach.fine results, by tag id
+VERSION = 2
 DEADMAN_S = 3.0
 HOLDER_STALE_S = 10.0     # a control holder silent this long (no ping, no command) can be taken over
 JOINTS = ["joint%d" % i for i in range(1, 7)]
 ARM_ACTIONS = ("/arm/move_j", "/arm/move_pose", "/arm/follow_trajectory")
+HANDEYE_ACCEPT_RMS_MM = 3.0      # calib.handeye installs a new calibration only at or below this rms
+TEACH_VEL_RAD_S, TEACH_ACC_RAD_S2 = 0.35, 0.7     # arm.follow_joints: joint speed / acceleration of the path
+FOLLOW_START_TOL_RAD = 0.1       # its first waypoint: this close to where the arm is
+FOLLOW_CLAMP_RAD = math.radians(3.0)   # waypoints beyond the controller limits by up to this are clamped inside
 
 
 def read_key():
@@ -68,8 +81,8 @@ class Gateway:
         from rclpy.action import ActionClient
         from std_msgs.msg import String
         from sensor_msgs.msg import JointState
-        from harness_msgs.msg import ArmStatus, GripperStatus
-        from harness_msgs.action import MoveJ
+        from harness_msgs.msg import ArmStatus, GripperStatus, TagArray
+        from harness_msgs.action import FollowTrajectory, MoveJ
         from harness_arm.kinematics import PiperKinematics, JOINT_LIMITS_RAD
 
         with open(PIPER_YAML) as f:
@@ -84,9 +97,13 @@ class Gateway:
         n.create_subscription(GripperStatus, "/arm/gripper_status", put("grip"), 10)
         n.create_subscription(JointState, "/joint_states", put("joints"), 10)
         n.create_subscription(String, "/bunny/status", lambda m: self.last.__setitem__("bunny", (json.loads(m.data), time.time())), 10)
-        self.MoveJ = MoveJ
+        n.create_subscription(TagArray, "/camera/tags", put("tags"), 10)
+        self.MoveJ, self.FollowTrajectory = MoveJ, FollowTrajectory
         self.ac_j = ActionClient(n, MoveJ, "/arm/move_j")
+        self.ac_t = ActionClient(n, FollowTrajectory, "/arm/follow_trajectory")
         self.clients = {}
+        self.hc = None                       # HarnessClient for teach.fine (created on first use)
+        self.load_handeye()
         ex = MultiThreadedExecutor(num_threads=4)
         ex.add_node(n)
         threading.Thread(target=ex.spin, daemon=True).start()
@@ -132,6 +149,144 @@ class Gateway:
         if m is None or not all(j in m.name for j in JOINTS):
             return None
         return [float(m.position[m.name.index(j)]) for j in JOINTS]
+
+    def load_handeye(self):
+        """calib/handeye.yaml -> self.Tfc (gripper base -> camera, m); None without one."""
+        import numpy as np, yaml
+        try:
+            with open(HANDEYE_FILE) as f:
+                d = yaml.safe_load(f) or {}
+            self.Tfc = np.array(d["flange_to_camera"]["matrix"], float)
+            self.he_info = {"date": d.get("date"), "rms_mm": d.get("rms_mm", d.get("residual_rms_mm"))}
+        except (OSError, KeyError, TypeError, ValueError):
+            self.Tfc, self.he_info = None, {"date": None, "rms_mm": None}
+
+    def camera(self):
+        """Tags the gripper camera sees now, posed in the arm base (corrected FK of the latest joints x
+        hand-eye x camera->tag as the detector solved it with assumed_mm)."""
+        import numpy as np
+        from harness_vision.geom import T_from_pose_msg
+        m, q = self.fresh("tags", 1.0), self.joints_rad()
+        out = {"online": m is not None, "handeye": self.he_info, "tags": []}
+        if m is None or q is None or self.Tfc is None:
+            return out
+        Tbc = self.kin.fk(q) @ self.Tfc
+        out["cam_mm"] = [round(float(v) * 1000, 2) for v in Tbc[:3, 3]]
+        for t in m.tags:
+            Tbt = Tbc @ T_from_pose_msg(t.pose)
+            out["tags"].append({"id": int(t.id), "size_px": round(t.size_px, 1), "center_px": [round(v, 1) for v in t.center_px],
+                                "distance_mm": round(t.distance_m * 1000, 1), "assumed_mm": round(t.size_m * 1000, 2),
+                                "base_mm": [round(float(v) * 1000, 2) for v in Tbt[:3, 3]],
+                                "base_R": [[round(float(v), 6) for v in row] for row in Tbt[:3, :3]],
+                                "reproj_px": round(t.reproj_err_px, 2)})
+        return out
+
+    def teach_client(self):
+        if self.hc is None:
+            from harness_calibration.client import HarnessClient
+            self.hc = HarnessClient("gateway_teach")
+        return self.hc
+
+    def fine(self, tid, black_mm, abort):
+        """teach.fine: the five-view cross on tag tid from where the camera looks now (harness_calibration.fine)."""
+        import datetime as dt, numpy as np, yaml
+        from harness_calibration.fine import Aborted, cross_locate
+        from harness_arm.kinematics import xyzrpy_from_T
+        if self.Tfc is None:
+            raise RuntimeError("no hand-eye calibration (calib/handeye.yaml)")
+        c = self.teach_client()
+        c.wait_ready()
+        if not (c.status and c.status.all_enabled):
+            raise RuntimeError("the arm is not holding: press Hold first")
+        t = c.tag(tid)
+        if t is None:
+            raise RuntimeError("tag %d is not in view from here" % tid)
+        scale = (black_mm / 1000.0) / t.size_m if black_mm > 0 else 1.0
+        try:
+            r = cross_locate(c, tid, self.Tfc, scale=scale, abort=abort.is_set)
+        except Aborted:
+            raise RuntimeError(JOB.get("why") or "aborted")
+        q = self.joints_rad()
+        res = {"ok": r["ok"], "reasons": r["reasons"], "tag_id": tid, "black_mm": black_mm or round(t.size_m * 1000, 2),
+               "spread_mm": r["spread_mm"], "spread_deg": r["spread_deg"], "views": r["views"], "size_px": r["size_px"],
+               "joints_deg": [round(math.degrees(v), 3) for v in q] if q else None}
+        if r["T"] is not None:
+            T = r["T"]
+            res["base_mm"] = [round(float(v) * 1000, 2) for v in T[:3, 3]]
+            res["base_R"] = [[round(float(v), 6) for v in row] for row in T[:3, :3]]
+        if r["ok"]:
+            try:
+                with open(TEACH_TAGS) as f:
+                    doc = yaml.safe_load(f) or {}
+            except OSError:
+                doc = {}
+            doc.setdefault("tags", {})[int(tid)] = {
+                "base_to_tag_matrix": T.tolist(), "base_to_tag_xyzrpy": xyzrpy_from_T(T), "spread_mm": r["spread_mm"],
+                "spread_deg": r["spread_deg"], "black_mm": res["black_mm"], "size_px": r["size_px"], "joints_rad": q,
+                "handeye_date": self.he_info.get("date"), "date": dt.datetime.now().isoformat(timespec="seconds")}
+            os.makedirs(os.path.dirname(TEACH_TAGS), exist_ok=True)
+            with open(TEACH_TAGS, "w") as f:
+                yaml.safe_dump(doc, f, sort_keys=False)
+        return res
+
+    def follow_joints(self, conn, wps_deg, label, abort):
+        """arm.follow_joints: a planner's joint path (corrected-model degrees) -> validated, streamed trajectory."""
+        import numpy as np
+        from harness_planner.demo import load_model, to_msg
+        from harness_planner.trajectory import PlanError, plan_joint_path
+        q = self.joints_rad()
+        if q is None:
+            raise RuntimeError("no arm feedback")
+        st = self.fresh("arm", 1.0)
+        if st is None or not st.all_enabled:
+            raise RuntimeError("the arm is not holding: press Hold first")
+        if not isinstance(wps_deg, list) or len(wps_deg) < 1 or any(not isinstance(w, list) or len(w) != 6 for w in wps_deg):
+            raise ValueError("waypoints_model_deg needs a list of 6-joint waypoints")
+        off = np.array(self.kin.offsets, float)
+        W = np.radians(np.array(wps_deg, float)) - off             # corrected-model angles -> controller joints
+        lo = np.array([l[0] for l in self.limits]) + 0.02
+        hi = np.array([l[1] for l in self.limits]) - 0.02
+        over = np.maximum(lo - W, W - hi).max(axis=1)
+        if (over > FOLLOW_CLAMP_RAD).any():
+            k = int(np.argmax(over))
+            raise RuntimeError("refused: waypoint %d is %.1f deg beyond a joint limit" % (k + 1, math.degrees(over[k])))
+        W = np.clip(W, lo, hi)
+        d0 = float(np.abs(W[0] - np.array(q)).max())
+        if d0 > FOLLOW_START_TOL_RAD:
+            raise RuntimeError("refused: the path starts %.1f deg from where the arm is; plan it from the current posture" % math.degrees(d0))
+        W[0] = q
+        kin, lim = load_model(ROOT)
+        lim.max_joint_vel_rad_s, lim.max_joint_acc_rad_s2 = TEACH_VEL_RAD_S, TEACH_ACC_RAD_S2
+        try:
+            tr = plan_joint_path(self.kin, W, lim)
+        except PlanError as e:
+            raise RuntimeError("refused: %s" % e)
+        if not self.ac_t.wait_for_server(timeout_sec=3.0):
+            raise RuntimeError("/arm/follow_trajectory not available")
+        g = self.FollowTrajectory.Goal(trajectory=to_msg(tr), label=label or "twin path")
+        gf = self.ac_t.send_goal_async(g)
+        t0 = time.time()
+        while not gf.done():
+            if time.time() - t0 > 5:
+                raise RuntimeError("goal not accepted in time")
+            time.sleep(0.01)
+        gh = gf.result()
+        if not gh.accepted:
+            raise RuntimeError("rejected by the arm node (busy, fault, teach mode or not enabled)")
+        rf = gh.get_result_async()
+        while not rf.done():
+            if abort.is_set():
+                gh.cancel_goal_async()
+                raise RuntimeError(JOB.get("why") or "aborted - arm frozen")
+            if time.time() - t0 > tr.duration + 60:
+                gh.cancel_goal_async()
+                raise RuntimeError("no result long after the path should have ended - arm frozen")
+            time.sleep(0.05)
+        r = rf.result().result
+        if not r.success:
+            raise RuntimeError(r.message)
+        return {"success": True, "message": r.message, "seconds": round(r.seconds, 1),
+                "max_tracking_error_deg": round(math.degrees(r.max_tracking_error_rad), 2), "plan": tr.report}
 
     # ------------------------------------------------------------------ arm model
     def tip_and_clearance(self, q):
@@ -220,7 +375,8 @@ class Gateway:
         bunny = {"online": bool(b and b.get("online"))}
         if b:
             bunny.update({k: b.get(k) for k in ("unit", "housing", "weight_g", "dispensing", "busy", "load_open")})
-        return {"arm": arm, "bunny": bunny}
+        calib = {"busy": JOB["busy"], "kind": JOB["kind"], "lines": JOB["lines"][-8:], "result": JOB["result"]}
+        return {"arm": arm, "bunny": bunny, "camera": self.camera(), "calib": calib}
 
 
 # ---------------------------------------------------------------------------- server
@@ -229,6 +385,65 @@ lock = threading.Lock()
 ctl = {"conn": None, "motion": None}     # control lease (a Conn) and the gateway-started motion {conn, label}
 # live slider driving: the latest target of each kind wins (arm.jog_pose / arm.jog_gripper)
 jog = {"pose": None, "grip": None, "busy": False, "error": "", "last": None, "ev": threading.Event()}
+# the one running job (calib.handeye / teach.fine / arm.follow_joints) and the last result
+JOB = {"busy": False, "kind": "", "lines": [], "result": None, "proc": None, "abort": threading.Event(), "why": ""}
+
+
+def abort_job(why):
+    """Stop the running job: its abort flag, SIGINT to its process group, every arm goal cancelled (the arm freezes)."""
+    if not JOB["busy"]:
+        return False
+    JOB["why"] = why
+    JOB["abort"].set()
+    p = JOB.get("proc")
+    if p is not None and p.poll() is None:
+        try:
+            os.killpg(p.pid, signal.SIGINT)
+        except OSError:
+            pass
+    gw.cancel_arm()
+    return True
+
+
+def handeye_job(tid, abort):
+    """calib.handeye: the hand-eye routine as a process; its result is installed when rms <= HANDEYE_ACCEPT_RMS_MM."""
+    import datetime as dt, shutil, yaml
+    new = os.path.join(ROOT, "calib", "handeye_new.yaml")
+    if os.path.exists(new):
+        os.remove(new)
+    cmd = ["ros2", "run", "harness_calibration", "handeye", "--tag-id", str(int(tid)), "--accept-mm", "6.0", "--out", new]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True,
+                         bufsize=1, env=dict(os.environ, PYTHONUNBUFFERED="1"), start_new_session=True)
+    JOB["proc"] = p
+    for line in p.stdout:
+        line = line.rstrip()
+        if line:
+            JOB["lines"] = (JOB["lines"] + [line])[-40:]
+            print("handeye: " + line, flush=True)
+    rc = p.wait()
+    if abort.is_set():
+        return {"ok": False, "installed": False, "message": JOB["why"] or "aborted"}
+    if not os.path.exists(new):
+        return {"ok": False, "installed": False,
+                "message": "hand-eye did not finish (exit %d): %s" % (rc, JOB["lines"][-1] if JOB["lines"] else "no output")}
+    with open(new) as f:
+        doc = yaml.safe_load(f) or {}
+    os.remove(new)
+    rms, mx = float(doc.get("residual_rms_mm") or 1e9), float(doc.get("residual_max_mm") or 1e9)
+    x = doc.get("flange_to_camera") or {}
+    res = {"rms_mm": round(rms, 2), "max_mm": round(mx, 2), "n_poses": doc.get("n_poses"), "tag_id": tid,
+           "xyz_mm": [round(v * 1000, 1) for v in x.get("xyz_m", [])], "rpy_deg": [round(math.degrees(v), 2) for v in x.get("rpy_rad", [])]}
+    if rms > HANDEYE_ACCEPT_RMS_MM:
+        return dict(res, ok=False, installed=False, message="rms %.2f mm > %.1f mm: the old calibration stays" % (rms, HANDEYE_ACCEPT_RMS_MM))
+    os.makedirs(os.path.join(ROOT, "calib", "handeye_backups"), exist_ok=True)
+    if os.path.exists(HANDEYE_FILE):
+        shutil.copy(HANDEYE_FILE, os.path.join(ROOT, "calib", "handeye_backups",
+                                               "handeye_%s.yaml" % dt.datetime.now().strftime("%Y-%m-%dT%H%M%S")))
+    doc.update(accepted=True, rms_mm=round(rms, 2), accepted_by="gateway calib.handeye: rms <= %.1f mm" % HANDEYE_ACCEPT_RMS_MM)
+    with open(HANDEYE_FILE, "w") as f:
+        yaml.safe_dump(doc, f, sort_keys=False)
+    gw.load_handeye()
+    return dict(res, ok=True, installed=True, message="installed (rms %.2f mm, max %.2f mm, %s poses)" % (rms, mx, doc.get("n_poses")))
 
 
 def jog_worker():
@@ -370,7 +585,8 @@ class Conn(socketserver.StreamRequestHandler):
             return gw.state()
         if cmd == "stop":                  # anyone, never refused
             jog["pose"] = jog["grip"] = None
-            r = {"cancelled": gw.cancel_arm()}
+            aborted = abort_job("stopped (stop)")
+            r = {"cancelled": gw.cancel_arm(), "job_aborted": aborted}
             b = gw.fresh("bunny", 3.0)
             if b and (b.get("dispensing") or b.get("busy")):
                 try:
@@ -420,6 +636,33 @@ class Conn(socketserver.StreamRequestHandler):
         if cmd == "arm.hold":
             self.need("control")
             return gw.trigger("/arm/hold", 15)
+        if cmd == "arm.release":           # operator 2026-10-23: one click; joints 1-6 only, the gripper keeps holding
+            self.need("control")
+            jog["pose"] = jog["grip"] = None
+            abort_job("the arm was released")
+            return gw.trigger("/arm/disable", 15)
+        if cmd == "calib.handeye":
+            self.need("control")
+            st = gw.fresh("arm", 1.0)
+            if st is None or not st.all_enabled:
+                raise RuntimeError("the arm is not holding: press Hold first (the routine moves it around where it is)")
+            seen = gw.camera()["tags"]
+            tid = a.get("tag_id")
+            if tid is None:
+                if not seen:
+                    raise RuntimeError("no tag in view: point the camera at a fixed tag 150-300 mm away")
+                tid = max(seen, key=lambda t: t["size_px"])["id"]
+            elif not any(t["id"] == int(tid) for t in seen):
+                raise RuntimeError("tag %s is not in view" % tid)
+            return self.job("calib.handeye", lambda ev: handeye_job(int(tid), ev), background=True, extra={"tag_id": int(tid)})
+        if cmd == "teach.fine":
+            self.need("control")
+            tid, black = int(a["tag_id"]), float(a.get("black_mm") or 0.0)
+            return self.job("teach.fine", lambda ev: gw.fine(tid, black, ev))
+        if cmd == "arm.follow_joints":
+            self.need("control")
+            wps, label = a.get("waypoints_model_deg"), str(a.get("label") or "")
+            return self.job("arm.follow_joints", lambda ev: gw.follow_joints(self, wps, label, ev))
         if cmd == "arm.gripper":
             self.need("control")
             from harness_msgs.srv import SetGripper
@@ -443,6 +686,45 @@ class Conn(socketserver.StreamRequestHandler):
                 raise RuntimeError(r.message)
             return {"position_steps": r.steps_done}
         raise ValueError("unknown cmd %r" % cmd)
+
+    def job(self, kind, fn, background=False, extra=None):
+        """Run fn(abort_event) as THE job (one at a time). This connection is its dead-man: silent DEADMAN_S or
+        closed -> abort_job (every arm goal cancelled: the arm freezes, stays enabled) and the lease is dropped.
+        background: answer {started} at once; the result goes to state.calib.result."""
+        with lock:
+            if JOB["busy"]:
+                raise RuntimeError("busy: %s is running" % JOB["kind"])
+            JOB.update(busy=True, kind=kind, lines=[], result=None, proc=None, abort=threading.Event(), why="")
+        ev, done = JOB["abort"], threading.Event()
+        ctl["motion"] = {"conn": self, "label": kind}
+
+        def watch():
+            while not done.wait(0.1):
+                if not self.alive or time.time() - self.last_rx > DEADMAN_S:
+                    abort_job("dead-man: controller silent for %.0f s - arm frozen" % DEADMAN_S)
+                    with lock:
+                        if ctl["conn"] is self:
+                            ctl["conn"] = None
+                    return
+
+        def body():
+            try:
+                r = fn(ev)
+                JOB["result"] = dict(r, kind=kind) if isinstance(r, dict) else r
+                return r
+            except Exception as e:     # noqa: BLE001  reported to the caller / in state.calib
+                JOB["result"] = {"ok": False, "kind": kind, "message": str(e)}
+                raise
+            finally:
+                done.set()
+                ctl["motion"] = None
+                JOB["busy"], JOB["proc"] = False, None
+
+        threading.Thread(target=watch, daemon=True).start()
+        if background:
+            threading.Thread(target=lambda: _quiet(body), daemon=True).start()
+            return dict({"started": True, "kind": kind}, **(extra or {}))
+        return body()
 
     def motion(self, chk, q, speed, rid):
         """Run /arm/move_j; progress events; the dead-man watch cancels it if this connection goes quiet."""
@@ -482,6 +764,13 @@ class Conn(socketserver.StreamRequestHandler):
             raise RuntimeError(r.message)
         return {"success": True, "message": r.message, "speed_percent": speed,
                 "final_joints_deg": [round(math.degrees(v), 3) for v in r.final_joints_rad], "check": chk}
+
+
+def _quiet(fn):
+    try:
+        fn()
+    except Exception:  # noqa: BLE001  a background job's failure is in state.calib.result
+        pass
 
 
 class Server(socketserver.ThreadingTCPServer):
