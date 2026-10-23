@@ -25,8 +25,9 @@ Actions:
                   (move_j re-targeted at traj_rate_hz; PROJECT_SPEC.md "2026-10-22 — Planner bedrock")
 
 Rules: enable state comes from joint feedback, never from an SDK return value.
-A watchdog disables the arm when feedback stops; any error bit cancels the
-running goal and disables. One motion goal at a time.
+Lost feedback or any error bit cancels the running goal and latches a fault; the
+node NEVER disables the arm on its own (it keeps holding its last target; INCIDENT
+2026-09-17 in PROJECT_SPEC.md). One motion goal at a time.
 """
 import math
 import os
@@ -97,7 +98,7 @@ class PiperNode(Node):
             ("workspace_max", [0.7, 0.7, 0.9]), ("gripper_enabled", True),
             ("gripper_max_m", 0.07), ("gripper_force", 1.0), ("gripper_tol_m", 0.002),
             ("gripper_timeout_s", 4.0), ("gripper_inverted", False), ("gripper_travel_m", 0.0967), ("gripper_scale", 1.0),
-            ("max_joint_delta_rad", 1.2), ("pose_max_joint_delta_rad", 0.9),
+            ("max_joint_delta_rad", 1.2), ("pose_max_joint_delta_rad", 1.2),
             ("floor_enabled", False), ("floor_plane", [0.0, 0.0, 0.0]), ("tcp_offset_m", 0.0), ("floor_margin_m", 0.01),
             ("kinematics_file", ""), ("kinematics_model", "piper"), ("ik_limit_margin_rad", 0.02),
             ("linear_step_m", 0.02), ("linear_step_rad", 0.1), ("stall_s", 2.0), ("pose_total_jump_rad", 2.5),

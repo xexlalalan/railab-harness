@@ -4,7 +4,7 @@ piper:
     rate_hz: 100.0
     default_speed_percent: 10
     max_speed_percent: 30          # hard cap this sprint; raise deliberately
-    watchdog_s: 0.25               # feedback silence that triggers auto-disable
+    watchdog_s: 0.25               # feedback silence that cancels the goal and latches a fault (the arm stays enabled)
     move_timeout_s: 30.0
     max_joint_delta_rad: 1.2       # one goal may not ask any joint to jump further than this (~70 deg)
     pose_max_joint_delta_rad: 1.2  # Cartesian move: freeze if any joint runs >1.2 rad from its start (IK branch flip guard, 2026-09-18)

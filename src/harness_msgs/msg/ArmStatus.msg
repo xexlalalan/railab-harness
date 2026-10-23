@@ -13,4 +13,4 @@ float64 feedback_age_s    # seconds since the last feedback frame
 float64 feedback_hz
 int32 speed_percent       # last commanded speed cap
 bool busy                 # a motion goal is executing
-string fault              # non-empty after a watchdog/error auto-disable; cleared by /arm/enable
+string fault              # non-empty after lost feedback / error bits (goal cancelled, arm left enabled); cleared by /arm/enable
