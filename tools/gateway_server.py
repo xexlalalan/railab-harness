@@ -33,6 +33,7 @@ PIPER_YAML = os.path.join(ROOT, "src", "harness_arm", "config", "piper.yaml")
 KIN_FILE = os.path.join(ROOT, "calib", "kinematics.yaml")
 VERSION = 1
 DEADMAN_S = 3.0
+HOLDER_STALE_S = 10.0     # a control holder silent this long (no ping, no command) can be taken over
 JOINTS = ["joint%d" % i for i in range(1, 7)]
 ARM_ACTIONS = ("/arm/move_j", "/arm/move_pose", "/arm/follow_trajectory")
 
@@ -378,10 +379,14 @@ class Conn(socketserver.StreamRequestHandler):
         if cmd == "take_control":
             self.need("key")
             with lock:
-                if ctl["conn"] not in (None, self) and ctl["conn"].alive:
-                    raise PermissionError("control held by %s" % ctl["conn"].client)
+                h = ctl["conn"]
+                # a holder that died without closing its socket (half-open link) must not block the
+                # lease for ever: the twin's link pings every 0.5 s while its page is open
+                stale = h is not None and (not h.alive or time.time() - h.last_rx > HOLDER_STALE_S)
+                if h not in (None, self) and not stale:
+                    raise PermissionError("control held by %s" % h.client)
                 ctl["conn"] = self
-            return {"control": True}
+            return {"control": True, "taken_over_from": h.client if (h is not None and h is not self) else None}
         if cmd == "release_control":
             with lock:
                 if ctl["conn"] is self:
