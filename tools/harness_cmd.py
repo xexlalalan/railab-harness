@@ -12,6 +12,8 @@ USAGE = """harness arm    enable | release | hold | grip-release | grip-enable |
 harness arm    grip <mm> [N]                        gripper to a gap (near the Bunny: <= 20 mm, ~1 N)
 harness arm    move-pose <x> <y> <z> <roll> <pitch> <yaw> [--joint] [--speed N]   mm / deg, straight line unless --joint
 harness arm    move-j <j1..j6 deg> [--speed N]
+harness arm    demo [motion.json] [--duration S] [--yes]   fly a motion file once (default motions/twin_demo.json, 24 s loop):
+                                                    approach, the path, back; without --yes a dry run (plan + checks, no motion)
 harness arm    teach ... | locate ...               (runs the calibration programs)
 harness bunny  status | weight | tare | abort | barcode [timeout_s]
 harness bunny  housing open | close | half | release
@@ -38,11 +40,11 @@ def serve():
     from rclpy.action import ActionClient
     from std_srvs.srv import Trigger
     from std_msgs.msg import String
-    from sensor_msgs.msg import Image
+    from sensor_msgs.msg import Image, JointState
     from harness_msgs.msg import ArmStatus, GripperStatus, FlaskLines
     from harness_msgs.srv import SetGripper, MoveZ, MoveV, WeighTo, LiquidPush, LiquidRun, Barcode, GantryJog, Volume, Lld, DispenseVolume
-    from harness_msgs.action import MovePose, MoveJ
-    from harness_planner import fill_to_mark
+    from harness_msgs.action import MovePose, MoveJ, FollowTrajectory
+    from harness_planner import fill_to_mark, demo as arm_demo
 
     # No rclpy signal handlers: a Ctrl-C in the terminal that first started this daemon must not
     # shut the ROS context down under a still-running daemon ("rcl node's context is invalid").
@@ -55,7 +57,9 @@ def serve():
     n.create_subscription(String, "/pipette/status", lambda m: last.__setitem__("pipette", (json.loads(m.data), time.time())), 10)
     n.create_subscription(FlaskLines, "/dtv/lines", lambda m: last.__setitem__("lines", (m, time.time())), 10)
     n.create_subscription(Image, "/dtv/image", lambda m: last.__setitem__("image", m), 2)
+    n.create_subscription(JointState, "/joint_states", lambda m: last.__setitem__("joints", (m, time.time())), 10)
     ac_pose = ActionClient(n, MovePose, "/arm/move_pose"); ac_j = ActionClient(n, MoveJ, "/arm/move_j")
+    ac_traj = ActionClient(n, FollowTrajectory, "/arm/follow_trajectory")
     ex = MultiThreadedExecutor(num_threads=4); ex.add_node(n)
     threading.Thread(target=ex.spin, daemon=True).start()
     clients = {}
@@ -127,6 +131,19 @@ def serve():
             if len(v) != 6: return "FAILED move-j needs 6 joint angles (deg)"
             g = MoveJ.Goal(); g.joints_rad = [math.radians(x) for x in v]; g.speed_percent = speed; g.timeout_s = 60.0
             return action(ac_j, g, 65)
+        if c == "demo":
+            pos, kv = opts(w[1:])
+
+            def joints():
+                m = fresh("joints", 1.0)
+                if m is None: return None
+                return [m.position[m.name.index(j)] for j in arm_demo.JOINT_NAMES] if all(j in m.name for j in arm_demo.JOINT_NAMES) else None
+            try:
+                return "OK " + arm_demo.run(n, ac_traj, out, cancelled, joints, lambda: last.get("arm"),
+                                            path_file=pos[0] if pos else arm_demo.DEFAULT_MOTION,
+                                            duration_s=float(kv.get("duration", arm_demo.DEFAULT_DURATION_S)), yes="yes" in kv)
+            except RuntimeError as e:
+                return "FAILED " + str(e)
         return "FAILED unknown arm command; see harness --help"
 
     # ------------------------------------------------------------------ bunny

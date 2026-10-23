@@ -701,3 +701,52 @@ An external orchestrator drives the harness by **workflow + step number** over t
 Rules: one step at a time (the planner serialises; a `run` while busy is refused, never queued); `ok` = the step script's exit status 0 = every `harness` call in it answered OK; the step keeps running to its end if the planner disconnects (its finish is then visible in `status.last`). A workflow is `workflows/<dir>/` with a supervisor executable named after it (`origami`, `neuromorphic`); steps are `NN_*.sh`, line 2 is the title. The CLI daemon now splits commands with `shlex`, so quoted arguments (`"Citric Acid"`) reach the node whole; `weigh-to` accepts a powder **name** (the bunny node sends a non-numeric id as `powder_name`, the Bunny resolves it in its database — Bunny spec "Harness Control Interface").
 
 Origami steps rewritten to the operator's 2026-10-10 list (see `docs/CONTROL_PATHWAY.md`). Steps 11/12: Bunny platform up / down 1000 steps; 2026-10-18: steps 13/14 added — up / down 500 steps (`bunny platform ±500`).
+
+## 2026-10-22 — Planner bedrock: Cartesian paths → streamed joint trajectories; `harness arm demo` — CONTRACT + IMPLEMENTED (not yet run on the arm)
+
+**Why.** Every arm motion so far is point-to-point: `move_j` sends one target and waits for the arm to settle; `move_pose --linear` chains IK'd waypoints every 20 mm, each settling — stop-and-go. A smooth motion through the air (a curve) needs a **trajectory**: dense time-stamped joint targets streamed while the arm moves. This is the bedrock the future planner (named targets, collision-checked `move-to`, `pick` / `place`, MoveIt 2 later — operator discussion 2026-10-22) builds on. First use: the **digital twin's demo motion** (the `railab-workflow` repo, layer "Digital twin in motion"), flown once on the real arm by `harness arm demo`. Operator decisions 2026-10-22: one run = approach, one loop, return to the pose it started from; default loop time 24 s (half the twin's pace; `--duration` changes it); the gripper is not touched; the path stays where the twin draws it (straight ahead of the arm) — **the operator clears the bench before running it** (the Bunny registered 2026-09-18 stands inside the path: tag 5 at 434 mm / heading 10°, platform tag at 505 mm / 235 mm high).
+
+**Pipeline** (`src/harness_planner/harness_planner/trajectory.py`, pure Python — numpy/scipy, no ROS, unit-tested offline in `src/harness_planner/test/`):
+
+1. **Path** — a *motion file* (contract below): the fingertip point's positions plus the tool's approach and up directions, sampled along a curve in the arm's base frame. Resampled smoothly by arc length (periodic cubic spline when `closed`).
+2. **Timing** — `u(t)` (fraction of the path done at time `t`): constant tool speed with smooth starts and stops (velocity ramps by smoothstep, `ramp_s` = min(2 s, T/4)), so the arm starts and ends at rest.
+3. **Joint space** — the harness's **own corrected kinematics** (`harness_arm/kinematics.py`, `calib/kinematics.yaml`; never the twin's joint numbers, whose model and joint zeros differ) solves IK at 40 Hz knots, each seeded by the previous (same elbow/wrist branch, continuous); flange = fingertip − `tcp_offset_m` × approach (`calib/floor.yaml` / `piper.yaml`). A cubic spline in time through the joint knots is sampled at the streaming rate (100 Hz). The loop's first knot is solved from several seeds and the solution closest to the current joints is kept.
+4. **Approach / return** — joint-space moves from the current joints to the loop start and from the loop end back to the starting joints: minimum-jerk profile (`10τ³ − 15τ⁴ + 6τ⁵`), duration from the joint speed / acceleration limits (≥ 2 s).
+5. **Validation, before anything moves** — every 100 Hz sample: joint limits (minus `ik_limit_margin_rad`), forward-kinematics deviation from the intended curve (≤ 1 mm / 0.5°), workspace box, fingertip clearance above the calibrated floor (`floor_margin_m`), joint speed ≤ `max_joint_vel_rad_s` (default 0.5 rad/s ≈ 29°/s) and acceleration ≤ `max_joint_acc_rad_s2` (default 1.0). A failure refuses the whole run and names the sample (segment, time, joint / clearance). A loop too fast for the limits reports the shortest duration that fits. **No collision checking yet** — the scene is the floor and the workspace box only; obstacles are the operator's responsibility (clear bench).
+
+**Motion file — CONTRACT `railab-motion/1`** (JSON; written by the twin's *Export for harness* button; kept in `motions/`; the demo's copy is `motions/twin_demo.json`):
+
+| key | meaning |
+|---|---|
+| `format` | `"railab-motion/1"` |
+| `name`, `description`, `source` | free text; `source` names the program / function that generated it |
+| `frame` | `"arm_base"` — the PIPER SDK base frame: origin on the joint-1 axis at the base's mounting face, z up, x the arm's zero heading (the twin's PIPER model frame coincides: joint 1 on its z axis, joint 2 at 123 mm = SDK `d1`) |
+| `units` | `{"length": "mm"}`; directions are unit vectors |
+| `tool` | `"fingertip"` — the point between the fingertips; each system maps it to its own flange (harness: `tcp_offset_m`) |
+| `closed` | `true` = the last sample joins the first (no duplicate end sample) |
+| `samples` | `[{"p": [x, y, z], "approach": [ax, ay, az], "up": [ux, uy, uz]}, …]` — position; the direction the gripper points (harness flange z); the gripper's up (harness flange −x; ⟂ approach) |
+| `suggested_duration_s` | the generator's pace (the twin: 12 s); the harness uses its own default unless `--duration` is given |
+
+**Arm node: `/arm/follow_trajectory`** (`harness_msgs/action/FollowTrajectory`; the node stays the only safety owner and the only `can0` user):
+
+```
+trajectory_msgs/JointTrajectory trajectory   # joint1..joint6, time_from_start strictly increasing,
+                                              # first point = the current joints (± traj_start_tol_rad)
+float64 max_tracking_error_rad               # 0 = node default traj_tracking_error_rad
+string label
+---
+bool success
+string message
+float64 max_tracking_error_rad               # worst |measured − commanded| seen
+float64 seconds
+---
+float64 progress                             # 0..1 of the trajectory time
+float64 tracking_error_rad
+uint32 point_index
+```
+
+The node re-validates every point itself (limits, workspace, floor, joint speed ≤ `traj_max_joint_vel_rad_s` with 10 % slack, start within `traj_start_tol_rad` of the current joints, ≤ `traj_max_points`), refuses while busy / faulted / teach / not enabled, sets the speed to `max_speed_percent` (the controller must keep up; the trajectory's own timing limits the motion), then **streams** the target interpolated at the current time with `move_j` at `traj_rate_hz` (100 Hz; Agilex's own ROS driver drives continuous motion this way; `move_js` is NOT used — the SDK rates it "EXTREMELY HIGH" risk, no smoothing). Every cycle: cancel → freeze (`move_j` current joints), error bits / lost feedback → freeze + fail, tracking error > limit → freeze + fail. At the end it holds the last point until settled (`joint_tol_rad`, `settle_samples`). New `piper.yaml` parameters: `traj_rate_hz` 100, `traj_max_joint_vel_rad_s` 0.6, `traj_tracking_error_rad` 0.15, `traj_start_tol_rad` 0.05, `traj_max_points` 20000.
+
+**CLI: `harness arm demo [file] [--duration S] [--yes]`** (default file `motions/twin_demo.json`). Without `--yes` it is a **dry run**: plan + validate + print the plan (segments, durations, peak joint speeds, minimum floor clearance) and move nothing. With `--yes` (the operator's explicit request for this motion; the bench must be clear) it needs the arm enabled (`harness arm hold`), sends the trajectory to `/arm/follow_trajectory`, prints progress, and Ctrl-C cancels (the arm freezes where it is).
+
+**Status / first run.** Verified offline only (2026-10-22, the dev laptop: no ROS, no arm): `src/harness_planner/test/` (6 tests — motion-file contract, timing, the demo plans reachable / level / returning, too-fast refusal with an honest duration hint, floor and reach refusals, flange convention) and the node's `exec_follow_trajectory` driven against a simulated lagging arm (full 36 s run at 99 Hz: success, back at the start, worst lag 1.6°; a jammed joint → frozen + failed at 10.7 s; cancel → frozen; wrong start / too fast / bad timestamps → refused before any command). Planned demo, 24 s loop, from a parked pose: approach 5.9 s + loop 24 s + return 5.9 s; peak joint speed 28.6°/s (j2, approach), fingertip ≥ 219 mm above the floor; a loop shorter than ~21 s is refused (j5). **First run on the harness PC:** `colcon build --symlink-install --packages-select harness_msgs harness_arm harness_planner`, `harness nodes restart piper`, `harness daemon-stop` (reloads the CLI), `harness arm demo` (dry run: read the plan), clear the bench, `harness arm hold`, `harness arm demo --yes` with a hand on the arm's power; Ctrl-C freezes it. Raise speed later with `--duration` (≥ 21 s with the default limits).

@@ -15,6 +15,7 @@ Status: **have** = works today · **new** = to write.
 | `harness arm move-pose <x y z roll pitch yaw> [--joint] [--speed N]` (mm, deg) | arm | `/arm/move_pose` (action) | straight-line TCP move (`--joint` = joint-interpolated) | have |
 | `harness arm move-j <j1..j6 deg> [--speed N]` | arm | `/arm/move_j` (action) | joint move | have |
 | `harness arm status` | arm | `/arm/status`, `/arm/gripper_status` | joints on/off, gripper gap | have |
+| `harness arm demo [motion.json] [--duration S] [--yes]` | arm + planner | `harness_planner.demo` (plans with `harness_planner.trajectory`) → `/arm/follow_trajectory` (FollowTrajectory action) | fly a motion file once: approach from the current pose, the path (default `motions/twin_demo.json`, the twin's figure-eight, 24 s loop), back; without `--yes` a dry run (plan + checks only). Bench must be clear | have (2026-10-22; not yet run on the arm) |
 | `harness arm teach ...` / `locate ...` | arm + camera | `harness_calibration teach`, `locate` programs | find a module's tag, store its pose | have |
 | `harness bunny status` | bunny | `/bunny/status` (String JSON) | housing, weight, pump, dispensing, powder, link | have |
 | `harness bunny weight` / `tare` | bunny | `/bunny/weight` (Float64), `/bunny/tare` | scale (`scale_link.py`, `core.tare`) | have |

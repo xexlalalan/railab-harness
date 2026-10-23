@@ -2,9 +2,10 @@
 <package format="3">
   <name>harness_planner</name>
   <version>0.1.0</version>
-  <description>Compound operations (workflows) composed only from module services/actions: fill-to-mark, ...</description>
+  <description>Compound operations (workflows) composed only from module services/actions: fill-to-mark, the arm demo; the planner bedrock (Cartesian paths -> validated joint trajectories)</description>
   <maintainer email="xexlalalan@gmail.com">bunny-harness</maintainer>
   <license>Proprietary</license>
   <depend>rclpy</depend><depend>std_srvs</depend><depend>std_msgs</depend><depend>harness_msgs</depend>
+  <depend>trajectory_msgs</depend><depend>builtin_interfaces</depend><depend>harness_arm</depend>
   <export><build_type>ament_python</build_type></export>
 </package>

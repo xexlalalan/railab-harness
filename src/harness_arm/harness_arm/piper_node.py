@@ -21,6 +21,8 @@ Services:
 Actions:
   /arm/move_j     harness_msgs/MoveJ
   /arm/move_pose  harness_msgs/MovePose   (linear=false -> move_p, true -> move_l)
+  /arm/follow_trajectory  harness_msgs/FollowTrajectory   stream a validated joint trajectory
+                  (move_j re-targeted at traj_rate_hz; PROJECT_SPEC.md "2026-10-22 — Planner bedrock")
 
 Rules: enable state comes from joint feedback, never from an SDK return value.
 A watchdog disables the arm when feedback stops; any error bit cancels the
@@ -30,6 +32,7 @@ import math
 import os
 import threading
 import time
+import warnings
 
 import numpy as np
 import yaml
@@ -43,7 +46,7 @@ from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
 from std_srvs.srv import Trigger
 
-from harness_msgs.action import MoveJ, MovePose
+from harness_msgs.action import FollowTrajectory, MoveJ, MovePose
 from harness_arm.kinematics import PiperKinematics, T_from_xyzrpy, xyzrpy_from_T, pose_error
 from harness_msgs.msg import ArmStatus, GripperStatus
 from harness_msgs.srv import SetGripper, SetJoints, SetSpeed
@@ -98,6 +101,8 @@ class PiperNode(Node):
             ("floor_enabled", False), ("floor_plane", [0.0, 0.0, 0.0]), ("tcp_offset_m", 0.0), ("floor_margin_m", 0.01),
             ("kinematics_file", ""), ("kinematics_model", "piper"), ("ik_limit_margin_rad", 0.02),
             ("linear_step_m", 0.02), ("linear_step_rad", 0.1), ("stall_s", 2.0), ("pose_total_jump_rad", 2.5),
+            ("traj_rate_hz", 100.0), ("traj_max_joint_vel_rad_s", 0.6), ("traj_tracking_error_rad", 0.15),
+            ("traj_start_tol_rad", 0.05), ("traj_max_points", 20000),
         ])
         self.P = {x.name: x.value for x in p}
         self.cb = ReentrantCallbackGroup()
@@ -132,6 +137,9 @@ class PiperNode(Node):
                                  goal_callback=self.goal_cb, cancel_callback=self.cancel_cb,
                                  callback_group=self.cb)
         self.as_p = ActionServer(self, MovePose, "/arm/move_pose", self.exec_move_pose,
+                                 goal_callback=self.goal_cb, cancel_callback=self.cancel_cb,
+                                 callback_group=self.cb)
+        self.as_t = ActionServer(self, FollowTrajectory, "/arm/follow_trajectory", self.exec_follow_trajectory,
                                  goal_callback=self.goal_cb, cancel_callback=self.cancel_cb,
                                  callback_group=self.cb)
 
@@ -809,6 +817,157 @@ class PiperNode(Node):
         res.final_pose = [float(x) for x in (self.snap.get("tcp") or [0.0] * 6)]
         (gh.succeed if ok else gh.abort)()
         return res
+
+    # ------------------------------------------------------------------ trajectories
+    def _check_trajectory(self, t, q):
+        """Reason a joint trajectory must be refused, or None: every point within the joint limits,
+        the workspace box and the floor margin; joint speed between points within
+        traj_max_joint_vel_rad_s (+10 %). The planner checked the same; this node is the last gate."""
+        m = float(self.P["ik_limit_margin_rad"]) * 0.5
+        lo = np.array([l[0] + m for l in self.kin.limits])
+        hi = np.array([l[1] - m for l in self.kin.limits])
+        bad = np.argwhere((q < lo) | (q > hi))
+        if len(bad):
+            i, j = bad[0]
+            return f"point {i}: joint {j + 1} at {math.degrees(q[i, j]):.1f} deg is outside its limits"
+        v = np.abs(np.diff(q, axis=0)) / np.diff(t)[:, None]
+        vmax = float(self.P["traj_max_joint_vel_rad_s"]) * 1.1
+        if (v > vmax).any():
+            i, j = np.unravel_index(v.argmax(), v.shape)
+            return f"point {i + 1}: joint {j + 1} would turn at {v[i, j]:.2f} rad/s > {vmax:.2f} (traj_max_joint_vel_rad_s + 10 %)"
+        for i in range(len(t)):
+            with warnings.catch_warnings():          # a level gripper is exactly at the rpy gimbal lock; the rotation is still right
+                warnings.simplefilter("ignore", UserWarning)
+                pose = self.kin.fk_xyzrpy(q[i])
+            if not self._in_workspace(pose[:3]):
+                return f"point {i} (t = {t[i]:.2f} s): flange outside the workspace box"
+            fv = self._floor_violation(pose)
+            if fv:
+                return f"point {i} (t = {t[i]:.2f} s): {fv}"
+        return None
+
+    def exec_follow_trajectory(self, gh):
+        """Validate, then stream: every 1 / traj_rate_hz the target interpolated at the current time
+        goes to the controller with move_j (its speed set to max_speed_percent so it can keep up — the
+        trajectory's own timing limits the motion). Cancel / errors / lost feedback / tracking error
+        -> freeze where it is. At the end, hold the last point until settled."""
+        g = gh.request
+        res = FollowTrajectory.Result()
+
+        def fail(msg):
+            res.success, res.message = False, msg
+            gh.abort()
+            return res
+
+        jt = g.trajectory
+        names = list(jt.joint_names)
+        if names and sorted(names) != sorted(JOINT_NAMES):
+            return fail(f"refused: joint_names must be {JOINT_NAMES}")
+        order = [names.index(n) for n in JOINT_NAMES] if names else list(range(6))
+        pts = list(jt.points)
+        if len(pts) < 2:
+            return fail("refused: a trajectory needs at least 2 points")
+        if len(pts) > int(self.P["traj_max_points"]):
+            return fail(f"refused: {len(pts)} points > traj_max_points {self.P['traj_max_points']}")
+        try:
+            t = np.array([p.time_from_start.sec + p.time_from_start.nanosec * 1e-9 for p in pts], dtype=float)
+            q = np.array([[float(p.positions[i]) for i in order] for p in pts], dtype=float)
+        except (IndexError, ValueError):
+            return fail("refused: every point needs 6 joint positions")
+        if (np.diff(t) <= 0).any():
+            return fail("refused: time_from_start must increase strictly")
+        why = self._check_trajectory(t, q)
+        if why:
+            return fail("refused: " + why)
+        cur = self.snap.get("joints") or self._read()["joints"]
+        if cur is None:
+            return fail("no joint feedback")
+        d0 = float(np.abs(q[0] - np.array(cur, dtype=float)).max())
+        if d0 > float(self.P["traj_start_tol_rad"]):
+            return fail(f"refused: the trajectory starts {d0:.3f} rad away from the current joints "
+                        f"(> traj_start_tol_rad {self.P['traj_start_tol_rad']}); plan it from where the arm is")
+        tol = float(g.max_tracking_error_rad) if g.max_tracking_error_rad > 0 else float(self.P["traj_tracking_error_rad"])
+        ok, msg, worst, secs = self._stream(gh, t, q, tol, g.label or "trajectory")
+        res.success, res.message = ok, msg
+        res.max_tracking_error_rad, res.seconds = float(worst), float(secs)
+        (gh.succeed if ok else gh.abort)()
+        return res
+
+    def _stream(self, gh, t, q, tol, label):
+        """The streaming loop of exec_follow_trajectory: (ok, message, worst tracking error, seconds)."""
+        if not self.motion.acquire(blocking=False):
+            return False, "another motion is running", 0.0, 0.0
+        self.busy = True
+        self.cancel_requested = False
+        worst, tt = 0.0, 0.0
+        try:
+            s = self._read()
+            if not all(s["enabled"]):
+                return False, "arm is not enabled (harness arm hold first)", 0.0, 0.0
+            speed = int(self.P["max_speed_percent"])
+            with self.sdk:
+                self.robot.set_speed_percent(speed)
+            self.speed = speed
+            T_end, period = float(t[-1]), 1.0 / float(self.P["traj_rate_hz"])
+            self.get_logger().info(f"{label}: streaming {len(t)} points over {T_end:.1f} s at "
+                                   f"{self.P['traj_rate_hz']:.0f} Hz, speed {speed} %, tracking limit {tol:.3f} rad")
+            t0 = time.monotonic()
+            nxt, k = t0, 0
+            while True:
+                tt = time.monotonic() - t0
+                if tt >= T_end:
+                    break
+                cmd = [float(np.interp(tt, t, q[:, j])) for j in range(6)]
+                with self.sdk:
+                    self.robot.move_j(cmd)
+                s = self._read()
+                if self.cancel_requested or gh.is_cancel_requested:
+                    self._stop_here()
+                    return False, f"cancelled at {tt:.1f} s of {T_end:.1f} s; stopped where it was", worst, tt
+                if s["errors"]:
+                    self._stop_here()
+                    return False, f"errors at {tt:.1f} s: " + ",".join(s["errors"]), worst, tt
+                if s["age"] >= float(self.P["watchdog_s"]):
+                    return False, f"feedback lost at {tt:.1f} s", worst, tt
+                if s["joints"] is not None:
+                    e = [abs(a - b) for a, b in zip(s["joints"], cmd)]
+                    j = max(range(6), key=lambda i: e[i])
+                    worst = max(worst, e[j])
+                    if e[j] > tol:
+                        self._stop_here()
+                        return False, (f"tracking error {e[j]:.3f} rad on joint {j + 1} > {tol:.3f} at {tt:.1f} s "
+                                       f"(the arm cannot follow: blocked, clamped at a limit, or too fast); stopped"), worst, tt
+                if k % 10 == 0:
+                    f = FollowTrajectory.Feedback()
+                    f.progress, f.tracking_error_rad = tt / T_end, worst
+                    f.point_index = int(np.searchsorted(t, tt))
+                    gh.publish_feedback(f)
+                k += 1
+                nxt += period
+                delay = nxt - time.monotonic()
+                if delay > 0:
+                    time.sleep(delay)
+                else:
+                    nxt = time.monotonic()               # overrun: re-sync, never burst
+            final = [float(x) for x in q[-1]]
+            with self.sdk:
+                self.robot.move_j(final)
+            jtol, need, settled, t_end = float(self.P["joint_tol_rad"]), int(self.P["settle_samples"]), 0, time.time() + 5.0
+            while time.time() < t_end:
+                time.sleep(0.05)
+                s = self._read()
+                if self.cancel_requested or gh.is_cancel_requested:
+                    self._stop_here()
+                    return False, "cancelled while settling", worst, T_end
+                if s["joints"] is not None:
+                    e = max(abs(a - b) for a, b in zip(s["joints"], final))
+                    settled = settled + 1 if e <= jtol else 0
+                    if settled >= need:
+                        return True, f"{label}: done in {T_end:.1f} s (worst tracking error {worst:.3f} rad)", worst, T_end
+            return False, f"{label}: streamed, but the last point did not settle within 5 s", worst, T_end
+        finally:
+            self.busy = False
+            self.motion.release()
 
     def shutdown(self):
         try:

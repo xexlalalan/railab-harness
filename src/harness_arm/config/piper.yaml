@@ -34,3 +34,9 @@ piper:
     linear_step_rad: 0.1
     pose_total_jump_rad: 2.5       # point-to-point move_pose: split into joint via points up to this total jump; beyond = refused
     stall_s: 2.0                   # move fails fast if the joints stop short of the target for this long (controller limit clamp)
+    # --- /arm/follow_trajectory (2026-10-22, planner bedrock): streamed joint trajectories
+    traj_rate_hz: 100.0            # move_j re-targeted this often while a trajectory runs
+    traj_max_joint_vel_rad_s: 0.6  # refuse trajectories faster than this (+10 %) between points; the planner plans to 0.5
+    traj_tracking_error_rad: 0.15  # freeze + fail when |measured - commanded| exceeds this on any joint
+    traj_start_tol_rad: 0.05       # the first point must be this close to the current joints
+    traj_max_points: 20000
