@@ -10,7 +10,7 @@ tags:
   layout:
     - {id: 3, role: platform, accuracy: accurate, size_mm: 7.5, white_mm: 10, link: platform, note: "on the dispenser platform (moves with it); the dispenser mount's reference"}
     - {id: 7, role: body_top, accuracy: accurate, size_mm: 37.5, white_mm: 50, link: body}
-    - {id: 0, role: body_side, accuracy: accurate, size_mm: 30.0, white_mm: 40, link: body}
+    - {id: 5, role: body_side, accuracy: accurate, size_mm: 30.0, white_mm: 40, link: body, note: "the twin's tag3 (operator 2026-10-23: id 5, not 0); the twin says a 40 mm print, the 2026-09-18 range-scale test measured 35.8 mm black (48 mm print) - ruler check pending"}
 footprint_mm: [420, 380, 600]
 handoffs: {}                               # dispenser_mount / vial_place: {ref_tag: <accurate tag role>, pose_mm_deg} (spec 2026-10-23 "Tag classes")
 interface: {kind: tcp_json, discovery: static}
