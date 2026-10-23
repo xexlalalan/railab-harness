@@ -209,6 +209,8 @@ class Gateway:
             from harness_arm.kinematics import xyzrpy_from_T
             x = xyzrpy_from_T(self.kin.fk(q))
             arm["joints_deg"] = [round(math.degrees(v), 3) for v in q]
+            # the corrected model's angles (raw + calib/kinematics.yaml zero offsets): what the twin mirrors
+            arm["joints_model_deg"] = [round(math.degrees(v + o), 3) for v, o in zip(q, self.kin.offsets)]
             arm["flange_mm_deg"] = [round(v * 1000, 1) for v in x[:3]] + [round(math.degrees(v), 2) for v in x[3:]]
             _, tip, _ = self.tip_and_clearance(q)        # the fingertip: same orientation, tcp_offset along flange z
             arm["tip_mm_deg"] = [round(float(v) * 1000, 1) for v in tip] + arm["flange_mm_deg"][3:]
