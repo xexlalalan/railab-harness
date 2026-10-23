@@ -18,7 +18,8 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   v2 (2026-10-23, spec "Release, hand-eye and tag teaching through the gateway"):
   {"cmd": "arm.release"}                                  joints 1-6 limp (the gripper keeps holding)
   {"cmd": "calib.handeye", "args": {"tag_id": 8}}         job: hand-eye around where the arm holds; state.calib
-  {"cmd": "teach.fine", "args": {"tag_id": 7, "black_mm": 37.5}}   job: five-view cross on the tag in view
+  {"cmd": "teach.plan_views", "args": {"from_model_deg": [...6], "backoff_mm": 40, "tilt_deg": 1.5}}   dry run
+  {"cmd": "teach.fine", "args": {"tag_id": 7, "black_mm": 37.5, "tilt_deg": 3, "views_model_deg": {...}}}   job: the cross
   {"cmd": "arm.follow_joints", "args": {"waypoints_model_deg": [[...6], ...]}}   job: a planner's joint path
 
 The gateway owns no hardware: it is an rclpy client of the module nodes, like harness_cmd.py. Releasing the
@@ -188,8 +189,53 @@ class Gateway:
             self.hc = HarnessClient("gateway_teach")
         return self.hc
 
-    def fine(self, tid, black_mm, abort):
-        """teach.fine: the five-view cross on tag tid from where the camera looks now (harness_calibration.fine)."""
+    def plan_views(self, q_model_deg, backoff_mm, tilt_deg):
+        """teach.plan_views, a dry run: the five-view cross for a viewing posture (corrected-model degrees) with the
+        camera backoff_mm further back along its optical axis and +-tilt_deg tilts. Every view solved by IK inside
+        the joint limits (seeded from the posture: same wrist / elbow branch), its fingertip checked against the
+        floor and the workspace box; nothing moves. Obstacles are the caller's (the twin's) to check."""
+        import numpy as np
+        from harness_calibration.fine import backed_off, cross_targets
+        if self.Tfc is None:
+            raise RuntimeError("no hand-eye calibration (calib/handeye.yaml)")
+        if not isinstance(q_model_deg, list) or len(q_model_deg) != 6:
+            raise ValueError("from_model_deg needs 6 joint angles")
+        off = np.array(self.kin.offsets, float)
+        q = np.radians(np.array(q_model_deg, float)) - off
+        margin = float(self.P.get("ik_limit_margin_rad", 0.02))
+        lo = np.array([l[0] for l in self.limits]) + margin
+        hi = np.array([l[1] for l in self.limits]) - margin
+        T0 = backed_off(self.kin.fk(q), self.Tfc, float(backoff_mm) / 1000.0)
+        fl_margin = float(self.P.get("floor_margin_m", 0.015))
+        wlo, whi = self.P.get("workspace_min"), self.P.get("workspace_max")
+        out, reasons, q_c = [], [], None
+        for name, T in cross_targets(T0, self.Tfc, float(tilt_deg)):
+            qs, pe, ae = self.kin.ik(T, q_c if q_c is not None else np.clip(q, lo + 1e-6, hi - 1e-6), margin=margin)
+            why = None
+            if pe > 1e-3 or ae > 5e-3:
+                why = "out of reach inside the joint limits (best %.1f mm / %.2f deg)" % (pe * 1000, math.degrees(ae))
+            else:
+                Tq, _, clear = self.tip_and_clearance(list(qs))
+                if self.P.get("floor_enabled", False) and clear < fl_margin:
+                    why = "the fingertip would be %.0f mm above the floor (margin %.0f mm)" % (clear * 1000, fl_margin * 1000)
+                elif wlo and whi and not all(wlo[i] <= Tq[i, 3] <= whi[i] for i in range(3)):
+                    why = "the gripper base would leave the workspace box"
+                elif q_c is not None and float(np.abs(qs - q_c).max()) > float(self.P.get("max_joint_delta_rad", 1.2)):
+                    why = "a joint would jump %.0f deg (another wrist branch)" % math.degrees(float(np.abs(qs - q_c).max()))
+            out.append({"view": name, "ok": why is None, "reason": why,
+                        "joints_model_deg": [round(math.degrees(float(v + o)), 4) for v, o in zip(qs, off)]})
+            if why:
+                reasons.append("%s: %s" % (name, why))
+                if name == "centre":
+                    break                                     # no centre view, no cross
+            elif name == "centre":
+                q_c = qs
+        return {"ok": not reasons, "reasons": reasons, "backoff_mm": float(backoff_mm), "tilt_deg": float(tilt_deg),
+                "centre_model_deg": out[0]["joints_model_deg"], "views": out[1:]}
+
+    def fine(self, tid, black_mm, abort, tilt_deg=3.0, views_model_deg=None):
+        """teach.fine: the five-view cross on tag tid from where the camera looks now (harness_calibration.fine);
+        views_model_deg {view: 6 corrected-model degrees} = go to exactly these (teach.plan_views) postures."""
         import datetime as dt, numpy as np, yaml
         from harness_calibration.fine import Aborted, cross_locate
         from harness_arm.kinematics import xyzrpy_from_T
@@ -203,8 +249,12 @@ class Gateway:
         if t is None:
             raise RuntimeError("tag %d is not in view from here" % tid)
         scale = (black_mm / 1000.0) / t.size_m if black_mm > 0 else 1.0
+        vj = None
+        if views_model_deg:
+            off = list(self.kin.offsets)
+            vj = {k: [math.radians(float(v)) - o for v, o in zip(q, off)] for k, q in views_model_deg.items()}
         try:
-            r = cross_locate(c, tid, self.Tfc, scale=scale, abort=abort.is_set)
+            r = cross_locate(c, tid, self.Tfc, scale=scale, abort=abort.is_set, tilt_deg=float(tilt_deg), view_joints=vj)
         except Aborted:
             raise RuntimeError(JOB.get("why") or "aborted")
         q = self.joints_rad()
@@ -657,10 +707,14 @@ class Conn(socketserver.StreamRequestHandler):
             elif not any(t["id"] == int(tid) for t in seen):
                 raise RuntimeError("tag %s is not in view" % tid)
             return self.job("calib.handeye", lambda ev: handeye_job(int(tid), ev), background=True, extra={"tag_id": int(tid)})
+        if cmd == "teach.plan_views":
+            self.need("key")
+            return gw.plan_views(a.get("from_model_deg"), float(a.get("backoff_mm") or 0.0), float(a.get("tilt_deg") or 3.0))
         if cmd == "teach.fine":
             self.need("control")
             tid, black = int(a["tag_id"]), float(a.get("black_mm") or 0.0)
-            return self.job("teach.fine", lambda ev: gw.fine(tid, black, ev))
+            tilt, views = float(a.get("tilt_deg") or 3.0), a.get("views_model_deg") or None
+            return self.job("teach.fine", lambda ev: gw.fine(tid, black, ev, tilt, views))
         if cmd == "arm.follow_joints":
             self.need("control")
             wps, label = a.get("waypoints_model_deg"), str(a.get("label") or "")
