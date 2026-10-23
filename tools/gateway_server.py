@@ -488,6 +488,10 @@ def main():
         print(make_key())
         return
     gw = Gateway()
+    # rclpy takes SIGTERM for its own shutdown, which leaves the TCP server running: `harness nodes
+    # restart gateway` (pkill = SIGTERM) must end the process
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
     threading.Thread(target=jog_worker, daemon=True).start()
     print("gateway: listening on 0.0.0.0:%d (key %s)" % (PORT, "set" if read_key() else "MISSING: view-only"), flush=True)
     Server(("0.0.0.0", PORT), Conn).serve_forever()
