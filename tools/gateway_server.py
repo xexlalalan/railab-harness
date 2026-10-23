@@ -51,6 +51,8 @@ HANDEYE_SETTLE_S = 3.0           # wait after every hand-eye move before the ima
 TEACH_VEL_RAD_S, TEACH_ACC_RAD_S2 = 0.35, 0.7     # arm.follow_joints: joint speed / acceleration of the path
 FOLLOW_START_TOL_RAD = 0.1       # its first waypoint: this close to where the arm is
 FOLLOW_CLAMP_RAD = math.radians(3.0)   # waypoints beyond the controller limits by up to this are clamped inside
+VIEW_CONE_DEG = 22.0             # teach.plan_views: an approximate centre view keeps the tag this close to the camera axis
+VIEW_ROOM_RAD = math.radians(4.0)      # ... and this much more room from the joint limits (so the tilts fit)
 
 
 def read_key():
@@ -189,11 +191,14 @@ class Gateway:
             self.hc = HarnessClient("gateway_teach")
         return self.hc
 
-    def plan_views(self, q_model_deg, backoff_mm, tilt_deg):
+    def plan_views(self, q_model_deg, backoff_mm, tilt_deg, tag_base_mm=None):
         """teach.plan_views, a dry run: the five-view cross for a viewing posture (corrected-model degrees) with the
         camera backoff_mm further back along its optical axis and +-tilt_deg tilts. Every view solved by IK inside
         the joint limits (seeded from the posture: same wrist / elbow branch), its fingertip checked against the
-        floor and the workspace box; nothing moves. Obstacles are the caller's (the twin's) to check."""
+        floor and the workspace box; nothing moves. Obstacles are the caller's (the twin's) to check.
+        A posture held past a joint limit (the arm was limp) cannot be reproduced exactly: with tag_base_mm (where
+        the tag is, arm base) the centre becomes the nearest view inside the limits with VIEW_ROOM_RAD to spare,
+        if the tag stays within VIEW_CONE_DEG of the camera axis; the tilts are then around that centre."""
         import numpy as np
         from harness_calibration.fine import backed_off, cross_targets
         if self.Tfc is None:
@@ -208,11 +213,36 @@ class Gateway:
         T0 = backed_off(self.kin.fk(q), self.Tfc, float(backoff_mm) / 1000.0)
         fl_margin = float(self.P.get("floor_margin_m", 0.015))
         wlo, whi = self.P.get("workspace_min"), self.P.get("workspace_max")
+        seed = np.clip(q, lo + 1e-6, hi - 1e-6)
+        held = "; ".join("joint %d was held at %.1f deg (limit %.1f)" % (j + 1, math.degrees(q[j]), math.degrees(lo[j] - margin if q[j] < lo[j] else hi[j] + margin))
+                         for j in range(6) if q[j] < lo[j] - margin or q[j] > hi[j] + margin)
+        note, centre = "", None
+        qs, pe, ae = self.kin.ik(T0, seed, margin=margin)
+        if pe <= 1e-3 and ae <= 5e-3:
+            centre = qs
+        elif tag_base_mm is not None:                      # the nearest view inside the limits, room for the tilts
+            qa, pa, aa = self.kin.ik(T0, seed, margin=margin + VIEW_ROOM_RAD)
+            Tc = self.kin.fk(qa) @ self.Tfc
+            v = np.array(tag_base_mm, float) / 1000.0 - Tc[:3, 3]
+            off_axis = math.degrees(math.acos(max(-1.0, min(1.0, float(Tc[:3, 2] @ v) / max(1e-9, float(np.linalg.norm(v)))))))
+            if off_axis <= VIEW_CONE_DEG:
+                centre = qa
+                note = ("the nearest view inside the joint limits: %.0f mm / %.1f deg from the one asked for%s; the tag %.0f deg off the camera axis"
+                        % (pa * 1000, math.degrees(aa), " (" + held + ")" if held else "", off_axis))
+            else:
+                pe, ae = pa, aa
         out, reasons, q_c = [], [], None
-        for name, T in cross_targets(T0, self.Tfc, float(tilt_deg)):
-            qs, pe, ae = self.kin.ik(T, q_c if q_c is not None else np.clip(q, lo + 1e-6, hi - 1e-6), margin=margin)
+        T_c = self.kin.fk(centre) if centre is not None else T0
+        for name, T in cross_targets(T_c, self.Tfc, float(tilt_deg)):
+            if name == "centre":
+                qs = centre if centre is not None else qs
+            else:
+                qs, pe, ae = self.kin.ik(T, q_c, margin=margin)
             why = None
-            if pe > 1e-3 or ae > 5e-3:
+            if name == "centre" and centre is None:
+                why = ("out of reach inside the joint limits (best %.1f mm / %.2f deg)" % (pe * 1000, math.degrees(ae))
+                       + ("; " + held if held else "") + ("; the nearest reachable view loses the tag" if tag_base_mm is not None else ""))
+            elif name != "centre" and (pe > 1e-3 or ae > 5e-3):
                 why = "out of reach inside the joint limits (best %.1f mm / %.2f deg)" % (pe * 1000, math.degrees(ae))
             else:
                 Tq, _, clear = self.tip_and_clearance(list(qs))
@@ -230,7 +260,7 @@ class Gateway:
                     break                                     # no centre view, no cross
             elif name == "centre":
                 q_c = qs
-        return {"ok": not reasons, "reasons": reasons, "backoff_mm": float(backoff_mm), "tilt_deg": float(tilt_deg),
+        return {"ok": not reasons, "reasons": reasons, "note": note, "backoff_mm": float(backoff_mm), "tilt_deg": float(tilt_deg),
                 "centre_model_deg": out[0]["joints_model_deg"], "views": out[1:]}
 
     def fine(self, tid, black_mm, abort, tilt_deg=3.0, views_model_deg=None):
@@ -709,7 +739,8 @@ class Conn(socketserver.StreamRequestHandler):
             return self.job("calib.handeye", lambda ev: handeye_job(int(tid), ev), background=True, extra={"tag_id": int(tid)})
         if cmd == "teach.plan_views":
             self.need("key")
-            return gw.plan_views(a.get("from_model_deg"), float(a.get("backoff_mm") or 0.0), float(a.get("tilt_deg") or 3.0))
+            return gw.plan_views(a.get("from_model_deg"), float(a.get("backoff_mm") or 0.0), float(a.get("tilt_deg") or 3.0),
+                                 a.get("tag_base_mm"))
         if cmd == "teach.fine":
             self.need("control")
             tid, black = int(a["tag_id"]), float(a.get("black_mm") or 0.0)
