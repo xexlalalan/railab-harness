@@ -750,3 +750,33 @@ The node re-validates every point itself (limits, workspace, floor, joint speed 
 **CLI: `harness arm demo [file] [--duration S] [--yes]`** (default file `motions/twin_demo.json`). Without `--yes` it is a **dry run**: plan + validate + print the plan (segments, durations, peak joint speeds, minimum floor clearance) and move nothing. With `--yes` (the operator's explicit request for this motion; the bench must be clear) it needs the arm enabled (`harness arm hold`), sends the trajectory to `/arm/follow_trajectory`, prints progress, and Ctrl-C cancels (the arm freezes where it is).
 
 **Status / first run.** Verified offline only (2026-10-22, the dev laptop: no ROS, no arm): `src/harness_planner/test/` (6 tests — motion-file contract, timing, the demo plans reachable / level / returning, too-fast refusal with an honest duration hint, floor and reach refusals, flange convention) and the node's `exec_follow_trajectory` driven against a simulated lagging arm (full 36 s run at 99 Hz: success, back at the start, worst lag 1.6°; a jammed joint → frozen + failed at 10.7 s; cancel → frozen; wrong start / too fast / bad timestamps → refused before any command). Planned demo, 24 s loop, from a parked pose: approach 5.9 s + loop 24 s + return 5.9 s; peak joint speed 28.6°/s (j2, approach), fingertip ≥ 219 mm above the floor; a loop shorter than ~21 s is refused (j5). **First run on the harness PC:** `colcon build --symlink-install --packages-select harness_msgs harness_arm harness_planner`, `harness nodes restart piper`, `harness daemon-stop` (reloads the CLI), `harness arm demo` (dry run: read the plan), clear the bench, `harness arm hold`, `harness arm demo --yes` with a hand on the arm's power; Ctrl-C freezes it. Raise speed later with `--duration` (≥ 21 s with the default limits).
+
+## 2026-10-22 — Twin control gateway (TCP 7803) — CONTRACT (PROPOSED, not implemented)
+
+**Why.** The operator wants to watch and drive the harness modules from the workflow app's digital twin (`railab-workflow`, spec §10.7): click a module in the *Digital twin in motion* layer, set its joints, test them on the real module. The twin's server (on the laptop) needs a live, persistent link to the harness PC; the existing servers do not fit (7801 is the Bunny's own; 7802 runs one numbered step per connection). Operator decisions 2026-10-22: one link per harness, over the **lab Wi-Fi**; the gateway listens on all interfaces; **motion commands need a shared key**; the control panel lives in the twin's motion layer.
+
+**Server.** `tools/gateway_server.py` — an rclpy client of the module nodes (like `harness_cmd.py`; it owns no hardware, the arm node stays the only safety owner and the only `can0` user), process `gateway` under `harness nodes`, **TCP port 7803**, all interfaces. Newline-delimited JSON, UTF-8, **persistent connections, many requests per connection**; any number of clients at once.
+
+**Key.** The shared key lives in `~/.config/railab-harness/gateway.key` on the PC (one line; `chmod 600`; `harness gateway key` creates a random one if missing and prints it). The twin stores the same string in its settings. Without a key file the gateway runs **view-only**. The key travels unencrypted on the Wi-Fi: it guards against *accidental* commands from other machines, not against an attacker.
+
+**Messages.** Request `{"id": n, "cmd": "...", "args": {...}}` → reply `{"id": n, "ok": true, "result": {...}}` or `{"id": n, "ok": false, "error": "..."}`. Unsolicited events carry `"event"` instead of `"id"`.
+
+| cmd | who | result / behaviour |
+|---|---|---|
+| `hello {key?, client}` | anyone | `{version: 1, access: "control" \| "view", modules: {arm: {joints: 6, limits_deg: [[lo, hi] ×6], gripper_max_mm, max_speed_percent}, bunny: {...}}}` — a missing or wrong key gives `view` (wrong key also returns `warning`) |
+| `subscribe {rate_hz ≤ 20, default 10}` | anyone | `state` events at that rate until `unsubscribe` / disconnect |
+| `ping` | anyone | `{t}`; the controller must send something at least every **1 s** (see dead-man) |
+| `take_control` / `release_control` | key | **one controller at a time**: refused while another connection holds it (`error: "control held by <client>"`); released on disconnect |
+| `stop` | **anyone** | cancel any running arm goal → the arm freezes where it is (stays enabled); `abort` to the Bunny if it is moving. Never refused |
+| `arm.hold` | controller | `/arm/hold` (enable + hold the current posture). **There is no release/disable command** — making the arm limp stays a CLI-only, explicitly named action |
+| `arm.check_j {joints_deg[6]}` | key | dry run, nothing moves: within the controller limits (`ik_limit_margin_rad`)? largest joint jump vs now (≤ `max_joint_delta_rad`)? corrected FK → `flange_mm_deg`, `tip_mm`, fingertip clearance above the calibrated floor; `{ok, reasons[], ...}` |
+| `arm.move_j {joints_deg[6], speed_percent (default 10)}` | controller | runs `arm.check_j` first, then `/arm/move_j`; replies when the move ends `{success, message, residual_rad}`; `progress` events in between |
+| `arm.gripper {gap_mm, force_n}` | controller | `/arm/gripper` (the near-Bunny rule ≤ 20 mm / ~1 N stays the operator's) |
+| `bunny.housing {to: open\|half\|close}` | controller | `/bunny/housing_*` |
+| `bunny.platform {steps ±}` | controller | `/bunny/platform`; result = new position in steps |
+
+**`state` event** (`{"event": "state", "t": ..., ...}`): `arm: {online, joints_deg[6] (raw controller joints = what move_j takes), gripper_mm, enabled[6], ctrl_mode, busy, fault, errors[], feedback_age_s, flange_mm_deg (corrected)}`, `bunny: {online, housing, housing_rad, weight_g, dispensing, busy}` (from `/bunny/status`; platform position is not in the Bunny's status — it is returned by `bunny.platform`), `control: {held_by, you}`. A module whose node is down shows `online: false`.
+
+**Dead-man.** While a motion started through the gateway runs, the controller's connection must stay alive: no message for **3 s**, or the socket closing, → the gateway cancels the goal (arm freezes, stays enabled) and drops the control lease. Viewers never affect motion.
+
+**Joints.** `joints_deg` are the PIPER controller's own joint angles (SDK zero, SDK signs), not the corrected model's: `calib/kinematics.yaml` offsets enter only the FK the gateway reports. Mapping these onto the twin's model is the twin's job (railab-workflow §10.7), verified read-only before any command is sent.
