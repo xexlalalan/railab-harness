@@ -13,7 +13,8 @@ camera|harness_vision/tag_nod[e]|ros2 launch harness_vision camera.launch.py
 dtv|harness_dtv/dtv_nod[e]|ros2 run harness_dtv dtv_node
 bunny|harness_instrument/bunny_nod[e]|ros2 run harness_instrument bunny_node
 pipette|harness_pipette/pipette_nod[e]|ros2 run harness_pipette pipette_node
-workflows|tools/workflow_serve[r].py|python3 tools/workflow_server.py"
+workflows|tools/workflow_serve[r].py|python3 tools/workflow_server.py
+gateway|tools/gateway_serve[r].py|python3 tools/gateway_server.py"
 # The arm node owns can0 and dies at start if the interface is down (every PC reboot leaves it down until the
 # boot-time CAN config exists). can_up brings it up at 1 Mbps; `ip link set` needs root, so sudo asks for the
 # password in the terminal when it is not cached (no terminal = it fails and the arm node is not started).
@@ -42,19 +43,21 @@ nodes() {
   source rosenv.sh 2>/dev/null
   case "$1" in
     start)   each_node start_bg; bunny_check ;;
-    stop)    for n in dtv bunny pipette workflows; do kill_node "$n" "$(grep "^$n|" <<<"$NODES" | cut -d'|' -f2)"; done
+    stop)    for n in dtv bunny pipette workflows gateway; do kill_node "$n" "$(grep "^$n|" <<<"$NODES" | cut -d'|' -f2)"; done
              pkill -f "harness_cmd.py --serv[e]" && echo "CLI daemon: stopped"
              echo "(arm, camera nodes and the Bunny app left running)" ;;
-    restart) line=$(grep "^$2|" <<<"$NODES") || { echo "usage: harness nodes restart piper|camera|dtv|bunny|pipette|workflows"; exit 2; }
+    restart) line=$(grep "^$2|" <<<"$NODES") || { echo "usage: harness nodes restart piper|camera|dtv|bunny|pipette|workflows|gateway"; exit 2; }
              IFS='|' read -r n p c <<<"$line"; kill_node "$n" "$p"; sleep 2; start_bg "$n" "$p" "$c" ;;
     status)  timeout 10 ros2 node list 2>/dev/null; bunny_check ;;
-    *)       echo "usage: harness nodes start|stop|status|restart piper|camera|dtv|bunny|pipette|workflows"; exit 2 ;;
+    *)       echo "usage: harness nodes start|stop|status|restart piper|camera|dtv|bunny|pipette|workflows|gateway"; exit 2 ;;
   esac
 }
 
 # ---------------------------------------------------------------- commands
 case "$1" in
   nodes) nodes "${@:2}"; exit $? ;;
+  gateway) [ "$2" = key ] || { echo "usage: harness gateway key"; exit 2; }
+           exec python3 tools/gateway_server.py --key ;;   # the shared key for the twin (created if missing)
   daemon-stop) pkill -f "harness_cmd.py --serve"; rm -f $SOCK; echo stopped; exit 0 ;;
   arm)
     case "$2" in

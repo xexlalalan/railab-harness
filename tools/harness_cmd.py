@@ -29,7 +29,8 @@ harness dtv    v clamp | open <mm> | max | release | home   (max = fully open; n
 harness pipette status | home | stop | eject | aspirate <ul> [ul/s] [pre_ul] | dispense <ul> [ul/s] [blow_ul]
 harness pipette lld [mode] [timeout_s] [mm/s] | z home | stop | move <mm> | rel <mm>
 harness run    dilute-to-volume [--flask-ml 25] [--tube-ml 0.06] [--max-ml N] [--offset-px 0] [--ring-row R] [--watch]   (alias: fill-to-mark)
-harness nodes  start | stop | status | restart piper|camera|dtv|bunny|pipette|workflows   (node processes; no daemon involved)
+harness nodes  start | stop | status | restart piper|camera|dtv|bunny|pipette|workflows|gateway   (node processes; no daemon involved)
+harness gateway key                                 print the twin control gateway's shared key (created if missing; TCP 7803)
 harness daemon-stop                                 (next harness call starts a fresh daemon = reloads harness_cmd.py)"""
 
 
