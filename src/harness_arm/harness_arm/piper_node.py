@@ -66,6 +66,12 @@ from scipy.spatial.transform import Rotation as _Rot
 JOINT_NAMES = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
 
 
+# teach status values that are a running teach record / replay (the controller's teach_status byte). "End teaching
+# record" (STOP_RECORDING) is what "end drag teaching" leaves behind, not a mode: reading it as teach mode made Hold
+# fire the controller's resume, which unpowered the arm (2026-10-24)
+TEACH_ACTIVE = ("START_RECORDING", "EXECUTE_TRAJECTORY", "PAUSE_EXECUTION", "RESUME_EXECUTION", "MOVE_TO_START")
+
+
 def _name(x):
     """Enum-ish -> short upper-case name ('CAN_CTRL(0x1)' -> 'CAN_CTRL')."""
     n = getattr(x, "name", None)
@@ -315,7 +321,10 @@ class PiperNode(Node):
             "ctrl_mode": _name(st.msg.ctrl_mode) if st else "UNKNOWN",
             "arm_status": _name(st.msg.arm_status) if st else "UNKNOWN",
             "motion_status": _name(st.msg.motion_status) if st else "UNKNOWN",
-            "teach": (_name(st.msg.teach_status) not in ("DISABLED", "0", "OFF")) if st else False,
+            "teach_status": _name(st.msg.teach_status) if st else "UNKNOWN",
+            # the controller's own teach (drag) mode — it then ignores every command — or a teach record / replay
+            "drag": _name(st.msg.ctrl_mode) == "TEACHING_MODE" if st else False,
+            "teach": (_name(st.msg.ctrl_mode) == "TEACHING_MODE" or _name(st.msg.teach_status) in TEACH_ACTIVE) if st else False,
             "age": (now - self.last_fb_t) if self.last_fb_t else 1e9,
         }
         try:
@@ -516,13 +525,16 @@ class PiperNode(Node):
         finally:
             self.motion.release()
 
-    def _leave_teach(self, wait_s):
+    def _leave_teach(self, wait_s, resume=True):
         """Out of the controller's teach (drag) mode: "end drag teaching" (0x150 byte 2 = 0x02); if it still reports
-        teach mode after wait_s, the controller's resume (0x150 byte 0 = 0x02, the SDK's reset). Returns what was sent."""
+        teach mode after wait_s and `resume`, the controller's resume (0x150 byte 0 = 0x02, the SDK's reset — it
+        UNPOWERS every joint: never from Hold). Returns what was sent."""
         from pyAgxArm.protocols.can_protocol.msgs.piper.default import ArmMsgMotionCtrl
         tried = []
-        for name, send in (("end drag teaching", lambda: self.robot._send_msg(ArmMsgMotionCtrl(grag_teach_ctrl=0x02))),
-                           ("controller resume", lambda: self.robot.reset())):
+        steps = [("end drag teaching", lambda: self.robot._send_msg(ArmMsgMotionCtrl(grag_teach_ctrl=0x02)))]
+        if resume:
+            steps.append(("controller resume", lambda: self.robot.reset()))
+        for name, send in steps:
             with self.sdk:
                 send()
             tried.append(name)
@@ -556,7 +568,7 @@ class PiperNode(Node):
         mode within 2 s nothing else is sent: the arm stays as it was (never disabled instead)."""
         from pyAgxArm.protocols.can_protocol.msgs.piper.default import ArmMsgMotionCtrl
         s = self._read()
-        if s["teach"]:
+        if s["drag"]:
             res.success, res.message = True, "already in drag mode"
             return res
         if s["age"] >= float(self.P["watchdog_s"]):
@@ -570,31 +582,43 @@ class PiperNode(Node):
             with self.sdk:
                 self.robot._send_msg(ArmMsgMotionCtrl(grag_teach_ctrl=0x01))
             t_end = time.time() + 2.0
-            while time.time() < t_end and not self._read()["teach"]:
+            while time.time() < t_end and not self._read()["drag"]:
                 time.sleep(0.02)
+            s = self._read()
+            cleared = False
+            if not s["drag"] and s["teach"]:
+                # 2026-10-24 on the arm: "start drag teaching" from the PC only starts the teach RECORD (control mode
+                # CAN_CTRL, joints still powered and holding) — it is not the drag mode: end that record again
+                with self.sdk:
+                    self.robot._send_msg(ArmMsgMotionCtrl(grag_teach_ctrl=0x02))
+                cleared = True
+                time.sleep(0.2)
         finally:
             self.motion.release()
         s = self._read()
-        res.success = s["teach"]
+        res.success = s["drag"]
         res.message = (f"drag mode: move the arm by hand (control mode {s['ctrl_mode']}, arm {s['arm_status']}, "
                        f"joints enabled {s['enabled']})" if res.success else
-                       f"the controller did not enter drag mode within 2 s (control mode {s['ctrl_mode']}, arm "
-                       f"{s['arm_status']}); nothing else was sent: the arm is as it was")
+                       "the controller does not go into drag mode from the PC" +
+                       (": it only started its teach recording (ended again)" if cleared else "") +
+                       f" — control mode {s['ctrl_mode']}, joints enabled {s['enabled']}; the arm is as it was")
         self.get_logger().warning("teach_enter: " + res.message)
         return res
 
     def _hold_from_teach(self, res):
-        """Hold from drag mode (the twin's Release, 2026-10-24): out of it, then at once power joints 1-6 and hold
-        where the arm is. No error-bit check in between: leaving it the controller may report a moment's joint
-        communication loss (seen 2026-10-24), and an arm left unpowered falls."""
+        """Hold from teach mode (or a teach record): "end drag teaching" only — never the controller's resume, which
+        unpowers every joint (2026-10-24: it dropped the arm) — then at once power joints 1-6 and hold where the arm
+        is, with no error-bit check in between (an arm left unpowered falls)."""
         if not self.motion.acquire(blocking=False):
             res.success, res.message = False, "refused: a motion goal is running"
             return res
         try:
-            tried = self._leave_teach(1.0)
-            if self._read()["teach"]:
-                res.success, res.message = False, ("the controller stays in drag mode after: " + ", ".join(tried) +
-                                                   " — try the teach button on the arm or power-cycle the arm")
+            tried = self._leave_teach(1.0, resume=False)     # never the controller's resume: it unpowers the arm
+            s = self._read()
+            if s["teach"]:
+                res.success, res.message = False, (f"the controller stays in teach mode (control mode {s['ctrl_mode']}, "
+                                                   f"teach {s['teach_status']}) after end drag teaching; nothing else "
+                                                   "sent — use the teach button on the arm")
                 return res
             with self.sdk:
                 self.robot.set_speed_percent(self.speed)
