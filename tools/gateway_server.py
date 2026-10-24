@@ -16,7 +16,7 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
       fingertip there (straight line, /arm/move_pose, the node's IK / floor / workspace checks) as soon as the
       current move ends, then the next latest one. Progress in the state event: control.jog.
   v2 (2026-10-23, spec "Release, hand-eye and tag teaching through the gateway"):
-  {"cmd": "arm.release"}                                  joints 1-6 limp (the gripper keeps holding)
+  {"cmd": "arm.release"}                                  joints 1-6 limp (the gripper keeps holding); v4: drag mode
   {"cmd": "calib.handeye", "args": {"tag_id": 8}}         job: hand-eye around where the arm holds; state.calib
   {"cmd": "teach.plan_views", "args": {"from_model_deg": [...6], "backoff_mm": 40, "tilt_deg": 1.5}}   dry run
   {"cmd": "teach.fine", "args": {"tag_id": 7, "black_mm": 37.5, "tilt_deg": 3, "views_model_deg": {...}}}   job: the cross
@@ -29,6 +29,9 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   {"cmd": "teach.tag", "args": {"tag_id": 3}}             the stored fine result of a tag (calib/teach/tags.yaml)
   {"cmd": "arm.teach_exit"}                               the controller out of teach (drag) mode (enables nothing)
   {"cmd": "arm.move_tip", "args": {"tip_mm_deg": [...6], "linear": true, "speed_percent": 10}}   job: fingertip to a pose
+  v4 (2026-10-24, spec "Release = the controller's drag-teach mode"):
+  {"cmd": "arm.release"}                                  the controller's drag-teach mode (/arm/teach_enter), not
+                                                          limp joints; arm.hold takes it out and holds
 
 The gateway owns no hardware: it is an rclpy client of the module nodes, like harness_cmd.py. Releasing the
 arm is the explicit arm.release (operator 2026-10-23; before that it was CLI-only). `stop` is accepted from
@@ -49,7 +52,7 @@ sys.path[:0] = [os.path.join(ROOT, "src", "harness_calibration"), os.path.join(R
 KIN_FILE = os.path.join(ROOT, "calib", "kinematics.yaml")
 HANDEYE_FILE = os.path.join(ROOT, "calib", "handeye.yaml")
 TEACH_TAGS = os.path.join(ROOT, "calib", "teach", "tags.yaml")      # teach.fine results, by tag id
-VERSION = 3
+VERSION = 4
 DEADMAN_S = 3.0
 HOLDER_STALE_S = 10.0     # a control holder silent this long (no ping, no command) can be taken over
 JOINTS = ["joint%d" % i for i in range(1, 7)]
@@ -844,11 +847,11 @@ class Conn(socketserver.StreamRequestHandler):
             self.need("control")
             jog["pose"] = jog["grip"] = None
             return gw.trigger("/arm/teach_exit", 15)
-        if cmd == "arm.release":           # operator 2026-10-23: one click; joints 1-6 only, the gripper keeps holding
+        if cmd == "arm.release":           # operator 2026-10-23: one click; 2026-10-24: the controller's drag-teach mode
             self.need("control")
             jog["pose"] = jog["grip"] = None
             abort_job("the arm was released")
-            return gw.trigger("/arm/disable", 15)
+            return gw.trigger("/arm/teach_enter", 15)
         if cmd == "calib.handeye":
             self.need("control")
             st = gw.fresh("arm", 1.0)

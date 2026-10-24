@@ -20,6 +20,8 @@ Services:
   /arm/gripper_enable   std_srvs/Trigger   re-power the gripper where the jaws are now, at gripper_hold_force
   /arm/teach_exit std_srvs/Trigger   take the controller out of teach (drag) mode: end drag teaching, else the
                   controller's resume (2026-10-24); the joints stay as the controller leaves them (Hold powers them)
+  /arm/teach_enter std_srvs/Trigger  release the arm into the controller's drag-teach mode (the twin's Release,
+                  operator 2026-10-24; was /arm/disable); /arm/hold takes it out and holds
   /arm/gripper_calibrate harness_msgs/GripperCalibrate   two-point calibration of the mm reading (jaws set by
                   hand, motor released): saved to gripper_calib_file, loaded at start (PROJECT_SPEC.md
                   "2026-10-24 — Gripper release, hold and calibration")
@@ -153,7 +155,8 @@ class PiperNode(Node):
 
         for name, cb in (("enable", self.srv_enable), ("disable", self.srv_disable),
                          ("hold", self.srv_hold), ("gripper_release", self.srv_gripper_release),
-                         ("gripper_enable", self.srv_gripper_enable), ("teach_exit", self.srv_teach_exit)):
+                         ("gripper_enable", self.srv_gripper_enable), ("teach_exit", self.srv_teach_exit),
+                         ("teach_enter", self.srv_teach_enter)):
             self.create_service(Trigger, f"/arm/{name}", cb, callback_group=self.cb)
         self.create_service(SetSpeed, "/arm/set_speed", self.srv_set_speed, callback_group=self.cb)
         self.create_service(SetJoints, "/arm/set_joints", self.srv_set_joints, callback_group=self.cb)
@@ -481,6 +484,9 @@ class PiperNode(Node):
         return res
 
     def srv_hold(self, req, res):
+        s = self._read()
+        if s["teach"] and s["age"] < float(self.P["watchdog_s"]):
+            return self._hold_from_teach(res)
         why = self._refuse()
         # a fault latched by error bits that are gone now (e.g. a moment's joint communication loss when the controller
         # left teach mode, 2026-10-24) does not block Hold — holding is the safe answer; it clears it, like /arm/enable
@@ -510,26 +516,31 @@ class PiperNode(Node):
         finally:
             self.motion.release()
 
-    def srv_teach_exit(self, req, res):
-        """Take the controller out of teach (drag) mode (2026-10-24: found in TEACHING_MODE, every command refused,
-        no button found): "end drag teaching" (0x150 byte 2 = 0x02); if it is still in teach mode, the controller's
-        resume (0x150 byte 0 = 0x02, the SDK's reset). Nothing is enabled or moved here: the joints stay as the
-        controller leaves them (support the arm); /arm/hold powers them."""
+    def _leave_teach(self, wait_s):
+        """Out of the controller's teach (drag) mode: "end drag teaching" (0x150 byte 2 = 0x02); if it still reports
+        teach mode after wait_s, the controller's resume (0x150 byte 0 = 0x02, the SDK's reset). Returns what was sent."""
         from pyAgxArm.protocols.can_protocol.msgs.piper.default import ArmMsgMotionCtrl
-        if not self._read()["teach"]:
-            res.success, res.message = True, "not in teach mode"
-            return res
         tried = []
         for name, send in (("end drag teaching", lambda: self.robot._send_msg(ArmMsgMotionCtrl(grag_teach_ctrl=0x02))),
                            ("controller resume", lambda: self.robot.reset())):
             with self.sdk:
                 send()
             tried.append(name)
-            t_end = time.time() + 2.0
+            t_end = time.time() + wait_s
             while time.time() < t_end and self._read()["teach"]:
-                time.sleep(0.05)
+                time.sleep(0.01)
             if not self._read()["teach"]:
                 break
+        return tried
+
+    def srv_teach_exit(self, req, res):
+        """Take the controller out of teach (drag) mode (2026-10-24: found in TEACHING_MODE, every command refused,
+        no button found): _leave_teach. Nothing is enabled or moved here: the joints stay as the controller leaves
+        them (support the arm); /arm/hold powers them."""
+        if not self._read()["teach"]:
+            res.success, res.message = True, "not in teach mode"
+            return res
+        tried = self._leave_teach(2.0)
         s = self._read()
         res.success = not s["teach"]
         res.message = (f"{'left' if res.success else 'STILL in'} teach mode after: {', '.join(tried)}; control mode "
@@ -537,6 +548,77 @@ class PiperNode(Node):
                        " — try the teach button on the arm or power-cycle the arm"))
         self.get_logger().warning("teach_exit: " + res.message)
         return res
+
+    def srv_teach_enter(self, req, res):
+        """Release into the controller's drag-teach mode (operator 2026-10-24: the twin's Release — it was
+        /arm/disable, joints limp): "start drag teaching" (0x150 byte 2 = 0x01), the arm is moved by hand;
+        /arm/hold takes it out again. A running goal is stopped first. If the controller does not report teach
+        mode within 2 s nothing else is sent: the arm stays as it was (never disabled instead)."""
+        from pyAgxArm.protocols.can_protocol.msgs.piper.default import ArmMsgMotionCtrl
+        s = self._read()
+        if s["teach"]:
+            res.success, res.message = True, "already in drag mode"
+            return res
+        if s["age"] >= float(self.P["watchdog_s"]):
+            res.success, res.message = False, "refused: no CAN feedback"
+            return res
+        self.cancel_requested = True
+        if not self.motion.acquire(timeout=2.0):
+            res.success, res.message = False, "refused: the running motion did not stop"
+            return res
+        try:
+            with self.sdk:
+                self.robot._send_msg(ArmMsgMotionCtrl(grag_teach_ctrl=0x01))
+            t_end = time.time() + 2.0
+            while time.time() < t_end and not self._read()["teach"]:
+                time.sleep(0.02)
+        finally:
+            self.motion.release()
+        s = self._read()
+        res.success = s["teach"]
+        res.message = (f"drag mode: move the arm by hand (control mode {s['ctrl_mode']}, arm {s['arm_status']}, "
+                       f"joints enabled {s['enabled']})" if res.success else
+                       f"the controller did not enter drag mode within 2 s (control mode {s['ctrl_mode']}, arm "
+                       f"{s['arm_status']}); nothing else was sent: the arm is as it was")
+        self.get_logger().warning("teach_enter: " + res.message)
+        return res
+
+    def _hold_from_teach(self, res):
+        """Hold from drag mode (the twin's Release, 2026-10-24): out of it, then at once power joints 1-6 and hold
+        where the arm is. No error-bit check in between: leaving it the controller may report a moment's joint
+        communication loss (seen 2026-10-24), and an arm left unpowered falls."""
+        if not self.motion.acquire(blocking=False):
+            res.success, res.message = False, "refused: a motion goal is running"
+            return res
+        try:
+            tried = self._leave_teach(1.0)
+            if self._read()["teach"]:
+                res.success, res.message = False, ("the controller stays in drag mode after: " + ", ".join(tried) +
+                                                   " — try the teach button on the arm or power-cycle the arm")
+                return res
+            with self.sdk:
+                self.robot.set_speed_percent(self.speed)
+                self._enable_joints()
+            if not self._wait_enabled(True):
+                res.success, res.message = False, f"left drag mode ({', '.join(tried)}) but the joints did not enable: support the arm"
+                return res
+            time.sleep(0.1)
+            target = list(self._read()["joints"])   # capture AFTER enable: no sag counted as drift
+            with self.sdk:
+                self.robot.move_j(target)
+            t_end = time.time() + 1.0                # the moment's error bits, if any, clear before the fault does
+            while time.time() < t_end and self._read()["errors"]:
+                time.sleep(0.05)
+            errs = self._read()["errors"]
+            if not errs:
+                self.fault = ""
+            threading.Thread(target=self._drift_watch, args=(target,), daemon=True).start()
+            res.success = True
+            res.message = f"holding (left drag mode: {', '.join(tried)})" + (f"; error bits still set: {','.join(errs)}" if errs else "")
+            self.get_logger().warning("hold: " + res.message)
+            return res
+        finally:
+            self.motion.release()
 
     def _drift_watch(self, target):
         worst = 0.0
