@@ -19,9 +19,10 @@ Services:
   /arm/gripper_release  std_srvs/Trigger   un-power the gripper motor only (jaws free); the ARM keeps holding
   /arm/gripper_enable   std_srvs/Trigger   re-power the gripper where the jaws are now, at gripper_hold_force
   /arm/teach_exit std_srvs/Trigger   take the controller out of teach (drag) mode: end drag teaching, else the
-                  controller's resume (2026-10-24); the joints stay as the controller leaves them (Hold powers them)
-  /arm/teach_enter std_srvs/Trigger  release the arm into the controller's drag-teach mode (the twin's Release,
-                  operator 2026-10-24; was /arm/disable); /arm/hold takes it out and holds
+                  controller's resume (2026-10-24); the joints stay as the controller leaves them (Hold powers them).
+                  Teach mode is the arm's own: the teach button at the wrist (between J5 and J6), torque released;
+                  it cannot be entered from the PC (spec "Release = the controller's drag-teach mode"). /arm/hold
+                  leaves it too (the resume only when every joint is unpowered already)
   /arm/gripper_calibrate harness_msgs/GripperCalibrate   two-point calibration of the mm reading (jaws set by
                   hand, motor released): saved to gripper_calib_file, loaded at start (PROJECT_SPEC.md
                   "2026-10-24 — Gripper release, hold and calibration")
@@ -161,8 +162,7 @@ class PiperNode(Node):
 
         for name, cb in (("enable", self.srv_enable), ("disable", self.srv_disable),
                          ("hold", self.srv_hold), ("gripper_release", self.srv_gripper_release),
-                         ("gripper_enable", self.srv_gripper_enable), ("teach_exit", self.srv_teach_exit),
-                         ("teach_enter", self.srv_teach_enter)):
+                         ("gripper_enable", self.srv_gripper_enable), ("teach_exit", self.srv_teach_exit)):
             self.create_service(Trigger, f"/arm/{name}", cb, callback_group=self.cb)
         self.create_service(SetSpeed, "/arm/set_speed", self.srv_set_speed, callback_group=self.cb)
         self.create_service(SetJoints, "/arm/set_joints", self.srv_set_joints, callback_group=self.cb)
@@ -559,50 +559,6 @@ class PiperNode(Node):
                        f"{s['ctrl_mode']}, joints enabled {s['enabled']}" + ("" if res.success else
                        " — try the teach button on the arm or power-cycle the arm"))
         self.get_logger().warning("teach_exit: " + res.message)
-        return res
-
-    def srv_teach_enter(self, req, res):
-        """Release into the controller's drag-teach mode (operator 2026-10-24: the twin's Release — it was
-        /arm/disable, joints limp): "start drag teaching" (0x150 byte 2 = 0x01), the arm is moved by hand;
-        /arm/hold takes it out again. A running goal is stopped first. If the controller does not report teach
-        mode within 2 s nothing else is sent: the arm stays as it was (never disabled instead)."""
-        from pyAgxArm.protocols.can_protocol.msgs.piper.default import ArmMsgMotionCtrl
-        s = self._read()
-        if s["drag"]:
-            res.success, res.message = True, "already in drag mode"
-            return res
-        if s["age"] >= float(self.P["watchdog_s"]):
-            res.success, res.message = False, "refused: no CAN feedback"
-            return res
-        self.cancel_requested = True
-        if not self.motion.acquire(timeout=2.0):
-            res.success, res.message = False, "refused: the running motion did not stop"
-            return res
-        try:
-            with self.sdk:
-                self.robot._send_msg(ArmMsgMotionCtrl(grag_teach_ctrl=0x01))
-            t_end = time.time() + 2.0
-            while time.time() < t_end and not self._read()["drag"]:
-                time.sleep(0.02)
-            s = self._read()
-            cleared = False
-            if not s["drag"] and s["teach"]:
-                # 2026-10-24 on the arm: "start drag teaching" from the PC only starts the teach RECORD (control mode
-                # CAN_CTRL, joints still powered and holding) — it is not the drag mode: end that record again
-                with self.sdk:
-                    self.robot._send_msg(ArmMsgMotionCtrl(grag_teach_ctrl=0x02))
-                cleared = True
-                time.sleep(0.2)
-        finally:
-            self.motion.release()
-        s = self._read()
-        res.success = s["drag"]
-        res.message = (f"drag mode: move the arm by hand (control mode {s['ctrl_mode']}, arm {s['arm_status']}, "
-                       f"joints enabled {s['enabled']})" if res.success else
-                       "the controller does not go into drag mode from the PC" +
-                       (": it only started its teach recording (ended again)" if cleared else "") +
-                       f" — control mode {s['ctrl_mode']}, joints enabled {s['enabled']}; the arm is as it was")
-        self.get_logger().warning("teach_enter: " + res.message)
         return res
 
     def _hold_from_teach(self, res):
