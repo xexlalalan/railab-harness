@@ -241,12 +241,15 @@ def plan_path_run(kin, path: CartesianPath, q_now, duration_s: float, lim: Limit
     return traj
 
 
-def plan_joint_path(kin, waypoints, lim: Limits, rate_hz: float = 100.0, t_min: float = 0.8) -> Trajectory:
+def plan_joint_path(kin, waypoints, lim: Limits, rate_hz: float = 100.0, t_min: float = 0.8,
+                    from_outside: bool = False) -> Trajectory:
     """A joint path from a planner (rad, K x 6, the first = where the arm is; PROJECT_SPEC.md
     "2026-10-23 — Release, hand-eye and tag teaching"): each segment a STRAIGHT line in joint space —
     what a collision-checked joint path assumes between its waypoints — timed as a minimum-jerk move
     within lim's joint speed / acceleration, at rest at every waypoint. Validated like every other
-    trajectory; raises PlanError naming the sample."""
+    trajectory; raises PlanError naming the sample. from_outside: the arm may START past a joint limit
+    (held there while limp, 2026-10-24) — that joint may stay between its start and the limit (it must
+    never go further out); the caller's path brings it back inside."""
     W = np.asarray(waypoints, float)
     if W.ndim != 2 or W.shape[1] != 6 or len(W) < 2:
         raise PlanError("a joint path needs at least 2 waypoints of 6 joints")
@@ -265,14 +268,14 @@ def plan_joint_path(kin, waypoints, lim: Limits, rate_hz: float = 100.0, t_min: 
     if not ts:
         raise PlanError("the path does not move")
     traj = Trajectory(np.concatenate(ts), np.vstack(qs), segs, {})
-    traj.report = validate(kin, traj, lim)
+    traj.report = validate(kin, traj, lim, from_outside=from_outside)
     traj.report.update({"segments": len(segs), "samples": len(traj.t), "rate_hz": rate_hz,
                         "duration_s": round(traj.duration, 2)})
     return traj
 
 
 def validate(kin, traj: Trajectory, lim: Limits, at=None, L=None, ramp=None, loop=None,
-             duration_s=None) -> dict:
+             duration_s=None, from_outside: bool = False) -> dict:
     """Check every sample; raise PlanError naming the first violation; return a summary."""
     t, q = traj.t, traj.q
     # the loop's time zero = the last approach sample (the loop's own t = 0 sample was dropped as a duplicate)
@@ -281,6 +284,8 @@ def validate(kin, traj: Trajectory, lim: Limits, at=None, L=None, ramp=None, loo
     where = lambda i: f"{seg_of(i)}, t = {t[i]:.2f} s"
     lo = np.array([l[0] + lim.ik_margin_rad * 0.5 for l in kin.limits])
     hi = np.array([l[1] - lim.ik_margin_rad * 0.5 for l in kin.limits])
+    if from_outside:                              # a start past a limit: allowed between it and the limit
+        lo, hi = np.minimum(lo, q[0]), np.maximum(hi, q[0])
     bad = np.argwhere((q < lo) | (q > hi))
     if len(bad):
         i, j = bad[0]

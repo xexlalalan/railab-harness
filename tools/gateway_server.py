@@ -56,6 +56,7 @@ HANDEYE_SETTLE_S = 3.0           # wait after every hand-eye move before the ima
 TEACH_VEL_RAD_S, TEACH_ACC_RAD_S2 = 0.35, 0.7     # arm.follow_joints: joint speed / acceleration of the path
 FOLLOW_START_TOL_RAD = 0.1       # its first waypoint: this close to where the arm is
 FOLLOW_CLAMP_RAD = math.radians(3.0)   # waypoints beyond the controller limits by up to this are clamped inside
+FOLLOW_RECOVER_RAD = math.radians(6.0)  # an arm held past a limit by up to this: the path first brings it back inside
 VIEW_CONE_DEG = 22.0             # teach.plan_views: an approximate centre view keeps the tag this close to the camera axis
 VIEW_ROOM_RAD = math.radians(4.0)      # ... and this much more room from the joint limits (so the tilts fit)
 
@@ -354,18 +355,28 @@ class Gateway:
         lo = np.array([l[0] for l in self.limits]) + 0.02
         hi = np.array([l[1] for l in self.limits]) - 0.02
         over = np.maximum(lo - W, W - hi).max(axis=1)
+        over[0] = 0.0                                    # the first waypoint becomes where the arm is (below)
         if (over > FOLLOW_CLAMP_RAD).any():
             k = int(np.argmax(over))
             raise RuntimeError("refused: waypoint %d is %.1f deg beyond a joint limit" % (k + 1, math.degrees(over[k])))
         W = np.clip(W, lo, hi)
-        d0 = float(np.abs(W[0] - np.array(q)).max())
+        qa = np.array(q)
+        qin = np.clip(qa, lo, hi)                        # the arm's posture brought inside the limits
+        out = np.abs(qa - qin)
+        if out.max() > FOLLOW_RECOVER_RAD:
+            j = int(np.argmax(out))
+            raise RuntimeError("refused: joint %d is held %.1f deg past its limit (more than %.0f): Release the arm and move it back by hand"
+                               % (j + 1, math.degrees(out[j]), math.degrees(FOLLOW_RECOVER_RAD)))
+        d0 = float(np.abs(W[0] - qin).max())
         if d0 > FOLLOW_START_TOL_RAD:
             raise RuntimeError("refused: the path starts %.1f deg from where the arm is; plan it from the current posture" % math.degrees(d0))
-        W[0] = q
+        W[0] = qin
+        if out.max() > 1e-6:                             # held past a limit (2026-10-24): first straight back inside
+            W = np.vstack([qa, W])
         kin, lim = load_model(ROOT)
         lim.max_joint_vel_rad_s, lim.max_joint_acc_rad_s2 = TEACH_VEL_RAD_S, TEACH_ACC_RAD_S2
         try:
-            tr = plan_joint_path(self.kin, W, lim)
+            tr = plan_joint_path(self.kin, W, lim, from_outside=True)
         except PlanError as e:
             raise RuntimeError("refused: %s" % e)
         if not self.ac_t.wait_for_server(timeout_sec=3.0):
@@ -496,7 +507,11 @@ class Gateway:
                         "gripper_max_mm": (self.gripper_calib() or {}).get("max_gap_mm") or round(float(self.P.get("gripper_max_m", 0.07)) * 1000, 1),
                         "max_speed_percent": int(self.P.get("max_speed_percent", 30)),
                         "default_speed_percent": int(self.P.get("default_speed_percent", 10)),
-                        "max_joint_delta_deg": round(math.degrees(float(self.P.get("max_joint_delta_rad", 1.2))), 1)},
+                        "max_joint_delta_deg": round(math.degrees(float(self.P.get("max_joint_delta_rad", 1.2))), 1),
+                        # the same limits in the corrected model's angles (what joints_model_deg reports): the twin's
+                        # planners keep inside these (2026-10-24)
+                        "limits_model_deg": [[round(math.degrees(lo + o), 2), round(math.degrees(hi + o), 2)]
+                                             for (lo, hi), o in zip(self.limits, self.kin.offsets)]},
                 "bunny": {"housing": ["open", "half", "close"], "platform": "steps"}}
 
     def state(self):

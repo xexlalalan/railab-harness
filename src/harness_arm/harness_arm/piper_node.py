@@ -965,6 +965,9 @@ class PiperNode(Node):
         m = float(self.P["ik_limit_margin_rad"]) * 0.5
         lo = np.array([l[0] + m for l in self.kin.limits])
         hi = np.array([l[1] - m for l in self.kin.limits])
+        # the arm may START past a limit (held there while limp; 2026-10-24): that joint may stay between its
+        # start and the limit, never further out (the start itself is checked against the arm below)
+        lo, hi = np.minimum(lo, q[0]), np.maximum(hi, q[0])
         bad = np.argwhere((q < lo) | (q > hi))
         if len(bad):
             i, j = bad[0]
@@ -1050,13 +1053,17 @@ class PiperNode(Node):
             T_end, period = float(t[-1]), 1.0 / float(self.P["traj_rate_hz"])
             self.get_logger().info(f"{label}: streaming {len(t)} points over {T_end:.1f} s at "
                                    f"{self.P['traj_rate_hz']:.0f} Hz, speed {speed} %, tracking limit {tol:.3f} rad")
+            m = float(self.P["ik_limit_margin_rad"]) * 0.5
+            lo = [l[0] + m for l in self.kin.limits]
+            hi = [l[1] - m for l in self.kin.limits]
             t0 = time.monotonic()
             nxt, k = t0, 0
             while True:
                 tt = time.monotonic() - t0
                 if tt >= T_end:
                     break
-                cmd = [float(np.interp(tt, t, q[:, j])) for j in range(6)]
+                # targets inside the controller limits: a start past a limit is pulled back in, never commanded out
+                cmd = [min(hi[j], max(lo[j], float(np.interp(tt, t, q[:, j])))) for j in range(6)]
                 with self.sdk:
                     self.robot.move_j(cmd)
                 s = self._read()

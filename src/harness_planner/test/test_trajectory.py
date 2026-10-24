@@ -162,3 +162,23 @@ def test_joint_path_refusals(kin, lim):
     beyond[4] = math.radians(75)                          # j5 clamps at 70 deg
     with pytest.raises(PlanError, match="joint 5"):
         plan_joint_path(kin, [Q_PARK, beyond], lim)
+
+
+def test_joint_path_from_a_start_held_past_a_limit(kin, lim):
+    """2026-10-24: the arm held past a joint limit (j6 at 123.5 deg, limit 120) may start a path that brings
+    that joint back inside; it may never go further out, and without from_outside the start is refused."""
+    lo6, hi6 = kin.limits[5]
+    start = list(Q_PARK)
+    start[5] = hi6 + math.radians(3.5)
+    inside = list(start)
+    inside[5] = hi6 - 0.02
+    target = [0.3, 0.6, -0.8, 0.1, 0.4, 0.2]
+    with pytest.raises(PlanError, match="joint 6"):
+        plan_joint_path(kin, [start, inside, target], lim)
+    tr = plan_joint_path(kin, [start, inside, target], lim, from_outside=True)
+    assert np.allclose(tr.q[0], start) and np.allclose(tr.q[-1], target)
+    assert tr.q[:, 5].max() <= start[5] + 1e-9
+    further = list(start)
+    further[5] = start[5] + 0.05
+    with pytest.raises(PlanError, match="joint 6"):
+        plan_joint_path(kin, [start, further, target], lim, from_outside=True)

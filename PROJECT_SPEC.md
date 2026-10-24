@@ -841,3 +841,12 @@ Operator decision 2026-10-23, shared with the digital twin (railab-workflow spec
 State: `arm.gripper_calib` = `{date, scale, max_gap_mm}` of `calib/gripper.yaml` (null without one); `hello`'s `gripper_max_mm` comes from it when present.
 
 **Deploy.** `colcon build --symlink-install --packages-select harness_msgs harness_arm`, then `harness nodes restart piper` and `harness nodes restart gateway` (the CLI's `grip-enable` gets the fix with the node).
+
+## 2026-10-24 — Paths from a posture held past a joint limit; the limits in the model's angles — IMPLEMENTED (not yet run on the arm)
+
+**Why.** The twin's real Pick & lift was refused at its first point: "joint 6 at 123.5 deg leaves its limits (segment 1, t = 0.00 s)" — the arm had been held (limp) with j6 3.5° past the controller's 120°, and every later path validation refused the start. Operator: if the beginning and the end are good postures, get around what lies between. The twin also planned with looser limits than the controller has (its j4 ±102 vs ±100; its j5 ±75, while the arm's calibrated −5.3° zero offset makes the real j5 range −64.7 … +75.3 in twin terms), so its paths could run through postures the harness refuses.
+
+- **`arm.follow_joints`:** the arm's posture brought inside the limits (`qin`, 0.02 rad spare) is the path's start; when the arm is held past a limit by up to **6°** (`FOLLOW_RECOVER_RAD`; more → refused: release, move it back by hand) the path first runs straight from where the arm is to `qin` (only the offending joints move), then the planner's path. The first waypoint is exempt from the 3° clamp rule (it becomes where the arm is).
+- **`plan_joint_path(..., from_outside=True)`** / `validate`: a joint that STARTS past its limit may stay between its start and the limit, never further out. **The arm node** (`_check_trajectory`) applies the same rule with the trajectory's first point, and clips every streamed target into the limits (a start past a limit is pulled back in, never commanded out).
+- **`hello` → `modules.arm.limits_model_deg`:** the controller limits in the corrected model's angles (raw + `calib/kinematics.yaml` zero offsets: what `joints_model_deg` reports) — the twin plans inside them (railab-workflow spec §10.6 *Real joint limits*).
+
