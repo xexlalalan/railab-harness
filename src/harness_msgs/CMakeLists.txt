@@ -13,6 +13,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/TagArray.msg"
   "msg/FlaskLines.msg"
   "srv/SetGripper.srv"
+  "srv/GripperCalibrate.srv"
   "srv/SetSpeed.srv"
   "srv/SetJoints.srv"
   "srv/MoveZ.srv"

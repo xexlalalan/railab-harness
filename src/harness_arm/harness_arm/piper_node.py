@@ -17,7 +17,10 @@ Services:
   /arm/set_joints harness_msgs/SetJoints   power or release SELECTED joints (1..6, 7 = gripper)
   /arm/gripper    harness_msgs/SetGripper
   /arm/gripper_release  std_srvs/Trigger   un-power the gripper motor only (jaws free); the ARM keeps holding
-  /arm/gripper_enable   std_srvs/Trigger   re-power the gripper at its current width
+  /arm/gripper_enable   std_srvs/Trigger   re-power the gripper where the jaws are now, at gripper_hold_force
+  /arm/gripper_calibrate harness_msgs/GripperCalibrate   two-point calibration of the mm reading (jaws set by
+                  hand, motor released): saved to gripper_calib_file, loaded at start (PROJECT_SPEC.md
+                  "2026-10-24 — Gripper release, hold and calibration")
 Actions:
   /arm/move_j     harness_msgs/MoveJ
   /arm/move_pose  harness_msgs/MovePose   (linear=false -> move_p, true -> move_l)
@@ -50,7 +53,7 @@ from std_srvs.srv import Trigger
 from harness_msgs.action import FollowTrajectory, MoveJ, MovePose
 from harness_arm.kinematics import PiperKinematics, T_from_xyzrpy, xyzrpy_from_T, pose_error
 from harness_msgs.msg import ArmStatus, GripperStatus
-from harness_msgs.srv import SetGripper, SetJoints, SetSpeed
+from harness_msgs.srv import GripperCalibrate, SetGripper, SetJoints, SetSpeed
 
 from pyAgxArm import AgxArmFactory, PiperFW, create_agx_arm_config
 from scipy.spatial.transform import Rotation as _Rot
@@ -98,6 +101,7 @@ class PiperNode(Node):
             ("workspace_max", [0.7, 0.7, 0.9]), ("gripper_enabled", True),
             ("gripper_max_m", 0.07), ("gripper_force", 1.0), ("gripper_tol_m", 0.002),
             ("gripper_timeout_s", 4.0), ("gripper_inverted", False), ("gripper_travel_m", 0.0967), ("gripper_scale", 1.0),
+            ("gripper_zero_m", 0.0), ("gripper_hold_force", 5.0), ("gripper_calib_file", ""),
             ("max_joint_delta_rad", 1.2), ("pose_max_joint_delta_rad", 1.2),
             ("floor_enabled", False), ("floor_plane", [0.0, 0.0, 0.0]), ("tcp_offset_m", 0.0), ("floor_margin_m", 0.01),
             ("kinematics_file", ""), ("kinematics_model", "piper"), ("ik_limit_margin_rad", 0.02),
@@ -116,9 +120,11 @@ class PiperNode(Node):
         self.last_fb_t = 0.0
         self.last_fb_stamp = None
         self.snap = {}                   # latest feedback snapshot, filled by _tick
+        self.grip_cal_closed = None      # raw reading recorded with the jaws shut (gripper calibration, step 1)
 
         self._connect()
         self._load_kinematics()
+        self._load_gripper_calib()
 
         self.pub_js = self.create_publisher(JointState, "/joint_states", 10)
         self.pub_tcp = self.create_publisher(PoseStamped, "/arm/tcp_pose", 10)          # corrected model (harness FK)
@@ -133,6 +139,7 @@ class PiperNode(Node):
         self.create_service(SetSpeed, "/arm/set_speed", self.srv_set_speed, callback_group=self.cb)
         self.create_service(SetJoints, "/arm/set_joints", self.srv_set_joints, callback_group=self.cb)
         self.create_service(SetGripper, "/arm/gripper", self.srv_gripper, callback_group=self.cb)
+        self.create_service(GripperCalibrate, "/arm/gripper_calibrate", self.srv_gripper_calibrate, callback_group=self.cb)
 
         self.as_j = ActionServer(self, MoveJ, "/arm/move_j", self.exec_move_j,
                                  goal_callback=self.goal_cb, cancel_callback=self.cancel_cb,
@@ -151,16 +158,38 @@ class PiperNode(Node):
 
     # ------------------------------------------------------------------ gripper mapping
     # Fingers mounted the other way round (2026-09-18): the motor's "open" is the jaws' closed.
-    # physical gap = (travel - raw) * scale when inverted; raw = travel - gap / scale.
+    # inverted:  physical gap = (travel - raw) * scale;  raw = travel - gap / scale
+    # otherwise: physical gap = (raw - zero) * scale;    raw = zero + gap / scale   (zero 0, scale 1 = the SDK's own)
     def _grip_phys(self, raw):
+        k = float(self.P["gripper_scale"])
         if not self.P["gripper_inverted"]:
-            return raw
-        return max(0.0, (float(self.P["gripper_travel_m"]) - raw) * float(self.P["gripper_scale"]))
+            return max(0.0, (raw - float(self.P["gripper_zero_m"])) * k)
+        return max(0.0, (float(self.P["gripper_travel_m"]) - raw) * k)
 
     def _grip_raw(self, gap):
+        k = float(self.P["gripper_scale"])
         if not self.P["gripper_inverted"]:
-            return gap
-        return max(0.0, float(self.P["gripper_travel_m"]) - gap / float(self.P["gripper_scale"]))
+            return max(0.0, float(self.P["gripper_zero_m"]) + gap / k)
+        return max(0.0, float(self.P["gripper_travel_m"]) - gap / k)
+
+    def _load_gripper_calib(self):
+        """The gripper's mm mapping from gripper_calib_file (written by /arm/gripper_calibrate), over piper.yaml."""
+        path = os.path.expanduser(str(self.P["gripper_calib_file"] or ""))
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path) as f:
+                d = yaml.safe_load(f) or {}
+            if bool(d["inverted"]) != bool(self.P["gripper_inverted"]):
+                raise ValueError("it was made with gripper_inverted=%s, piper.yaml says %s: calibrate again"
+                                 % (d["inverted"], self.P["gripper_inverted"]))
+            self.P["gripper_travel_m" if self.P["gripper_inverted"] else "gripper_zero_m"] = float(d["raw_closed_m"])
+            self.P["gripper_scale"] = float(d["scale"])
+            self.P["gripper_max_m"] = float(d["max_gap_m"])
+            self.get_logger().info(f"gripper: mm mapping from {path} ({d.get('date')}): gap 0 at raw {d['raw_closed_m']:.4f} m, "
+                                   f"scale {d['scale']:.4f}, max gap {d['max_gap_m'] * 1000:.1f} mm")
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().error(f"gripper: cannot use {path} ({e}); keeping piper.yaml's mapping")
 
     # ------------------------------------------------------------------ kinematics
     def _load_kinematics(self):
@@ -497,7 +526,10 @@ class PiperNode(Node):
                 if j == 7:
                     if self.ee is not None:
                         if req.enable:
-                            self.ee.move_gripper(float(self.snap.get("grip", {}).get("width", 0.0)), float(self.P["gripper_force"]))
+                            try:
+                                self._grip_hold_here()
+                            except RuntimeError as e:
+                                self.get_logger().error(f"set_joints: gripper not powered ({e})")
                         else:
                             self.ee.disable_gripper()
                 elif req.enable:
@@ -542,19 +574,125 @@ class PiperNode(Node):
         res.message = f"gripper motor released (SDK returned {ok}); width {g.get('width', float('nan')):.4f} m, driver enabled={g.get('enabled')}"
         return res
 
+    def _grip_hold_here(self):
+        """Power the gripper where the jaws are now, at gripper_hold_force (caller holds self.sdk). The target is
+        the RAW reading: sending the physical gap as a motor target moved the reversed jaws (2026-10-24)."""
+        g = self.snap.get("grip")
+        if g is None:
+            raise RuntimeError("no gripper feedback")
+        self.ee.move_gripper(float(g["width_raw"]), float(self.P["gripper_hold_force"]))
+
     def srv_gripper_enable(self, req, res):
-        """Re-power the gripper motor (re-enables on the next move command; sends a hold at the current width)."""
+        """Re-power the gripper motor where the jaws are now (an item between them stays held)."""
         if self.ee is None:
             res.success, res.message = False, "no gripper"
             return res
-        g = self.snap.get("grip", {})
-        w = float(g.get("width", 0.0))
-        with self.sdk:
-            self.ee.move_gripper(w, float(self.P["gripper_force"]))
+        try:
+            with self.sdk:
+                self._grip_hold_here()
+        except RuntimeError as e:
+            res.success, res.message = False, str(e)
+            return res
         time.sleep(0.3)
         g = self.snap.get("grip", {})
         res.success = True
-        res.message = f"gripper powered at width {g.get('width', float('nan')):.4f} m, driver enabled={g.get('enabled')}"
+        res.message = (f"gripper holding at {g.get('width', float('nan')) * 1000:.1f} mm, {float(self.P['gripper_hold_force']):g} N, "
+                       f"driver enabled={g.get('enabled')}")
+        return res
+
+    def _raw_now(self, n=10, dt=0.03):
+        """The gripper's raw reading averaged over n feedback samples (the jaws held still by hand)."""
+        vals = []
+        for _ in range(n):
+            g = self.snap.get("grip")
+            if g is not None:
+                vals.append(float(g["width_raw"]))
+            time.sleep(dt)
+        if not vals:
+            raise RuntimeError("no gripper feedback")
+        if max(vals) - min(vals) > 0.0005:
+            raise RuntimeError("the reading is not still (%.1f mm spread): hold the jaws still" % ((max(vals) - min(vals)) * 1000))
+        return sum(vals) / len(vals)
+
+    def srv_gripper_calibrate(self, req, res):
+        """Two-point calibration of the mm reading: "closed" (jaws pushed shut by hand = gap 0), then "open" at a
+        caliper-measured gap; the new mapping is applied at once and saved (GripperCalibrate.srv)."""
+        res.success = False
+        if self.ee is None:
+            res.message = "no gripper"
+            return res
+        step = str(req.step).strip().lower()
+        if step == "cancel":
+            self.grip_cal_closed = None
+            res.success, res.message = True, "calibration points forgotten"
+            return res
+        if step not in ("closed", "open"):
+            res.message = "step must be closed | open | cancel"
+            return res
+        g = self.snap.get("grip")
+        if g is None:
+            res.message = "no gripper feedback"
+            return res
+        if g.get("enabled"):
+            res.message = "release the gripper first (Release gripper), then set the jaws by hand"
+            return res
+        try:
+            raw = self._raw_now()
+        except RuntimeError as e:
+            res.message = str(e)
+            return res
+        res.raw_m = raw
+        if step == "closed":
+            self.grip_cal_closed = raw
+            res.success, res.message = True, f"shut recorded (raw {raw * 1000:.2f} mm): now open the jaws, measure the gap"
+            return res
+        gap = float(req.gap_m)
+        c = self.grip_cal_closed
+        if c is None:
+            res.message = "record the shut jaws first (step closed)"
+            return res
+        if not 0.005 <= gap <= 0.2:
+            res.message = f"the measured gap {gap * 1000:.1f} mm is not plausible (5-200 mm)"
+            return res
+        inv = bool(self.P["gripper_inverted"])
+        d = (c - raw) if inv else (raw - c)
+        if d < 0.003:
+            res.message = (f"the reading moved {d * 1000:+.1f} mm from shut to open: "
+                           + ("too little - open the jaws wider" if d >= 0 else f"the wrong way for gripper_inverted={inv}"))
+            return res
+        scale = gap / d
+        if not 0.5 <= scale <= 2.0:
+            res.message = f"the reading and the gap disagree by x{scale:.2f}: measure again (shut, then open)"
+            return res
+        stroke_raw = self._grip_raw(float(self.P["gripper_max_m"]))      # the motor's stroke end, in the old mapping
+        self.P["gripper_travel_m" if inv else "gripper_zero_m"] = c
+        self.P["gripper_scale"] = scale
+        self.P["gripper_max_m"] = round(self._grip_phys(stroke_raw), 5)
+        self.grip_cal_closed = None
+        res.travel_m, res.scale, res.max_gap_m = c, scale, float(self.P["gripper_max_m"])
+        doc = {"date": time.strftime("%Y-%m-%dT%H:%M:%S"), "inverted": inv, "raw_closed_m": round(c, 6),
+               "scale": round(scale, 6), "max_gap_m": float(self.P["gripper_max_m"]),
+               "points": {"closed_raw_m": round(c, 6), "open_raw_m": round(raw, 6), "open_gap_m": round(gap, 6)},
+               "note": "two-point calibration, jaws set by hand (motor released), open gap by calipers"}
+        path = os.path.expanduser(str(self.P["gripper_calib_file"] or ""))
+        saved = ""
+        if path:
+            try:
+                if os.path.exists(path):
+                    bdir = os.path.join(os.path.dirname(path), "gripper_backups")
+                    os.makedirs(bdir, exist_ok=True)
+                    os.replace(path, os.path.join(bdir, "gripper_%s.yaml" % time.strftime("%Y-%m-%dT%H%M%S")))
+                with open(path + ".tmp", "w") as f:
+                    yaml.safe_dump(doc, f, sort_keys=False)
+                os.replace(path + ".tmp", path)
+                saved = f"; saved to {path}"
+            except OSError as e:
+                saved = f"; NOT saved ({e}) - applied until the node restarts"
+        else:
+            saved = "; no gripper_calib_file set - applied until the node restarts"
+        res.success = True
+        res.message = f"calibrated: scale {scale:.3f}, max gap {self.P['gripper_max_m'] * 1000:.1f} mm{saved}"
+        self.get_logger().info("gripper: " + res.message)
         return res
 
     def srv_gripper(self, req, res):

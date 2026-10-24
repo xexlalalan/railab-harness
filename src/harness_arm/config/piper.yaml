@@ -23,6 +23,10 @@ piper:
     gripper_inverted: true         # fingers mounted reversed 2026-09-18: motor open = jaws closed
     gripper_travel_m: 0.0896       # raw reading at zero gap; set 2026-09-19 from the operator-set 20.00 mm gap (raw 0.0696); was 0.0967
     gripper_scale: 1.0             # physical gap per raw metre; set from a caliper measurement of the full-open gap
+    # the twin's Calibrate gripper (/arm/gripper_calibrate, 2026-10-24) writes travel / scale / max gap here; when the
+    # file exists the node uses it instead of the three numbers above
+    gripper_calib_file: /home/bunny-harness/bunny-harness-dev/calib/gripper.yaml
+    gripper_hold_force: 5.0        # N: /arm/gripper_enable (Hold gripper) grips where the jaws are with this (operator 2026-10-24)
     gripper_force: 1.0
     gripper_tol_m: 0.002
     gripper_timeout_s: 4.0

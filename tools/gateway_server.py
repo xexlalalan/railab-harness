@@ -22,6 +22,10 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   {"cmd": "teach.fine", "args": {"tag_id": 7, "black_mm": 37.5, "tilt_deg": 3, "views_model_deg": {...}}}   job: the cross
   {"cmd": "arm.follow_joints", "args": {"waypoints_model_deg": [[...6], ...]}}   job: a planner's joint path
   {"cmd": "arm.move_linear", "args": {"delta_mm": [0, 0, 100], "speed_percent": 10}}   job: fingertip straight by delta
+  v3 (2026-10-24, spec "Gripper release, hold and calibration"):
+  {"cmd": "arm.gripper_release"}                          the gripper motor only goes free (the arm keeps holding)
+  {"cmd": "arm.gripper_hold"}                             the gripper motor grips where the jaws are (5 N)
+  {"cmd": "arm.gripper_cal", "args": {"step": "closed"}}  / {"step": "open", "gap_mm": 35.2} / {"step": "cancel"}
 
 The gateway owns no hardware: it is an rclpy client of the module nodes, like harness_cmd.py. Releasing the
 arm is the explicit arm.release (operator 2026-10-23; before that it was CLI-only). `stop` is accepted from
@@ -42,7 +46,7 @@ sys.path[:0] = [os.path.join(ROOT, "src", "harness_calibration"), os.path.join(R
 KIN_FILE = os.path.join(ROOT, "calib", "kinematics.yaml")
 HANDEYE_FILE = os.path.join(ROOT, "calib", "handeye.yaml")
 TEACH_TAGS = os.path.join(ROOT, "calib", "teach", "tags.yaml")      # teach.fine results, by tag id
-VERSION = 2
+VERSION = 3
 DEADMAN_S = 3.0
 HOLDER_STALE_S = 10.0     # a control holder silent this long (no ping, no command) can be taken over
 JOINTS = ["joint%d" % i for i in range(1, 7)]
@@ -155,6 +159,24 @@ class Gateway:
         if m is None or not all(j in m.name for j in JOINTS):
             return None
         return [float(m.position[m.name.index(j)]) for j in JOINTS]
+
+    def gripper_calib(self):
+        """The gripper's mm calibration in use ({date, scale, max_gap_mm}), from gripper_calib_file; None without one."""
+        import yaml
+        path = os.path.expanduser(str(self.P.get("gripper_calib_file") or ""))
+        try:
+            mt = os.path.getmtime(path)
+        except OSError:
+            return None
+        if getattr(self, "_gc", (None, None))[0] != mt:
+            try:
+                with open(path) as f:
+                    d = yaml.safe_load(f) or {}
+                self._gc = (mt, {"date": d.get("date"), "scale": d.get("scale"),
+                                 "max_gap_mm": round(float(d["max_gap_m"]) * 1000, 1)})
+            except (OSError, KeyError, TypeError, ValueError):
+                self._gc = (mt, None)
+        return self._gc[1]
 
     def load_handeye(self):
         """calib/handeye.yaml -> self.Tfc (gripper base -> camera, m); None without one."""
@@ -471,7 +493,7 @@ class Gateway:
 
     def modules(self):
         return {"arm": {"joints": 6, "limits_deg": [[round(math.degrees(lo), 2), round(math.degrees(hi), 2)] for lo, hi in self.limits],
-                        "gripper_max_mm": round(float(self.P.get("gripper_max_m", 0.07)) * 1000, 1),
+                        "gripper_max_mm": (self.gripper_calib() or {}).get("max_gap_mm") or round(float(self.P.get("gripper_max_m", 0.07)) * 1000, 1),
                         "max_speed_percent": int(self.P.get("max_speed_percent", 30)),
                         "default_speed_percent": int(self.P.get("default_speed_percent", 10)),
                         "max_joint_delta_deg": round(math.degrees(float(self.P.get("max_joint_delta_rad", 1.2))), 1)},
@@ -495,6 +517,7 @@ class Gateway:
             arm["tip_mm_deg"] = [round(float(v) * 1000, 1) for v in tip] + arm["flange_mm_deg"][3:]
         if g is not None:
             arm["gripper"] = {"gap_mm": round(g.width_m * 1000, 2), "force_n": round(g.force_n, 2), "powered": g.enabled}
+        arm["gripper_calib"] = self.gripper_calib()
         b = self.fresh("bunny", 3.0)
         bunny = {"online": bool(b and b.get("online"))}
         if b:
@@ -808,6 +831,25 @@ class Conn(socketserver.StreamRequestHandler):
             if not r.success:
                 raise RuntimeError(r.message)
             return {"gap_mm": round(r.width_m * 1000, 2), "stalled": r.stalled, "message": r.message}
+        if cmd == "arm.gripper_release":   # the gripper motor only: the jaws go free, the arm keeps holding
+            self.need("control")
+            jog["grip"] = None
+            return gw.trigger("/arm/gripper_release", 15)
+        if cmd == "arm.gripper_hold":      # the gripper motor grips where the jaws are, at gripper_hold_force
+            self.need("control")
+            return gw.trigger("/arm/gripper_enable", 15)
+        if cmd == "arm.gripper_cal":
+            self.need("control")
+            from harness_msgs.srv import GripperCalibrate
+            step = str(a.get("step") or "")
+            r = gw.call(GripperCalibrate, "/arm/gripper_calibrate",
+                        GripperCalibrate.Request(step=step, gap_m=float(a.get("gap_mm") or 0.0) / 1000.0), 15)
+            if not r.success:
+                raise RuntimeError(r.message)
+            out = {"step": step, "message": r.message, "raw_mm": round(r.raw_m * 1000, 2)}
+            if step == "open":
+                out.update(scale=round(r.scale, 4), max_gap_mm=round(r.max_gap_m * 1000, 1))
+            return out
         if cmd == "bunny.housing":
             self.need("control")
             to = a.get("to")

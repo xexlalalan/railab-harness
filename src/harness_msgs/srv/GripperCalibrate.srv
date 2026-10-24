@@ -1,0 +1,17 @@
+# Two-point calibration of the gripper's mm reading: raw motor reading -> jaw gap
+# (PROJECT_SPEC.md "2026-10-24 — Gripper release, hold and calibration").
+# The gripper motor must be released (/arm/gripper_release) so the jaws can be set by hand.
+#   step "closed": the jaws pushed fully shut by hand -> the raw reading now is gap 0
+#   step "open":   the jaws held open at a caliper-measured gap_m -> the raw reading now is gap_m; with the
+#                  closed point recorded, the new mapping is applied at once and saved to the calibration
+#                  file (gripper_calib_file; the previous one backed up)
+#   step "cancel": forget a recorded closed point
+string step
+float64 gap_m
+---
+bool success
+string message
+float64 raw_m             # the raw reading recorded (closed / open)
+float64 travel_m          # the new mapping (step "open", success): raw reading at gap 0
+float64 scale             # jaw gap per raw metre
+float64 max_gap_m         # the widest gap the motor's stroke gives
