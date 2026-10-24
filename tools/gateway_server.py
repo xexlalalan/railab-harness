@@ -26,6 +26,8 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   {"cmd": "arm.gripper_release"}                          the gripper motor only goes free (the arm keeps holding)
   {"cmd": "arm.gripper_hold"}                             the gripper motor grips where the jaws are (5 N)
   {"cmd": "arm.gripper_cal", "args": {"step": "closed"}}  / {"step": "open", "gap_mm": 35.2} / {"step": "cancel"}
+  {"cmd": "teach.tag", "args": {"tag_id": 3}}             the stored fine result of a tag (calib/teach/tags.yaml)
+  {"cmd": "arm.move_tip", "args": {"tip_mm_deg": [...6], "linear": true, "speed_percent": 10}}   job: fingertip to a pose
 
 The gateway owns no hardware: it is an rclpy client of the module nodes, like harness_cmd.py. Releasing the
 arm is the explicit arm.release (operator 2026-10-23; before that it was CLI-only). `stop` is accepted from
@@ -414,14 +416,33 @@ class Gateway:
         q = self.joints_rad()
         if q is None:
             raise RuntimeError("no arm feedback")
+        T = self.kin.fk(q)
+        T[:3, 3] += np.array(delta_mm, float) / 1000.0
+        r = self.move_pose_goal([float(v) for v in xyzrpy_from_T(T)], True, speed, abort)
+        return dict(r, delta_mm=[float(v) for v in delta_mm])
+
+    def move_tip(self, tip_mm_deg, linear, speed, abort):
+        """arm.move_tip (2026-10-24): the fingertip to an absolute pose [x y z mm, rx ry rz deg] in the arm base (flange
+        orientation, fixed-axis XYZ), solved and drawn in the harness's calibrated model — the twin's precise steps
+        (onto a grip, onto a mount) land where the tags were measured, not where the twin's own model would put them."""
+        import numpy as np
+        q = self.joints_rad()
+        if q is None:
+            raise RuntimeError("no arm feedback")
+        flange = self.flange_from_tip(tip_mm_deg)
+        far = float(np.linalg.norm(np.array(flange[:3]) - self.kin.fk(q)[:3, 3]))
+        if far > 0.4:
+            raise RuntimeError("refused: the target is %.0f mm away (> 400 mm): plan a free move there first" % (far * 1000))
+        return self.move_pose_goal(flange, bool(linear), speed, abort)
+
+    def move_pose_goal(self, pose, linear, speed, abort):
+        """One /arm/move_pose goal (flange pose, m / rad) as a job step; the abort event cancels it (the arm freezes)."""
         st = self.fresh("arm", 1.0)
         if st is None or not st.all_enabled:
             raise RuntimeError("the arm is not holding: press Hold first")
-        T = self.kin.fk(q)
-        T[:3, 3] += np.array(delta_mm, float) / 1000.0
         if not self.ac_p.wait_for_server(timeout_sec=3.0):
             raise RuntimeError("/arm/move_pose not available")
-        g = self.MovePose.Goal(pose=[float(v) for v in xyzrpy_from_T(T)], linear=True, speed_percent=int(speed), timeout_s=60.0)
+        g = self.MovePose.Goal(pose=[float(v) for v in pose], linear=bool(linear), speed_percent=int(speed), timeout_s=60.0)
         gf = self.ac_p.send_goal_async(g)
         t0 = time.time()
         while not gf.done():
@@ -443,7 +464,26 @@ class Gateway:
         r = rf.result().result
         if not r.success:
             raise RuntimeError(r.message)
-        return {"success": True, "message": r.message, "delta_mm": [float(v) for v in delta_mm]}
+        return {"success": True, "message": r.message}
+
+    def stored_tag(self, tid):
+        """teach.tag: a tag's last accepted fine result (calib/teach/tags.yaml, written by teach.fine): where it is
+        (arm base) and the posture it was looked at from (the corrected model's degrees)."""
+        import yaml
+        try:
+            with open(TEACH_TAGS) as f:
+                doc = yaml.safe_load(f) or {}
+        except OSError:
+            doc = {}
+        rec = (doc.get("tags") or {}).get(int(tid))
+        if not rec:
+            raise RuntimeError("tag %d has not been located accurately yet (Find real positions of modules)" % int(tid))
+        T = rec["base_to_tag_matrix"]
+        q = rec.get("joints_rad")
+        return {"tag_id": int(tid), "base_mm": [round(float(T[i][3]) * 1000, 2) for i in range(3)],
+                "base_R": [[round(float(T[i][j]), 6) for j in range(3)] for i in range(3)],
+                "joints_model_deg": [round(math.degrees(float(v) + o), 4) for v, o in zip(q, self.kin.offsets)] if q else None,
+                "black_mm": rec.get("black_mm"), "spread_mm": rec.get("spread_mm"), "date": rec.get("date")}
 
     # ------------------------------------------------------------------ arm model
     def tip_and_clearance(self, q):
@@ -834,6 +874,16 @@ class Conn(socketserver.StreamRequestHandler):
                 raise ValueError("delta_mm needs x y z (mm), at most 300 mm long")
             speed = max(1, min(int(gw.P.get("max_speed_percent", 30)), int(a.get("speed_percent") or 10)))
             return self.job("arm.move_linear", lambda ev: gw.move_linear(d, speed, ev))
+        if cmd == "teach.tag":
+            self.need("key")
+            return gw.stored_tag(int(a["tag_id"]))
+        if cmd == "arm.move_tip":
+            self.need("control")
+            tip = [float(v) for v in a.get("tip_mm_deg") or []]
+            if len(tip) != 6:
+                raise ValueError("tip_mm_deg needs x y z rx ry rz")
+            speed = max(1, min(int(gw.P.get("max_speed_percent", 30)), int(a.get("speed_percent") or 10)))
+            return self.job("arm.move_tip", lambda ev: gw.move_tip(tip, a.get("linear", True), speed, ev))
         if cmd == "arm.follow_joints":
             self.need("control")
             wps, label = a.get("waypoints_model_deg"), str(a.get("label") or "")

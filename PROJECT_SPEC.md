@@ -860,3 +860,14 @@ State: `arm.gripper_calib` = `{date, scale, max_gap_mm}` of `calib/gripper.yaml`
 - Tests (offline, no ROS): `src/harness_arm/test/test_smooth_moves.py` (the node's planning on the real arm model: a joint move at rest with no acceleration step at both ends; the 100 mm lift one straight line < 0.5 mm off, orientation kept, never stopping, ≤ 50 mm/s at 10 %; an unreachable line refused), `test_trajectory.py` (a densely sampled curve = one run through every waypoint, one rise and one fall of speed).
 - **Not yet verified on the arm:** how smoothly the PIPER controller follows 100 Hz targets at `max_speed_percent` 30 (the streaming loop's controller speed); if it lags or shakes, that is the next knob.
 
+## 2026-10-24 — Install on Bunny: `teach.tag` and `arm.move_tip` (gateway v3) — CONTRACT + IMPLEMENTED (not yet run on the arm)
+
+**Why.** The twin's demo becomes *Install on Bunny* (railab-workflow spec §10.6, operator 2026-10-24: "grip the 20-400 vial with dispenser head to the Bunny tag 3 installation point"): take the head + vial out of holder slot 1 and put it on the Bunny's platform mount — the mounting point whose reference tag is the platform's **tag 3** (an accurate tag, `ref_tag`, "2026-10-23 — Tag classes"). Operator decisions: look at tag 3 **before picking** (gripper empty) and place the mount from it; the **operator opens the windshield** before starting (the demo never commands the housing; it refuses while the Bunny reports it not open); after placing, **let go gently** (open 15 mm wider than the clamped gap, 1 N — the near-platform rule ≤ 20 mm), back out, go home. This follows the 2026-09-19 design rule: look at the tag next to the work point from close by, then move only a short distance.
+
+| cmd | who | behaviour |
+|---|---|---|
+| `teach.tag {tag_id}` | key | a tag's last accepted `teach.fine` result from `calib/teach/tags.yaml`: `{tag_id, base_mm, base_R (detector frame), joints_model_deg (the posture it was looked at from, corrected-model degrees), black_mm, spread_mm, date}`; error when the tag was never located accurately |
+| `arm.move_tip {tip_mm_deg [x y z rx ry rz], linear (true), speed_percent (10)}` | controller, *job* | the fingertip to an ABSOLUTE pose in the arm base (flange orientation, fixed-axis XYZ; flange = tip − `tcp_offset_m` along flange z) through `/arm/move_pose` — solved and drawn in the harness's calibrated model, where the tags were measured, so the twin's precise steps (onto the grip, onto the mount) do not carry the twin model's error; refused when the target is more than 400 mm away (a free move first) |
+
+`arm.move_linear` now shares the `/arm/move_pose` goal code (`move_pose_goal`).
+
