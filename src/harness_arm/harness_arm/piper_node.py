@@ -18,6 +18,8 @@ Services:
   /arm/gripper    harness_msgs/SetGripper
   /arm/gripper_release  std_srvs/Trigger   un-power the gripper motor only (jaws free); the ARM keeps holding
   /arm/gripper_enable   std_srvs/Trigger   re-power the gripper where the jaws are now, at gripper_hold_force
+  /arm/teach_exit std_srvs/Trigger   take the controller out of teach (drag) mode: end drag teaching, else the
+                  controller's resume (2026-10-24); the joints stay as the controller leaves them (Hold powers them)
   /arm/gripper_calibrate harness_msgs/GripperCalibrate   two-point calibration of the mm reading (jaws set by
                   hand, motor released): saved to gripper_calib_file, loaded at start (PROJECT_SPEC.md
                   "2026-10-24 — Gripper release, hold and calibration")
@@ -151,7 +153,7 @@ class PiperNode(Node):
 
         for name, cb in (("enable", self.srv_enable), ("disable", self.srv_disable),
                          ("hold", self.srv_hold), ("gripper_release", self.srv_gripper_release),
-                         ("gripper_enable", self.srv_gripper_enable)):
+                         ("gripper_enable", self.srv_gripper_enable), ("teach_exit", self.srv_teach_exit)):
             self.create_service(Trigger, f"/arm/{name}", cb, callback_group=self.cb)
         self.create_service(SetSpeed, "/arm/set_speed", self.srv_set_speed, callback_group=self.cb)
         self.create_service(SetJoints, "/arm/set_joints", self.srv_set_joints, callback_group=self.cb)
@@ -505,6 +507,34 @@ class PiperNode(Node):
             return res
         finally:
             self.motion.release()
+
+    def srv_teach_exit(self, req, res):
+        """Take the controller out of teach (drag) mode (2026-10-24: found in TEACHING_MODE, every command refused,
+        no button found): "end drag teaching" (0x150 byte 2 = 0x02); if it is still in teach mode, the controller's
+        resume (0x150 byte 0 = 0x02, the SDK's reset). Nothing is enabled or moved here: the joints stay as the
+        controller leaves them (support the arm); /arm/hold powers them."""
+        from pyAgxArm.protocols.can_protocol.msgs.piper.default import ArmMsgMotionCtrl
+        if not self._read()["teach"]:
+            res.success, res.message = True, "not in teach mode"
+            return res
+        tried = []
+        for name, send in (("end drag teaching", lambda: self.robot._send_msg(ArmMsgMotionCtrl(grag_teach_ctrl=0x02))),
+                           ("controller resume", lambda: self.robot.reset())):
+            with self.sdk:
+                send()
+            tried.append(name)
+            t_end = time.time() + 2.0
+            while time.time() < t_end and self._read()["teach"]:
+                time.sleep(0.05)
+            if not self._read()["teach"]:
+                break
+        s = self._read()
+        res.success = not s["teach"]
+        res.message = (f"{'left' if res.success else 'STILL in'} teach mode after: {', '.join(tried)}; control mode "
+                       f"{s['ctrl_mode']}, joints enabled {s['enabled']}" + ("" if res.success else
+                       " — try the teach button on the arm or power-cycle the arm"))
+        self.get_logger().warning("teach_exit: " + res.message)
+        return res
 
     def _drift_watch(self, target):
         worst = 0.0

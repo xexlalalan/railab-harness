@@ -27,6 +27,7 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   {"cmd": "arm.gripper_hold"}                             the gripper motor grips where the jaws are (5 N)
   {"cmd": "arm.gripper_cal", "args": {"step": "closed"}}  / {"step": "open", "gap_mm": 35.2} / {"step": "cancel"}
   {"cmd": "teach.tag", "args": {"tag_id": 3}}             the stored fine result of a tag (calib/teach/tags.yaml)
+  {"cmd": "arm.teach_exit"}                               the controller out of teach (drag) mode (enables nothing)
   {"cmd": "arm.move_tip", "args": {"tip_mm_deg": [...6], "linear": true, "speed_percent": 10}}   job: fingertip to a pose
 
 The gateway owns no hardware: it is an rclpy client of the module nodes, like harness_cmd.py. Releasing the
@@ -839,6 +840,10 @@ class Conn(socketserver.StreamRequestHandler):
         if cmd == "arm.hold":
             self.need("control")
             return gw.trigger("/arm/hold", 15)
+        if cmd == "arm.teach_exit":        # 2026-10-24: the controller out of teach (drag) mode; enables nothing
+            self.need("control")
+            jog["pose"] = jog["grip"] = None
+            return gw.trigger("/arm/teach_exit", 15)
         if cmd == "arm.release":           # operator 2026-10-23: one click; joints 1-6 only, the gripper keeps holding
             self.need("control")
             jog["pose"] = jog["grip"] = None
