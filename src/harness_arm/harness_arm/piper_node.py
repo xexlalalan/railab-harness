@@ -482,7 +482,9 @@ class PiperNode(Node):
 
     def srv_hold(self, req, res):
         why = self._refuse()
-        if why:
+        # a fault latched by error bits that are gone now (e.g. a moment's joint communication loss when the controller
+        # left teach mode, 2026-10-24) does not block Hold — holding is the safe answer; it clears it, like /arm/enable
+        if why and "fault latched" not in why:
             res.success, res.message = False, "refused: " + why
             return res
         if not self.motion.acquire(blocking=False):
