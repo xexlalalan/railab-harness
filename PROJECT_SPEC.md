@@ -871,3 +871,9 @@ State: `arm.gripper_calib` = `{date, scale, max_gap_mm}` of `calib/gripper.yaml`
 
 `arm.move_linear` now shares the `/arm/move_pose` goal code (`move_pose_goal`).
 
+## 2026-10-24 — The controller found in teach (drag) mode: `/arm/teach_exit`, `arm.teach_exit`; Hold clears a stale fault — IMPLEMENTED, RUN ON THE ARM
+
+**What happened.** Hold did nothing: the PIPER controller reported `ctrl_mode TEACHING_MODE` (teach flag on, joints unpowered), and the arm node refuses every enable / hold / move in teach mode ("arm is in teach mode"). Not caused by the harness software: the SDK's mode message (0x151) cannot even express teaching mode (allowed 0x00 / 0x01 / 0x03 / 0x04 / 0x07) and nothing here sends 0x150 "start drag teaching" or the leader-arm modes; the operator found no teach button on the arm. The mode survives an arm-node restart (it lives in the controller).
+
+**Fix.** `/arm/teach_exit` (std_srvs/Trigger): 0x150 byte 2 = 0x02 "end drag teaching"; if still in teach mode after 2 s, 0x150 byte 0 = 0x02, the controller's resume (the SDK's `reset()`); enables and moves nothing. Gateway `arm.teach_exit` (controller); the twin's PiPER card shows **teach mode** and a **Leave teach mode** button while the controller is in it. Run on the arm 2026-10-24: "end drag teaching" alone did not leave it, the resume did → STANDBY, NORMAL, joints unpowered; at that moment all six joints reported a communication error for a fraction of a second, which latched the node's fault — and **Hold refused while a fault was latched**. Now `/arm/hold` (like `/arm/enable`) clears a fault latched by error bits that are gone (holding is the safe answer); with error bits present it still refuses.
+
