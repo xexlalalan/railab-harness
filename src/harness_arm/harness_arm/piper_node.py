@@ -606,19 +606,30 @@ class PiperNode(Node):
         return res
 
     def _hold_from_teach(self, res):
-        """Hold from teach mode (or a teach record): "end drag teaching" only — never the controller's resume, which
-        unpowers every joint (2026-10-24: it dropped the arm) — then at once power joints 1-6 and hold where the arm
-        is, with no error-bit check in between (an arm left unpowered falls)."""
+        """Hold from teach mode (or a teach record): "end drag teaching"; if the controller is still in teach mode and
+        every joint is ALREADY unpowered — the arm's own drag-teach mode, the button at the wrist between J5 and J6 —
+        the controller's resume, the only exit that works for it (2026-10-24): it unpowers every joint, which changes
+        nothing then. Never the resume with a joint powered (2026-10-24: it dropped the arm). Then at once power
+        joints 1-6 and hold where the arm is, with no error-bit check in between (an arm left unpowered falls)."""
         if not self.motion.acquire(blocking=False):
             res.success, res.message = False, "refused: a motion goal is running"
             return res
         try:
-            tried = self._leave_teach(1.0, resume=False)     # never the controller's resume: it unpowers the arm
+            tried = self._leave_teach(1.0, resume=False)     # the controller's resume only below: it unpowers the arm
             s = self._read()
+            if s["teach"] and not any(s["enabled"]):
+                with self.sdk:
+                    self.robot.reset()
+                tried.append("controller resume (every joint was unpowered already)")
+                t_end = time.time() + 2.0
+                while time.time() < t_end and self._read()["teach"]:
+                    time.sleep(0.01)
+                s = self._read()
             if s["teach"]:
                 res.success, res.message = False, (f"the controller stays in teach mode (control mode {s['ctrl_mode']}, "
-                                                   f"teach {s['teach_status']}) after end drag teaching; nothing else "
-                                                   "sent — use the teach button on the arm")
+                                                   f"teach {s['teach_status']}, joints enabled {s['enabled']}) after: "
+                                                   f"{', '.join(tried)}; nothing else sent — click the teach button at the "
+                                                   "wrist (between J5 and J6) so its light goes off, then Hold")
                 return res
             with self.sdk:
                 self.robot.set_speed_percent(self.speed)
