@@ -115,6 +115,17 @@ class PiperKinematics:
 
     # ------------------------------------------------------------------ paths
     @staticmethod
+    def pose_at(T0, T1, f):
+        """The pose a fraction f (0..1) of the way along the straight move T0 -> T1: position linear,
+        orientation slerped (the same path as interpolate)."""
+        R0 = Rot.from_matrix(T0[:3, :3])
+        rv = (R0.inv() * Rot.from_matrix(T1[:3, :3])).as_rotvec()
+        T = np.eye(4)
+        T[:3, :3] = (R0 * Rot.from_rotvec(rv * f)).as_matrix()
+        T[:3, 3] = T0[:3, 3] * (1 - f) + T1[:3, 3] * f
+        return T
+
+    @staticmethod
     def interpolate(T0, T1, step_m=0.02, step_rad=0.1):
         """Waypoints from T0 (exclusive) to T1 (inclusive): linear position, slerp orientation."""
         pe, ae = pose_error(T0, T1)

@@ -182,3 +182,23 @@ def test_joint_path_from_a_start_held_past_a_limit(kin, lim):
     further[5] = start[5] + 0.05
     with pytest.raises(PlanError, match="joint 6"):
         plan_joint_path(kin, [start, further, target], lim, from_outside=True)
+
+
+def test_joint_path_passes_nearly_collinear_waypoints_without_stopping(kin, lim):
+    """2026-10-24 (operator: smooth, no stop-and-go): a densely sampled gentle curve — what a planned straight
+    rise looks like in joint space — is one motion through every waypoint, at rest only at its ends."""
+    import dataclasses
+    slow = dataclasses.replace(lim, max_joint_vel_rad_s=0.35, max_joint_acc_rad_s2=0.7)
+    a = np.array(Q_PARK)
+    b = np.array([0.3, 0.6, -0.8, 0.1, 0.4, 0.2])
+    bend = np.array([0.0, 0.0, 0.0, 0.0, 0.04, 0.0])
+    W = [a + (b - a) * f + bend * math.sin(math.pi * f) for f in np.linspace(0.0, 1.0, 21)]
+    tr = plan_joint_path(kin, W, slow)
+    assert len(tr.segments) == 1 and tr.segments[0][0] == "segments 1-20"
+    for w in W:                                                    # through every waypoint
+        assert np.abs(tr.q - w).max(axis=1).min() < 0.004
+    v = np.abs(np.diff(tr.q, axis=0) / np.diff(tr.t)[:, None]).max(axis=1)
+    k = int(np.argmax(v))                                          # one rise, one fall: no stop in between
+    assert (np.diff(v[:k + 1]) > -1e-4).all() and (np.diff(v[k:]) < 1e-4).all()
+    assert v[0] < 0.01 and v[-1] < 0.01
+    assert v.max() <= 0.35 * 1.001

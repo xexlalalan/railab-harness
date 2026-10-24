@@ -22,8 +22,9 @@ Services:
                   hand, motor released): saved to gripper_calib_file, loaded at start (PROJECT_SPEC.md
                   "2026-10-24 — Gripper release, hold and calibration")
 Actions:
-  /arm/move_j     harness_msgs/MoveJ
-  /arm/move_pose  harness_msgs/MovePose   (linear=false -> move_p, true -> move_l)
+  /arm/move_j     harness_msgs/MoveJ      a smooth joint move (minimum-jerk, streamed; 2026-10-24)
+  /arm/move_pose  harness_msgs/MovePose   IK here; linear=false: a smooth joint move to it, true: the flange on a
+                  straight line with a smooth speed profile (streamed; 2026-10-24 — was 20 mm stop-and-go hops)
   /arm/follow_trajectory  harness_msgs/FollowTrajectory   stream a validated joint trajectory
                   (move_j re-targeted at traj_rate_hz; PROJECT_SPEC.md "2026-10-22 — Planner bedrock")
 
@@ -82,6 +83,20 @@ def _rpy_to_quat(r, p, y):
     )
 
 
+def _min_jerk(u):
+    """0..1 -> 0..1 with zero speed AND zero acceleration at both ends: the smooth start and stop."""
+    u = min(1.0, max(0.0, float(u)))
+    return u * u * u * (10.0 - 15.0 * u + 6.0 * u * u)
+
+
+def _min_jerk_time(dist, vmax, amax, t_min=0.5):
+    """Duration of a minimum-jerk move over `dist` whose peak speed (1.875 dist / T) and peak acceleration
+    (5.77 dist / T²) stay within vmax / amax."""
+    if dist <= 0.0:
+        return t_min
+    return max(t_min, 1.875 * dist / vmax, math.sqrt(5.7735 * dist / amax))
+
+
 def _ang_err(a, b):
     """Angle between two fixed-axis XYZ (roll, pitch, yaw) orientations, rad."""
     qa = _rpy_to_quat(*a)
@@ -108,6 +123,8 @@ class PiperNode(Node):
             ("linear_step_m", 0.02), ("linear_step_rad", 0.1), ("stall_s", 2.0), ("pose_total_jump_rad", 2.5),
             ("traj_rate_hz", 100.0), ("traj_max_joint_vel_rad_s", 0.6), ("traj_tracking_error_rad", 0.15),
             ("traj_start_tol_rad", 0.05), ("traj_max_points", 20000),
+            ("smooth_joint_vel_rad_s", 3.0), ("smooth_tool_vel_m_s", 0.5), ("smooth_tool_vel_rad_s", 3.0),
+            ("smooth_acc_per_s", 2.0), ("smooth_knot_s", 0.04), ("smooth_knot_jump_rad", 0.15),
         ])
         self.P = {x.name: x.value for x in p}
         self.cb = ReentrantCallbackGroup()
@@ -750,217 +767,146 @@ class PiperNode(Node):
             with self.sdk:
                 self.robot.move_j(list(s["joints"]))
 
-    def _run_motion(self, gh, send, done_fn, feedback_fn, timeout, max_jump=None, need=None):
-        """Common execute loop. send(): issue the SDK command. done_fn(snap)->(done, err_value).
-        feedback_fn(snap)->feedback msg. Returns (success, message)."""
-        if not self.motion.acquire(blocking=False):
-            return False, "another motion is running"
-        self.busy = True
-        self.cancel_requested = False
-        try:
-            s = self._read()
-            if not all(s["enabled"]):
-                return False, "arm is not enabled (call /arm/enable or /arm/hold first)"
-            q_start = list(s["joints"]) if s["joints"] is not None else None
-            with self.sdk:
-                send()
-            t0 = time.time()
-            settled = 0
-            bad = 0
-            q_last, t_moved = (list(s["joints"]) if s["joints"] is not None else None), time.time()
-            need = int(self.P["settle_samples"]) if need is None else int(need)
-            while True:
-                time.sleep(0.05)
-                s = self._read()
-                if self.cancel_requested or gh.is_cancel_requested:
-                    self._stop_here()
-                    return False, "cancelled"
-                if s["errors"]:
-                    return False, "errors: " + ",".join(s["errors"])
-                bad = bad + 1 if s["arm_status"] != "NORMAL" else 0
-                if bad >= 3:                      # controller refused the target (no IK solution, limit, singularity)
-                    self._stop_here()
-                    return False, f"controller reports {s['arm_status']}"
-                if s["age"] >= float(self.P["watchdog_s"]):
-                    return False, "feedback lost"
-                if max_jump is not None and q_start is not None:
-                    # A Cartesian target lets the controller pick any IK branch; near a wrist limit it
-                    # silently flips j4/j5/j6 by ~180 deg (2026-09-18). Freeze as soon as a joint runs away.
-                    dq = [abs(a - b) for a, b in zip(s["joints"], q_start)]
-                    k = max(range(6), key=lambda i: dq[i])
-                    if dq[k] > max_jump:
-                        self._stop_here()
-                        return False, (f"joint-jump guard: joint {k + 1} moved {dq[k]:.2f} rad "
-                                       f"(> {max_jump:.2f}) during a Cartesian move - wrist flip / other IK branch; stopped")
-                done, err = done_fn(s)
-                gh.publish_feedback(feedback_fn(s))
-                settled = settled + 1 if done else 0
-                # stall: joints stopped moving but the target is not reached -> the controller has
-                # clamped a joint at ITS limit (it does so silently, e.g. j4 at 100 deg). Fail fast.
-                if q_last is not None and s["joints"] is not None:
-                    if max(abs(a - b) for a, b in zip(s["joints"], q_last)) > 0.002:
-                        q_last, t_moved = list(s["joints"]), time.time()
-                    elif not done and time.time() - t_moved > float(self.P["stall_s"]):
-                        self._stop_here()
-                        return False, (f"stalled short of the target for {self.P['stall_s']:.1f} s (residual {err:.4f}): "
-                                       f"a joint is clamped at a controller limit or the target is unreachable")
-                if settled >= need:
-                    return True, f"reached (residual {err:.4f})"
-                if time.time() - t0 > timeout:
-                    self._stop_here()
-                    return False, f"timeout after {timeout:.0f} s (residual {err:.4f})"
-        finally:
-            self.busy = False
-            self.motion.release()
+    # ------------------------------------------------------------------ smooth moves (2026-10-24)
+    # Every motion is a timed trajectory streamed at traj_rate_hz (_stream): minimum-jerk profiles, so the arm
+    # starts and stops with zero speed AND zero acceleration — no rush, no stop-and-go (operator 2026-10-24:
+    # "as smooth as possible, with smooth acceleration control"). Before, move_j handed the whole move to the
+    # controller's own profile and a linear move_pose was a chain of 20 mm hops, each stopping.
+    def _smooth_caps(self, speed):
+        """speed_percent -> (joint rad/s, rad/s², tool m/s, m/s², tool rad/s, rad/s²): the profile's peaks."""
+        f = max(1, min(100, int(speed))) / 100.0
+        k = float(self.P["smooth_acc_per_s"])
+        vj = min(float(self.P["traj_max_joint_vel_rad_s"]), f * float(self.P["smooth_joint_vel_rad_s"]))
+        vl = f * float(self.P["smooth_tool_vel_m_s"])
+        va = f * float(self.P["smooth_tool_vel_rad_s"])
+        return vj, k * vj, vl, k * vl, va, k * va
+
+    def _joint_line(self, q0, q1, speed):
+        """A straight joint move as (t, q): minimum-jerk, its peak joint speed / acceleration within the caps."""
+        vj, aj = self._smooth_caps(speed)[:2]
+        q0, q1 = np.asarray(q0, float), np.asarray(q1, float)
+        T = _min_jerk_time(float(np.abs(q1 - q0).max()), vj, aj)
+        t = np.linspace(0.0, T, max(2, int(math.ceil(T * float(self.P["traj_rate_hz"]))) + 1))
+        return t, q0 + np.outer([_min_jerk(x / T) for x in t], q1 - q0)
+
+    def _tool_line(self, q0, T0, T1, speed):
+        """A straight flange line T0 -> T1 (orientation slerped) as (t, q): minimum-jerk ALONG the line (tool speed
+        and acceleration within the caps), IK at knots every smooth_knot_s seeded from the previous one (same
+        wrist / elbow branch), joints interpolated at the stream rate; stretched in time until every joint stays
+        within its speed cap. Raises ValueError (words) when the line cannot be followed in this branch."""
+        vj, aj, vl, al, va, aa = self._smooth_caps(speed)
+        pe, ae = pose_error(T0, T1)
+        T = max(_min_jerk_time(pe, vl, al), _min_jerk_time(ae, va, aa))
+        dt_k, margin, jump = float(self.P["smooth_knot_s"]), float(self.P["ik_limit_margin_rad"]), float(self.P["smooth_knot_jump_rad"])
+        for _ in range(5):
+            tk = np.linspace(0.0, T, max(2, int(math.ceil(T / dt_k)) + 1))
+            qk, seed = [np.asarray(q0, float)], np.asarray(q0, float)
+            for ti in tk[1:]:
+                f = _min_jerk(ti / T)
+                q, perr, aerr = self.kin.ik(self.kin.pose_at(T0, T1, f), seed, margin=margin)
+                if perr > 1e-3 or aerr > 5e-3:
+                    raise ValueError(f"no IK solution in the current branch {100 * f:.0f} % along the line "
+                                     f"(best {perr * 1000:.1f} mm / {math.degrees(aerr):.2f} deg); joints near a limit or out of reach")
+                if float(np.abs(q - seed).max()) > jump:
+                    raise ValueError(f"{100 * f:.0f} % along the line a joint would jump "
+                                     f"{math.degrees(float(np.abs(q - seed).max())):.0f} deg (wrist flip / another branch)")
+                qk.append(q)
+                seed = q
+            qk = np.array(qk)
+            vmax = float((np.abs(np.diff(qk, axis=0)) / np.diff(tk)[:, None]).max())
+            if vmax <= vj * 1.001:
+                break
+            T *= vmax / vj * 1.05                               # a joint too fast: the same line, slower
+        t = np.linspace(0.0, T, max(2, int(math.ceil(T * float(self.P["traj_rate_hz"]))) + 1))
+        return t, np.column_stack([np.interp(t, tk, qk[:, j]) for j in range(6)])
 
     def exec_move_j(self, gh):
         g = gh.request
         target = [float(x) for x in g.joints_rad]
         speed = self._clamp_speed(g.speed_percent)
-        timeout = g.timeout_s if g.timeout_s > 0 else float(self.P["move_timeout_s"])
-        tol = float(self.P["joint_tol_rad"])
+        res = MoveJ.Result()
+
+        def finish(ok, msg):
+            res.success, res.message = ok, msg
+            res.final_joints_rad = [float(x) for x in (self.snap.get("joints") or [0.0] * 6)]
+            (gh.succeed if ok else gh.abort)()
+            return res
         cur = self.snap.get("joints") or self._read()["joints"]
+        if cur is None:
+            return finish(False, "no joint feedback")
         jump = max(abs(a - b) for a, b in zip(cur, target))
         if jump > float(self.P["max_joint_delta_rad"]):
-            res = MoveJ.Result()
-            res.success = False
-            res.message = (f"refused: joint jump {jump:.2f} rad exceeds max_joint_delta_rad "
-                           f"{self.P['max_joint_delta_rad']}; split the move into via points")
-            res.final_joints_rad = [float(x) for x in cur]
-            gh.abort()
-            return res
+            return finish(False, f"refused: joint jump {jump:.2f} rad exceeds max_joint_delta_rad "
+                                 f"{self.P['max_joint_delta_rad']}; split the move into via points")
+        t, q = self._joint_line(cur, target, speed)
+        why = self._check_trajectory(t, q, geometry=False)     # joint moves: limits + speed (not the floor, as before)
+        if why:
+            return finish(False, "refused: " + why)
 
-        def send():
-            self.robot.set_speed_percent(speed)
-            self.speed = speed
-            self.robot.move_j(target)
-
-        def done(s):
-            e = max(abs(a - b) for a, b in zip(s["joints"], target))
-            return e <= tol, e
-
-        def fb(s):
+        def fb(tt, worst, s):
             f = MoveJ.Feedback()
-            f.max_joint_error_rad = done(s)[1]
+            f.max_joint_error_rad = max(abs(a - b) for a, b in zip(s["joints"], target)) if s["joints"] is not None else 0.0
             return f
-
-        ok, msg = self._run_motion(gh, send, done, fb, timeout)
-        res = MoveJ.Result()
-        res.success, res.message = ok, msg
-        res.final_joints_rad = [float(x) for x in (self.snap.get("joints") or [0.0] * 6)]
-        (gh.succeed if ok else gh.abort)()
-        return res
+        ok, msg, _, _ = self._stream(gh, t, q, float(self.P["traj_tracking_error_rad"]), "move_j", feedback=fb)
+        return finish(ok, msg)
 
     def exec_move_pose(self, gh):
-        """Cartesian goal in the CORRECTED model: solve IK here (seeded from the current joints,
-        so the wrist/elbow branch cannot change), then drive the controller with joint targets.
-        linear=True: straight line as a chain of short joint moves through IK'd waypoints."""
+        """Cartesian goal in the CORRECTED model: IK here (seeded from the current joints, so the wrist / elbow
+        branch cannot change). linear=False: one smooth joint move to the IK solution; linear=True: the flange on
+        a straight line with a smooth speed profile (_tool_line). Both streamed (_stream)."""
         g = gh.request
         pose = [float(x) for x in g.pose]
         speed = self._clamp_speed(g.speed_percent)
-        timeout = g.timeout_s if g.timeout_s > 0 else float(self.P["move_timeout_s"])
-        ptol, atol = float(self.P["pos_tol_m"]), float(self.P["ang_tol_rad"])
-        jtol = float(self.P["joint_tol_rad"])
-        max_jump = float(self.P["max_joint_delta_rad"])
         res = MovePose.Result()
 
-        def fail(msg):
-            res.success, res.message = False, msg
+        def finish(ok, msg):
+            res.success, res.message = ok, msg
             res.final_pose = [float(x) for x in (self.snap.get("tcp") or [0.0] * 6)]
-            gh.abort()
+            (gh.succeed if ok else gh.abort)()
             return res
-
         if not self._in_workspace(pose[:3]):
-            return fail("target outside workspace box")
+            return finish(False, "target outside workspace box")
         fv = self._floor_violation(pose)
         if fv:
-            return fail("refused: " + fv)
+            return finish(False, "refused: " + fv)
         cur = self.snap.get("joints") or self._read()["joints"]
         if cur is None:
-            return fail("no joint feedback")
+            return finish(False, "no joint feedback")
         T_goal = T_from_xyzrpy(pose)
         T_now = self.kin.fk(cur)
-        if g.linear:
-            wps = self.kin.interpolate(T_now, T_goal, float(self.P["linear_step_m"]), float(self.P["linear_step_rad"]))
-        else:
-            wps = [T_goal]
+        try:
+            if g.linear:
+                t, q = self._tool_line(cur, T_now, T_goal, speed)
+            else:
+                qg, pe, ae = self.kin.ik(T_goal, list(cur), margin=float(self.P["ik_limit_margin_rad"]))
+                if pe > 1e-3 or ae > 5e-3:
+                    return finish(False, f"refused: no IK solution in the current branch (best {pe * 1000:.1f} mm / "
+                                         f"{math.degrees(ae):.2f} deg); joints near a limit or pose out of reach")
+                jump = float(np.abs(np.asarray(qg) - np.asarray(cur)).max())
+                if jump > float(self.P["pose_total_jump_rad"]):
+                    return finish(False, f"refused: target needs a joint jump of {jump:.2f} rad (> pose_total_jump_rad "
+                                         f"{self.P['pose_total_jump_rad']}); is this the pose you meant?")
+                t, q = self._joint_line(cur, qg, speed)
+        except ValueError as e:
+            return finish(False, f"refused: {e}")
+        why = self._check_trajectory(t, q)                     # limits, speed, workspace box, floor: every sample
+        if why:
+            return finish(False, "refused: " + why)
 
-        # solve the whole chain first; refuse before moving if any waypoint is unreachable
-        margin = float(self.P["ik_limit_margin_rad"])
-        targets, seed = [], list(cur)
-        for k, T in enumerate(wps):
-            q, pe, ae = self.kin.ik(T, seed, margin=margin)
-            if pe > 1e-3 or ae > 5e-3:
-                return fail(f"refused: no IK solution in the current branch for waypoint {k + 1}/{len(wps)} "
-                            f"(best {pe*1000:.1f} mm / {math.degrees(ae):.2f} deg); joints near a limit or pose out of reach")
-            jump = max(abs(a - b) for a, b in zip(seed, q))
-            if jump > max_jump:
-                if g.linear or len(wps) > 1:
-                    return fail(f"refused: waypoint {k + 1} needs a joint jump of {jump:.2f} rad (> max_joint_delta_rad {max_jump}); "
-                                f"split the move")
-                # point-to-point: a long but legitimate move. Split it into joint-space via points
-                # (what the controller's own move_p does internally), each checked against floor/workspace.
-                cap = float(self.P["pose_total_jump_rad"])
-                if jump > cap:
-                    return fail(f"refused: target needs a joint jump of {jump:.2f} rad (> pose_total_jump_rad {cap}); "
-                                f"is this the pose you meant?")
-                n = int(math.ceil(jump / (0.8 * max_jump)))
-                qs, qe = np.array(seed), np.array(q)
-                for i in range(1, n):
-                    qi = qs + (qe - qs) * i / n
-                    wp_pose = self.kin.fk_xyzrpy(qi)
-                    fv = self._floor_violation(wp_pose)
-                    if fv or not self._in_workspace(wp_pose[:3]):
-                        return fail(f"refused: via point {i}/{n} of the split move " + (fv or "outside workspace box"))
-                    targets.append([float(v) for v in qi])
-            if g.linear and k < len(wps) - 1:
-                wp_pose = xyzrpy_from_T(T)
-                fv = self._floor_violation(wp_pose)
-                if fv or not self._in_workspace(wp_pose[:3]):
-                    return fail(f"refused: waypoint {k + 1} " + (fv or "outside workspace box"))
-            targets.append([float(v) for v in q])
-            seed = list(q)
-
-        def errs(s):
-            return pose_error(self.kin.fk(s["joints"]), T_goal)
-
-        ok, msg = True, ""
-        need_final = int(self.P["settle_samples"])
-        for k, target in enumerate(targets):
-            last = k == len(targets) - 1
-
-            def send(target=target):
-                self.robot.set_speed_percent(speed)
-                self.speed = speed
-                self.robot.move_j(target)
-
-            def done(s, target=target, last=last):
-                je = max(abs(a - b) for a, b in zip(s["joints"], target))
-                pe, ae = errs(s)
-                if last:
-                    return (je <= jtol and pe <= ptol and ae <= atol), pe + ae
-                return je <= 3 * jtol, pe + ae      # intermediate waypoint: pass through
-
-            def fb(s):
-                f = MovePose.Feedback()
-                f.position_error_m, f.orientation_error_rad = errs(s)
-                return f
-
-            ok, msg = self._run_motion(gh, send, done, fb, timeout,
-                                       max_jump=float(self.P["pose_max_joint_delta_rad"]),
-                                       need=need_final if last else 1)
-            if not ok:
-                msg = f"waypoint {k + 1}/{len(targets)}: {msg}"
-                break
-        res.success, res.message = ok, msg
-        res.final_pose = [float(x) for x in (self.snap.get("tcp") or [0.0] * 6)]
-        (gh.succeed if ok else gh.abort)()
-        return res
+        def fb(tt, worst, s):
+            f = MovePose.Feedback()
+            if s["joints"] is not None:
+                f.position_error_m, f.orientation_error_rad = pose_error(self.kin.fk(s["joints"]), T_goal)
+            return f
+        ok, msg, _, _ = self._stream(gh, t, q, float(self.P["traj_tracking_error_rad"]),
+                                     "move_pose" + (" linear" if g.linear else ""), feedback=fb)
+        return finish(ok, msg)
 
     # ------------------------------------------------------------------ trajectories
-    def _check_trajectory(self, t, q):
+    def _check_trajectory(self, t, q, geometry=True):
         """Reason a joint trajectory must be refused, or None: every point within the joint limits,
-        the workspace box and the floor margin; joint speed between points within
+        the workspace box and the floor margin (geometry=False: limits and speed only — move_j, whose
+        targets were never floor-filtered); joint speed between points within
         traj_max_joint_vel_rad_s (+10 %). The planner checked the same; this node is the last gate."""
         m = float(self.P["ik_limit_margin_rad"]) * 0.5
         lo = np.array([l[0] + m for l in self.kin.limits])
@@ -977,7 +923,7 @@ class PiperNode(Node):
         if (v > vmax).any():
             i, j = np.unravel_index(v.argmax(), v.shape)
             return f"point {i + 1}: joint {j + 1} would turn at {v[i, j]:.2f} rad/s > {vmax:.2f} (traj_max_joint_vel_rad_s + 10 %)"
-        for i in range(len(t)):
+        for i in (range(len(t)) if geometry else ()):
             with warnings.catch_warnings():          # a level gripper is exactly at the rpy gimbal lock; the rotation is still right
                 warnings.simplefilter("ignore", UserWarning)
                 pose = self.kin.fk_xyzrpy(q[i])
@@ -1035,13 +981,14 @@ class PiperNode(Node):
         (gh.succeed if ok else gh.abort)()
         return res
 
-    def _stream(self, gh, t, q, tol, label):
-        """The streaming loop of exec_follow_trajectory: (ok, message, worst tracking error, seconds)."""
+    def _stream(self, gh, t, q, tol, label, feedback=None):
+        """The streaming loop of every motion (follow_trajectory, move_j, move_pose): (ok, message, worst
+        tracking error, seconds). feedback(tt, worst, snap) -> the goal's feedback message (default: FollowTrajectory's)."""
         if not self.motion.acquire(blocking=False):
             return False, "another motion is running", 0.0, 0.0
         self.busy = True
         self.cancel_requested = False
-        worst, tt = 0.0, 0.0
+        worst, tt, bad = 0.0, 0.0, 0
         try:
             s = self._read()
             if not all(s["enabled"]):
@@ -1075,6 +1022,10 @@ class PiperNode(Node):
                     return False, f"errors at {tt:.1f} s: " + ",".join(s["errors"]), worst, tt
                 if s["age"] >= float(self.P["watchdog_s"]):
                     return False, f"feedback lost at {tt:.1f} s", worst, tt
+                bad = bad + 1 if s.get("arm_status", "NORMAL") != "NORMAL" else 0
+                if bad >= 3:                          # the controller refused the targets (limit, singularity)
+                    self._stop_here()
+                    return False, f"controller reports {s['arm_status']} at {tt:.1f} s; stopped", worst, tt
                 if s["joints"] is not None:
                     e = [abs(a - b) for a, b in zip(s["joints"], cmd)]
                     j = max(range(6), key=lambda i: e[i])
@@ -1084,10 +1035,13 @@ class PiperNode(Node):
                         return False, (f"tracking error {e[j]:.3f} rad on joint {j + 1} > {tol:.3f} at {tt:.1f} s "
                                        f"(the arm cannot follow: blocked, clamped at a limit, or too fast); stopped"), worst, tt
                 if k % 10 == 0:
-                    f = FollowTrajectory.Feedback()
-                    f.progress, f.tracking_error_rad = tt / T_end, worst
-                    f.point_index = int(np.searchsorted(t, tt))
-                    gh.publish_feedback(f)
+                    if feedback is not None:
+                        gh.publish_feedback(feedback(tt, worst, s))
+                    else:
+                        f = FollowTrajectory.Feedback()
+                        f.progress, f.tracking_error_rad = tt / T_end, worst
+                        f.point_index = int(np.searchsorted(t, tt))
+                        gh.publish_feedback(f)
                 k += 1
                 nxt += period
                 delay = nxt - time.monotonic()

@@ -7,7 +7,7 @@ piper:
     watchdog_s: 0.25               # feedback silence that cancels the goal and latches a fault (the arm stays enabled)
     move_timeout_s: 30.0
     max_joint_delta_rad: 1.2       # one goal may not ask any joint to jump further than this (~70 deg)
-    pose_max_joint_delta_rad: 1.2  # Cartesian move: freeze if any joint runs >1.2 rad from its start (IK branch flip guard, 2026-09-18)
+    pose_max_joint_delta_rad: 1.2  # (unused since 2026-10-24: a straight line is planned whole; a joint jumping > smooth_knot_jump_rad between knots refuses it)
     joint_tol_rad: 0.01
     pos_tol_m: 0.003
     ang_tol_rad: 0.03
@@ -34,10 +34,19 @@ piper:
     kinematics_file: /home/bunny-harness/bunny-harness-dev/calib/kinematics.yaml
     kinematics_model: piper
     ik_limit_margin_rad: 0.02
-    linear_step_m: 0.02
+    linear_step_m: 0.02            # (unused since 2026-10-24: straight lines are smooth, not 20 mm hops)
     linear_step_rad: 0.1
-    pose_total_jump_rad: 2.5       # point-to-point move_pose: split into joint via points up to this total jump; beyond = refused
-    stall_s: 2.0                   # move fails fast if the joints stop short of the target for this long (controller limit clamp)
+    pose_total_jump_rad: 2.5       # point-to-point move_pose: one smooth joint move up to this jump; beyond = refused
+    stall_s: 2.0                   # (unused since 2026-10-24: a joint the controller clamps shows as a tracking error)
+    # --- smooth moves (2026-10-24): move_j / move_pose are minimum-jerk trajectories streamed like follow_trajectory.
+    # speed_percent scales these peaks (10 % = 0.3 rad/s joints, 50 mm/s and 0.3 rad/s tool); acceleration peak =
+    # smooth_acc_per_s x speed peak; joints never above traj_max_joint_vel_rad_s
+    smooth_joint_vel_rad_s: 3.0
+    smooth_tool_vel_m_s: 0.5
+    smooth_tool_vel_rad_s: 3.0
+    smooth_acc_per_s: 2.0
+    smooth_knot_s: 0.04            # straight lines: IK every 40 ms of the profile, joints interpolated at traj_rate_hz
+    smooth_knot_jump_rad: 0.15     # a joint changing more than this between two knots = a wrist flip: refused
     # --- /arm/follow_trajectory (2026-10-22, planner bedrock): streamed joint trajectories
     traj_rate_hz: 100.0            # move_j re-targeted this often while a trajectory runs
     traj_max_joint_vel_rad_s: 0.6  # refuse trajectories faster than this (+10 %) between points; the planner plans to 0.5

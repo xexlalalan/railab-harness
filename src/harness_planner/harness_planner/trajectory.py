@@ -142,6 +142,47 @@ def min_jerk(q0, q1, vmax: float, amax: float, rate_hz: float, t_min: float = 2.
     return t, q0 + np.outer(f, q1 - q0)
 
 
+CORNER_DEG = 5.0      # plan_joint_path: waypoints whose path turns less than this are passed without stopping
+
+
+def _corner_runs(W):
+    """Split a joint polyline (no zero-length segments) into runs of waypoint indices whose consecutive
+    segments turn by less than CORNER_DEG: a run is driven as one motion, a real corner stops."""
+    runs, cur = [], [0]
+    for k in range(1, len(W) - 1):
+        a, b = W[k] - W[k - 1], W[k + 1] - W[k]
+        c = float(a @ b) / max(1e-12, float(np.linalg.norm(a) * np.linalg.norm(b)))
+        cur.append(k)
+        if math.degrees(math.acos(max(-1.0, min(1.0, c)))) >= CORNER_DEG:
+            runs.append(cur)
+            cur = [k]
+    cur.append(len(W) - 1)
+    runs.append(cur)
+    return runs
+
+
+def _run_motion(P, vmax: float, amax: float, rate_hz: float, t_min: float):
+    """Nearly-collinear waypoints P (>= 3) as ONE motion (2026-10-24, operator: smooth, no stop-and-go): a C2
+    spline through every waypoint (parameter = the largest joint's distance along the polyline), minimum-jerk
+    along it, stretched in time until joint speed and acceleration are within vmax / amax. Returns (t, q)."""
+    u = np.concatenate([[0.0], np.cumsum(np.abs(np.diff(P, axis=0)).max(axis=1))])
+    L = float(u[-1])
+    sp = CubicSpline(u, P, axis=0, bc_type="natural")
+    T = max(t_min, 1.875 * L / vmax, math.sqrt(5.774 * L / amax))
+    for _ in range(8):
+        t = np.linspace(0.0, T, max(3, int(math.ceil(T * rate_hz)) + 1))
+        tau = t / T
+        q = sp(L * (10 * tau ** 3 - 15 * tau ** 4 + 6 * tau ** 5))
+        v = np.diff(q, axis=0) / np.diff(t)[:, None]
+        a = np.diff(v, axis=0) / np.diff(t)[1:, None]
+        r = max(float(np.abs(v).max()) / vmax, math.sqrt(float(np.abs(a).max()) / amax))
+        if r <= 1.0:
+            break
+        T *= r * 1.02
+    q[0], q[-1] = P[0], P[-1]
+    return t, q
+
+
 # ---------------------------------------------------------------------------------- the plan
 @dataclass
 class Limits:
@@ -246,24 +287,33 @@ def plan_joint_path(kin, waypoints, lim: Limits, rate_hz: float = 100.0, t_min: 
     """A joint path from a planner (rad, K x 6, the first = where the arm is; PROJECT_SPEC.md
     "2026-10-23 — Release, hand-eye and tag teaching"): each segment a STRAIGHT line in joint space —
     what a collision-checked joint path assumes between its waypoints — timed as a minimum-jerk move
-    within lim's joint speed / acceleration, at rest at every waypoint. Validated like every other
+    within lim's joint speed / acceleration, at rest at every real corner (a turn of CORNER_DEG or more;
+    nearly collinear waypoints are passed without stopping, on a smooth spline through them). Validated like every other
     trajectory; raises PlanError naming the sample. from_outside: the arm may START past a joint limit
     (held there while limp, 2026-10-24) — that joint may stay between its start and the limit (it must
     never go further out); the caller's path brings it back inside."""
     W = np.asarray(waypoints, float)
     if W.ndim != 2 or W.shape[1] != 6 or len(W) < 2:
         raise PlanError("a joint path needs at least 2 waypoints of 6 joints")
+    keep = [0] + [k for k in range(1, len(W)) if float(np.abs(W[k] - W[k - 1]).max()) >= 1e-6]
+    idx, W = keep, W[keep]                        # zero-length segments dropped; idx = the caller's numbering
     ts, qs, segs, t_off = [], [], [], 0.0
-    for k in range(len(W) - 1):
-        if float(np.abs(W[k + 1] - W[k]).max()) < 1e-6:
-            continue
-        t, q = min_jerk(W[k], W[k + 1], lim.max_joint_vel_rad_s, lim.max_joint_acc_rad_s2, rate_hz, t_min=t_min)
+    # 2026-10-24: waypoints on a nearly straight run (a planned straight rise, a curve sampled densely) are driven
+    # through without stopping; the arm comes to rest only at real corners (CORNER_DEG) and at the end
+    for run in (_corner_runs(W) if len(W) >= 2 else []):
+        P = W[run]
+        if len(P) == 2:
+            t, q = min_jerk(P[0], P[1], lim.max_joint_vel_rad_s, lim.max_joint_acc_rad_s2, rate_hz, t_min=t_min)
+            name = f"segment {idx[run[1]]}"
+        else:
+            t, q = _run_motion(P, lim.max_joint_vel_rad_s, lim.max_joint_acc_rad_s2, rate_hz, t_min)
+            name = f"segments {idx[run[1]]}-{idx[run[-1]]}"
         if ts:                                    # the segment boundary sample is the previous segment's last
             t, q = t[1:], q[1:]
         i0 = sum(len(x) for x in ts)
         ts.append(t + t_off)
         qs.append(q)
-        segs.append((f"segment {k + 1}", i0, i0 + len(t)))
+        segs.append((name, i0, i0 + len(t)))
         t_off = float(ts[-1][-1])
     if not ts:
         raise PlanError("the path does not move")
