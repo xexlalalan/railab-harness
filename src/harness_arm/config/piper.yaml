@@ -53,3 +53,8 @@ piper:
     traj_tracking_error_rad: 0.15  # freeze + fail when |measured - commanded| exceeds this on any joint
     traj_start_tol_rad: 0.05       # the first point must be this close to the current joints
     traj_max_points: 20000
+    # --- e-stop button (2026-10-24): its normally-closed contact carries the 5 V of this USB mouse (lsusb vendor:product);
+    # pressed = the mouse gone = goals cancelled, joints 1-6 held where they are, every command refused until it is out
+    # and Hold clears the fault. An unplugged mouse counts as pressed. "" = no button watched (the node says so at start)
+    estop_usb_id: "04f2:1459"      # HP USB Optical Mouse on the hub next to the CAN adapter (USB 1-8.2 on 2026-10-24)
+    estop_poll_s: 0.02

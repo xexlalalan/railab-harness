@@ -37,6 +37,13 @@ Rules: enable state comes from joint feedback, never from an SDK return value.
 Lost feedback or any error bit cancels the running goal and latches a fault; the
 node NEVER disables the arm on its own (it keeps holding its last target; INCIDENT
 2026-09-17 in PROJECT_SPEC.md). One motion goal at a time.
+
+E-stop button (2026-10-24, PROJECT_SPEC.md "Emergency stop button"): its normally-closed contact carries the 5 V
+of a USB mouse (estop_usb_id); pressed, the mouse vanishes from the kernel's USB list. A thread of its own polls
+for it every estop_poll_s: gone -> the running goal is cancelled, joints 1-6 are re-targeted to where they are
+(and again every poll while pressed), the gripper keeps its last command, the fault latches and every command is
+refused until the button is out again and /arm/hold (or /arm/enable) clears the fault. Never the controller's own
+emergency stop (the arm sinks) or its resume (the arm drops). A mouse that is unplugged counts as pressed.
 """
 import math
 import os
@@ -71,6 +78,46 @@ JOINT_NAMES = ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
 # record" (STOP_RECORDING) is what "end drag teaching" leaves behind, not a mode: reading it as teach mode made Hold
 # fire the controller's resume, which unpowered the arm (2026-10-24)
 TEACH_ACTIVE = ("START_RECORDING", "EXECUTE_TRAJECTORY", "PAUSE_EXECUTION", "RESUME_EXECUTION", "MOVE_TO_START")
+
+USB_SYSFS = "/sys/bus/usb/devices"      # where the kernel lists USB devices (idVendor / idProduct files)
+ESTOP_PRESSED = "e-stop pressed"        # the fault starts with this while the button is pressed (gateway: state.arm.estop)
+
+
+class UsbWatch:
+    """Is the USB device vendor:product plugged in and powered? From sysfs (no udev): a cheap look where it was last
+    seen, a scan of the list when it is not there (it comes back at the same port, re-enumerated, when the 5 V returns)."""
+
+    def __init__(self, usb_id, root=USB_SYSFS):
+        self.vendor, self.product = [x.strip().lower() for x in str(usb_id).split(":", 1)]
+        self.root = root
+        self.path = None                     # the device's sysfs directory the last time it was seen
+
+    @staticmethod
+    def _read(path):
+        try:
+            with open(path) as f:
+                return f.read().strip().lower()
+        except OSError:
+            return None
+
+    def _at(self, d):
+        return (self._read(os.path.join(d, "idVendor")) == self.vendor
+                and self._read(os.path.join(d, "idProduct")) == self.product)
+
+    def present(self):
+        if self.path and self._at(self.path):
+            return True
+        try:
+            names = os.listdir(self.root)
+        except OSError:
+            names = []
+        for n in sorted(names):
+            d = os.path.join(self.root, n)
+            if ":" not in n and self._at(d):   # "1-8.2:1.0" is an interface of a device, not a device
+                self.path = d
+                return True
+        self.path = None
+        return False
 
 
 def _name(x):
@@ -136,6 +183,7 @@ class PiperNode(Node):
             ("traj_start_tol_rad", 0.05), ("traj_max_points", 20000),
             ("smooth_joint_vel_rad_s", 3.0), ("smooth_tool_vel_m_s", 0.5), ("smooth_tool_vel_rad_s", 3.0),
             ("smooth_acc_per_s", 2.0), ("smooth_knot_s", 0.04), ("smooth_knot_jump_rad", 0.15),
+            ("estop_usb_id", ""), ("estop_poll_s", 0.02),
         ])
         self.P = {x.name: x.value for x in p}
         self.cb = ReentrantCallbackGroup()
@@ -143,6 +191,8 @@ class PiperNode(Node):
         self.motion = threading.Lock()   # one motion goal at a time
         self.speed = int(self.P["default_speed_percent"])
         self.fault = ""
+        self.estop = ""                  # the refusal while the e-stop button is pressed ("" = out)
+        self.estop_hold = None           # joints 1-6 held there while it is pressed (None: the arm was not powered)
         self.busy = False
         self.cancel_requested = False
         self.last_fb_t = 0.0
@@ -183,6 +233,10 @@ class PiperNode(Node):
         self.get_logger().info(f"piper node up on {self.P['can_channel']}, speed cap "
                                f"{self.P['max_speed_percent']} %, gripper="
                                f"{'yes' if self.ee else 'no'}")
+        if str(self.P["estop_usb_id"]).strip():
+            threading.Thread(target=self._estop_watch, name="estop", daemon=True).start()
+        else:
+            self.get_logger().warning("e-stop: no estop_usb_id set - no e-stop button is watched")
 
     # ------------------------------------------------------------------ gripper mapping
     # Fingers mounted the other way round (2026-09-18): the motor's "open" is the jaws' closed.
@@ -355,6 +409,8 @@ class PiperNode(Node):
         # refuse new goals until /arm/enable clears it.
         if not connected or s["errors"]:
             why = "feedback lost" if not connected else "error bits: " + ",".join(s["errors"])
+            if self.estop:                   # the e-stop stays the first word of the fault while it is pressed
+                why = f"{self.estop} (also: {why})"
             if self.fault != why:
                 self.get_logger().error(f"FAULT: {why} (arm left enabled, goals cancelled)")
             self.fault = why
@@ -412,6 +468,8 @@ class PiperNode(Node):
 
     def _refuse(self):
         """Reason a motion/enable must be refused, or None."""
+        if self.estop:
+            return self.estop
         s = self.snap or self._read()
         if s["age"] >= float(self.P["watchdog_s"]):
             return "no CAN feedback"
@@ -445,8 +503,17 @@ class PiperNode(Node):
             return f"tip would be {clearance*1000:.1f} mm above the floor (margin {self.P['floor_margin_m']*1000:.0f} mm)"
         return None
 
+    def _refused_estop(self, res):
+        """While the e-stop button is pressed every command is refused (reads go on): fills res, returns True."""
+        if not self.estop:
+            return False
+        res.success, res.message = False, "refused: " + self.estop
+        return True
+
     # ------------------------------------------------------------------ services
     def srv_enable(self, req, res):
+        if self._refused_estop(res):
+            return res
         s = self._read()
         if s["errors"] or s["age"] >= float(self.P["watchdog_s"]):
             res.success, res.message = False, "refused: " + ("errors: " + ",".join(s["errors"]) if s["errors"] else "no CAN feedback")
@@ -484,6 +551,8 @@ class PiperNode(Node):
             self.robot.disable(j)
 
     def srv_disable(self, req, res):
+        if self._refused_estop(res):         # the arm stays held while the button is pressed
+            return res
         self.cancel_requested = True
         with self.sdk:
             self._disable_joints()
@@ -493,6 +562,8 @@ class PiperNode(Node):
         return res
 
     def srv_hold(self, req, res):
+        if self._refused_estop(res):         # already held; the fault clears only once the button is out
+            return res
         s = self._read()
         if s["teach"] and s["age"] < float(self.P["watchdog_s"]):
             return self._hold_from_teach(res)
@@ -549,6 +620,8 @@ class PiperNode(Node):
         """Take the controller out of teach (drag) mode (2026-10-24: found in TEACHING_MODE, every command refused,
         no button found): _leave_teach. Nothing is enabled or moved here: the joints stay as the controller leaves
         them (support the arm); /arm/hold powers them."""
+        if self._refused_estop(res):
+            return res
         if not self._read()["teach"]:
             res.success, res.message = True, "not in teach mode"
             return res
@@ -628,8 +701,9 @@ class PiperNode(Node):
         everything beyond it: the caller supports the arm. 7 = gripper."""
         js = [int(j) for j in req.joints] or [1, 2, 3, 4, 5, 6]
         bad = [j for j in js if j < 1 or j > 7]
-        if bad:
-            res.success, res.message = False, f"invalid joint numbers {bad} (1..6, 7 = gripper)"
+        if bad or self._refused_estop(res):
+            if bad:
+                res.success, res.message = False, f"invalid joint numbers {bad} (1..6, 7 = gripper)"
             res.joints_enabled = self.snap.get("enabled", [False] * 6)
             return res
         if req.enable:
@@ -685,8 +759,9 @@ class PiperNode(Node):
 
     def srv_gripper_release(self, req, res):
         """Un-power the GRIPPER motor only (jaws go free); the arm keeps holding."""
-        if self.ee is None:
-            res.success, res.message = False, "no gripper"
+        if self.ee is None or self._refused_estop(res):
+            if self.ee is None:
+                res.success, res.message = False, "no gripper"
             return res
         with self.sdk:
             ok = self.ee.disable_gripper()
@@ -706,8 +781,9 @@ class PiperNode(Node):
 
     def srv_gripper_enable(self, req, res):
         """Re-power the gripper motor where the jaws are now (an item between them stays held)."""
-        if self.ee is None:
-            res.success, res.message = False, "no gripper"
+        if self.ee is None or self._refused_estop(res):
+            if self.ee is None:
+                res.success, res.message = False, "no gripper"
             return res
         try:
             with self.sdk:
@@ -740,8 +816,9 @@ class PiperNode(Node):
         """Two-point calibration of the mm reading: "closed" (jaws pushed shut by hand = gap 0), then "open" at a
         caliper-measured gap; the new mapping is applied at once and saved (GripperCalibrate.srv)."""
         res.success = False
-        if self.ee is None:
-            res.message = "no gripper"
+        if self.ee is None or self._refused_estop(res):
+            if self.ee is None:
+                res.message = "no gripper"
             return res
         step = str(req.step).strip().lower()
         if step == "cancel":
@@ -818,8 +895,9 @@ class PiperNode(Node):
         return res
 
     def srv_gripper(self, req, res):
-        if self.ee is None:
-            res.success, res.message = False, "no gripper"
+        if self.ee is None or self._refused_estop(res):
+            if self.ee is None:
+                res.success, res.message = False, "no gripper"
             return res
         width = max(0.0, min(float(self.P["gripper_max_m"]), req.width_m))
         force = req.force if req.force > 0 else float(self.P["gripper_force"])
@@ -866,11 +944,73 @@ class PiperNode(Node):
         return CancelResponse.ACCEPT
 
     def _stop_here(self):
-        """Freeze the arm where it is: re-target the current joints."""
+        """Freeze the arm where it is: re-target the current joints (the e-stop's own hold target while it is pressed)."""
         s = self._read()
-        if s["joints"] is not None and all(s["enabled"]):
+        target = self.estop_hold if (self.estop and self.estop_hold is not None) else s["joints"]
+        if target is not None and all(s["enabled"]):
             with self.sdk:
-                self.robot.move_j(list(s["joints"]))
+                self.robot.move_j(list(target))
+
+    # ------------------------------------------------------------------ e-stop button (2026-10-24)
+    # The button's normally-closed contact carries the 5 V of a USB mouse (estop_usb_id): pressed, the mouse vanishes
+    # from the kernel's USB list; a cut wire or a pulled plug count as pressed too. A thread of its own (not a ROS
+    # timer: it runs even when every executor thread is busy) polls sysfs every estop_poll_s. After the code another
+    # agent wrote for the same button (piper_llm_skills, branch emergency-freeze: a guard process replaying the joint
+    # feedback as MOVE J targets on the CAN bus); here the arm node is the only CAN writer, so the hold is its own.
+    def _estop_watch(self):
+        watch = UsbWatch(str(self.P["estop_usb_id"]))
+        period = max(0.005, float(self.P["estop_poll_s"]))
+        present = watch.present()
+        if present:
+            self.get_logger().info(f"e-stop: watching USB {self.P['estop_usb_id']} at {watch.path} every "
+                                   f"{period * 1000:.0f} ms (present: the button is out)")
+        first = True
+        while True:
+            try:
+                self._estop_step(present, first)
+            except Exception as e:  # noqa: BLE001  the watch must never die
+                self.get_logger().error(f"e-stop watch: {e}")
+            first = False
+            time.sleep(period)
+            present = watch.present()
+
+    def _estop_step(self, present, first=False):
+        """One pass of the watch: trip when the mouse is gone, replay the hold while it is, release when it is back."""
+        if not present and not self.estop:
+            self._estop_trip(first)
+        elif present and self.estop:
+            self._estop_release()
+        elif self.estop and self.estop_hold is not None:
+            with self.sdk:
+                self.robot.move_j(list(self.estop_hold))
+
+    def _estop_trip(self, first=False):
+        """The button pressed: cancel the running goal, latch the fault, hold joints 1-6 where they are (re-sent every
+        poll while pressed); the gripper keeps its last command (a held item stays held). An arm that is not powered
+        is not powered here (it is in the operator's hands): nothing is sent then. Never the controller's own
+        emergency stop (the arm sinks) or its resume (the arm drops)."""
+        self.estop = (f"{ESTOP_PRESSED}" + (" (or its USB mouse is unplugged)" if first else "")
+                      + ": the arm is held where it was; twist the button out, then Hold")
+        self.cancel_requested = True
+        self.fault = self.estop
+        s = self._read()
+        if s["joints"] is not None and s["age"] < float(self.P["watchdog_s"]) and all(s["enabled"]):
+            self.estop_hold = list(s["joints"])
+            with self.sdk:
+                self.robot.move_j(list(self.estop_hold))
+            how = "holding joints at " + str([round(math.degrees(v), 1) for v in self.estop_hold]) + " deg"
+        else:
+            self.estop_hold = None
+            how = "nothing sent: " + ("no CAN feedback" if s["joints"] is None or s["age"] >= float(self.P["watchdog_s"])
+                                      else "the arm is not powered (it stays in the operator's hands)")
+        self.get_logger().error(f"E-STOP: {self.estop}; goals cancelled, every command refused; {how}")
+
+    def _estop_release(self):
+        """The button twisted out (the mouse is back): the hold stays the controller's last target and the fault stays
+        latched until /arm/hold or /arm/enable - nothing moves by itself."""
+        self.estop, self.estop_hold = "", None
+        self.fault = "e-stop was pressed: press Hold to go on"
+        self.get_logger().warning("e-stop released: the arm keeps holding where it was; Hold clears the fault")
 
     # ------------------------------------------------------------------ smooth moves (2026-10-24)
     # Every motion is a timed trajectory streamed at traj_rate_hz (_stream): minimum-jerk profiles, so the arm
@@ -1095,6 +1235,8 @@ class PiperNode(Node):
         self.cancel_requested = False
         worst, tt, bad = 0.0, 0.0, 0
         try:
+            if self.estop:                          # pressed between the goal's acceptance and here
+                return False, "refused: " + self.estop, 0.0, 0.0
             s = self._read()
             if not all(s["enabled"]):
                 return False, "arm is not enabled (harness arm hold first)", 0.0, 0.0
@@ -1119,8 +1261,10 @@ class PiperNode(Node):
                 with self.sdk:
                     self.robot.move_j(cmd)
                 s = self._read()
-                if self.cancel_requested or gh.is_cancel_requested:
+                if self.estop or self.cancel_requested or gh.is_cancel_requested:
                     self._stop_here()
+                    if self.estop:
+                        return False, f"{ESTOP_PRESSED} at {tt:.1f} s of {T_end:.1f} s: held where it was", worst, tt
                     return False, f"cancelled at {tt:.1f} s of {T_end:.1f} s; stopped where it was", worst, tt
                 if s["errors"]:
                     self._stop_here()
@@ -1161,9 +1305,10 @@ class PiperNode(Node):
             while time.time() < t_end:
                 time.sleep(0.05)
                 s = self._read()
-                if self.cancel_requested or gh.is_cancel_requested:
+                if self.estop or self.cancel_requested or gh.is_cancel_requested:
                     self._stop_here()
-                    return False, "cancelled while settling", worst, T_end
+                    return False, (f"{ESTOP_PRESSED} while settling: held where it was" if self.estop
+                                   else "cancelled while settling"), worst, T_end
                 if s["joints"] is not None:
                     e = max(abs(a - b) for a, b in zip(s["joints"], final))
                     settled = settled + 1 if e <= jtol else 0

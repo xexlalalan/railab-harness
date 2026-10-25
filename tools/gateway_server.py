@@ -32,6 +32,8 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   v4 (2026-10-24, spec "Release = the controller's drag-teach mode"): arm.release stays joints 1-6 limp — the arm's
   drag-teach mode is its wrist button (torque released) and cannot be entered from the PC; arm.hold also leaves
   that teach mode (the controller's resume only when every joint is unpowered already) and holds
+  v5 (2026-10-24, spec "Emergency stop button"): state.arm.estop — true while the e-stop button is pressed (the arm
+  node holds the arm where it is and refuses every command; out again, the fault stays until arm.hold)
 
 The gateway owns no hardware: it is an rclpy client of the module nodes, like harness_cmd.py. Releasing the
 arm is the explicit arm.release (operator 2026-10-23; before that it was CLI-only). `stop` is accepted from
@@ -52,7 +54,7 @@ sys.path[:0] = [os.path.join(ROOT, "src", "harness_calibration"), os.path.join(R
 KIN_FILE = os.path.join(ROOT, "calib", "kinematics.yaml")
 HANDEYE_FILE = os.path.join(ROOT, "calib", "handeye.yaml")
 TEACH_TAGS = os.path.join(ROOT, "calib", "teach", "tags.yaml")      # teach.fine results, by tag id
-VERSION = 4
+VERSION = 5
 DEADMAN_S = 3.0
 HOLDER_STALE_S = 10.0     # a control holder silent this long (no ping, no command) can be taken over
 JOINTS = ["joint%d" % i for i in range(1, 7)]
@@ -564,7 +566,8 @@ class Gateway:
         if a is not None:
             arm.update(enabled=list(a.joints_enabled), all_enabled=a.all_enabled, ctrl_mode=a.ctrl_mode,
                        arm_status=a.arm_status, busy=a.busy, fault=a.fault, errors=list(a.errors),
-                       teach=a.teach_mode, feedback_age_s=round(a.feedback_age_s, 3), speed_percent=a.speed_percent)
+                       teach=a.teach_mode, feedback_age_s=round(a.feedback_age_s, 3), speed_percent=a.speed_percent,
+                       estop=a.fault.startswith("e-stop pressed"))    # piper_node.ESTOP_PRESSED: the button is pressed
         if q is not None:
             from harness_arm.kinematics import xyzrpy_from_T
             x = xyzrpy_from_T(self.kin.fk(q))
