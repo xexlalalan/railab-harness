@@ -14,6 +14,12 @@ so the RealSense "inverse Brown-Conrady" model is honoured exactly.
 center_fraction x image height) AND mean edge length within [min_size_px,
 max_size_px] (a standoff gate). The node only reports it; whoever teaches
 decides how long it must hold.
+
+Families (2026-10-24): `families` lists the AprilTag families to decode — one
+OpenCV detector per family runs on every frame (a detector identifies codes of
+its own dictionary only, so a 36h11 print was invisible while the node ran
+16h5 alone); every detection carries its family. Black-square sizes per
+family and id in `tag_sizes` ("family:id=size_m"); `tag_size_m` otherwise.
 """
 import threading
 import time
@@ -39,27 +45,47 @@ class TagNode(Node):
     def __init__(self):
         super().__init__("tag_node")
         prm = self.declare_parameters("", [
-            ("width", 1280), ("height", 720), ("fps", 30), ("family", "tag36h11"),
-            ("tag_size_m", 0.05), ("tag_sizes_ids", [0]), ("tag_sizes_m", [0.0]),
+            ("width", 1280), ("height", 720), ("fps", 30), ("family", "tag36h11"), ("families", ["tag36h11"]),
+            ("tag_size_m", 0.05), ("tag_sizes_ids", [0]), ("tag_sizes_m", [0.0]), ("tag_sizes", [""]),
             ("center_fraction", 0.3333), ("min_size_px", 50), ("max_size_px", 260),
             ("image_rate_hz", 10.0), ("jpeg_quality", 70), ("exposure_us", 0),
             ("error_correction_rate", 0.0),
         ])
         self.P = {x.name: x.value for x in prm}
-        self.sizes = {int(i): float(s) for i, s in zip(self.P["tag_sizes_ids"] or [], self.P["tag_sizes_m"] or []) if s > 0}
+        # black-square edge per (family, id) from tag_sizes "family:id=size_m"; the older tag_sizes_ids / tag_sizes_m
+        # pairs count for any family; tag_size_m for everything else
+        self.sizes_any = {int(i): float(s) for i, s in zip(self.P["tag_sizes_ids"] or [], self.P["tag_sizes_m"] or []) if s > 0}
+        self.sizes = {}
+        for e in self.P["tag_sizes"] or []:
+            e = str(e).strip()
+            if not e:
+                continue
+            try:
+                fam, rest = e.split(":", 1)
+                i, s = rest.split("=", 1)
+                self.sizes[(fam.strip(), int(i))] = float(s)
+            except ValueError:
+                raise ValueError(f"tag_sizes entry {e!r}: expected family:id=size_m, e.g. tag36h11:3=0.024") from None
+        fams = [str(f) for f in (self.P["families"] or []) if str(f).strip()] or [str(self.P["family"])]
+        bad = [f for f in fams if f not in FAMILIES]
+        if bad:
+            raise ValueError(f"unknown tag families {bad}: choose from {sorted(FAMILIES)}")
 
         self.pub_tags = self.create_publisher(TagArray, "/camera/tags", 10)
         self.pub_img = self.create_publisher(CompressedImage, "/camera/image/compressed", 5)
         self.pub_info = self.create_publisher(CameraInfo, "/camera/camera_info", 5)
 
-        d = cv2.aruco.getPredefinedDictionary(FAMILIES[self.P["family"]])
-        dp = cv2.aruco.DetectorParameters()
-        dp.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-        dp.adaptiveThreshWinSizeMin = 23          # one threshold scale: 5x faster on cluttered 720p scenes
-        dp.adaptiveThreshWinSizeMax = 23
-        dp.minMarkerPerimeterRate = 0.04          # ignore candidates smaller than ~13 px edge
-        dp.errorCorrectionRate = float(self.P["error_correction_rate"])  # 0 = exact code match (16h5 mis-decodes otherwise)
-        self.det = cv2.aruco.ArucoDetector(d, dp)
+        self.dets = []                            # one detector per family, run on every frame
+        for fam in fams:
+            d = cv2.aruco.getPredefinedDictionary(FAMILIES[fam])
+            dp = cv2.aruco.DetectorParameters()
+            dp.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+            dp.adaptiveThreshWinSizeMin = 23          # one threshold scale: 5x faster on cluttered 720p scenes
+            dp.adaptiveThreshWinSizeMax = 23
+            dp.minMarkerPerimeterRate = 0.04          # ignore candidates smaller than ~13 px edge
+            dp.errorCorrectionRate = float(self.P["error_correction_rate"])  # 0 = exact code match (16h5 mis-decodes otherwise)
+            self.dets.append((fam, cv2.aruco.ArucoDetector(d, dp)))
+        self.P["family"] = fams[0]
 
         self._open_camera()
         self.frames = 0
@@ -68,8 +94,10 @@ class TagNode(Node):
         self.th = threading.Thread(target=self._loop, daemon=True)
         self.th.start()
         self.create_timer(5.0, self._report)
-        self.get_logger().info(f"tag_node up: {self.P['width']}x{self.P['height']}@{self.P['fps']} "
-                               f"{self.P['family']} default size {self.P['tag_size_m']} m")
+        self.get_logger().info(f"tag_node up: {self.P['width']}x{self.P['height']}@{self.P['fps']} families "
+                               f"{[f for f, _ in self.dets]}, default size {self.P['tag_size_m']} m, sizes "
+                               + ", ".join(f"{f}:{i}={s * 1000:g} mm" for (f, i), s in sorted(self.sizes.items()))
+                               + ("".join(f", any:{i}={s * 1000:g} mm" for i, s in sorted(self.sizes_any.items()))))
 
     # ------------------------------------------------------------------ camera
     def _open_camera(self):
@@ -129,7 +157,11 @@ class TagNode(Node):
             img = np.asanyarray(cf.get_data())
             dep = np.asanyarray(df.get_data()) if df else None
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            corners, ids, _ = self.det.detectMarkers(gray)
+            found = []                            # (family, corners, id) over every family's detector
+            for fam, det in self.dets:
+                corners, ids, _ = det.detectMarkers(gray)
+                if ids is not None:
+                    found += [(fam, c, int(i)) for c, i in zip(corners, ids.flatten())]
             now = self.get_clock().now().to_msg()
 
             msg = TagArray()
@@ -137,10 +169,10 @@ class TagNode(Node):
             msg.header.frame_id = "gripper_cam_optical"
             msg.image_width, msg.image_height = W, H
             msg.center_fraction = float(self.P["center_fraction"])
-            if ids is not None:
-                for c, i in zip(corners, ids.flatten()):
+            if found:
+                for fam, c, i in found:
                     pts = c.reshape(4, 2)
-                    size = float(self.sizes.get(int(i), self.P["tag_size_m"]))
+                    size = float(self.sizes.get((fam, i), self.sizes_any.get(i, self.P["tag_size_m"])))
                     h = size / 2.0
                     obj = np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]], np.float64)
                     ok, rvec, tvec = cv2.solvePnP(obj, self._normalised(pts), np.eye(3), None,
@@ -150,7 +182,7 @@ class TagNode(Node):
                     proj, _ = cv2.projectPoints(obj, rvec, tvec, np.eye(3), None)
                     err = float(np.mean(np.linalg.norm(proj.reshape(4, 2) - self._normalised(pts), axis=1))) * self.intr.fx
                     t = TagDetection()
-                    t.id, t.family, t.size_m = int(i), self.P["family"], size
+                    t.id, t.family, t.size_m = int(i), fam, size
                     cx, cy = pts.mean(axis=0)
                     t.center_px = [float(cx), float(cy)]
                     t.corners_px = [float(v) for v in pts.flatten()]
@@ -179,10 +211,11 @@ class TagNode(Node):
                 ov = img.copy()
                 any_set = any(t.in_center_square for t in msg.tags)
                 cv2.rectangle(ov, sq[:2], sq[2:], (0, 200, 0) if any_set else (0, 200, 255), 2)
-                if ids is not None:
-                    cv2.aruco.drawDetectedMarkers(ov, corners, ids)
+                if found:
+                    cv2.aruco.drawDetectedMarkers(ov, [c for _, c, _ in found], np.array([[i] for _, _, i in found], np.int32))
                 for t in msg.tags:
-                    cv2.putText(ov, f"id{t.id} {t.distance_m*1000:.0f}mm{' d' + format(t.depth_m*1000, '.0f') if t.depth_m else ''} {t.size_px:.0f}px{' SET' if t.in_center_square else ''}",
+                    fam = t.family[3:] if len(self.dets) > 1 else ""          # "36h11 id3" when more than one family runs
+                    cv2.putText(ov, f"{fam + ' ' if fam else ''}id{t.id} {t.distance_m*1000:.0f}mm{' d' + format(t.depth_m*1000, '.0f') if t.depth_m else ''} {t.size_px:.0f}px{' SET' if t.in_center_square else ''}",
                                 (int(t.center_px[0]) + 10, int(t.center_px[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                                 (0, 255, 0) if t.in_center_square else (0, 165, 255), 2)
                 okj, buf = cv2.imencode(".jpg", ov, [cv2.IMWRITE_JPEG_QUALITY, int(self.P["jpeg_quality"])])

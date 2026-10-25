@@ -3,12 +3,16 @@ tag_node:
     width: 1280
     height: 720
     fps: 30
-    family: "tag16h5"           # the lab tags are 16h5 (ID 7 on the test tag)
-    tag_size_m: 0.05            # Bunny tags (16h5): 50 mm black square (operator, 2026-09-17)
-    tag_sizes_ids: [7, 5, 3, 8, 2]    # per-id overrides (black-square edge)
-    tag_sizes_m: [0.0375, 0.0358, 0.0075, 0.0347, 0.0225] # 2026-10-23 the twin's tag list (printed x 6/8): Bunny 7 (50 mm print), 3 platform (10), 5 (35.8 by the 2026-09-18 range-scale test; the twin says a 40 mm print = 30 - ruler check pending); holder 2 (30). 8 = wall tag 34.7 (stereo depth)
+    families: ["tag16h5", "tag36h11"]   # one detector per family on every frame (2026-10-24): the lab's tags are 16h5; the Bunny platform's tag 3 is a 36h11 print
+    family: "tag16h5"           # (only when `families` is empty)
+    tag_size_m: 0.05            # black-square edge of a tag with no entry below (the Bunny's 16h5 tags: 50 mm print, 37.5 black)
+    # black-square edge per family and id. 16h5 = printed x 6/8: Bunny 7 (50 mm print), 5 (35.8 by the 2026-09-18 range-scale
+    # test; the twin says a 40 mm print = 30 - ruler check pending), holder 2 (30 mm print), 8 = wall tag 34.7 (stereo depth).
+    # 36h11 = printed x 8/10: the Bunny platform's tag 3 (2026-10-24, was a 10 mm 16h5 print): a 27.5 mm print (the twin's
+    # entry) in the platform's 30.5 mm pocket -> 22 mm black; a ruler check of the black square settles it
+    tag_sizes: ["tag16h5:7=0.0375", "tag16h5:5=0.0358", "tag16h5:8=0.0347", "tag16h5:2=0.0225", "tag36h11:3=0.022"]
     center_fraction: 0.3333     # central square side = fraction of image height
-    min_size_px: 40             # "set" needs mean edge length within [min, max] px (standoff gate); 40 for the 7.5 mm platform tag
+    min_size_px: 40             # "set" needs mean edge length within [min, max] px (standoff gate); 40 was for the old 7.5 mm platform tag
     max_size_px: 260
     image_rate_hz: 10.0         # /camera/image/compressed publish rate (with overlay)
     jpeg_quality: 70
