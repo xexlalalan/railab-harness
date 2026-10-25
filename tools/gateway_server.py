@@ -9,7 +9,7 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   {"id": 3, "cmd": "take_control"} / "release_control" / "ping" / "stop"
   {"id": 4, "cmd": "arm.check_j", "args": {"joints_deg": [...]}}     dry run, nothing moves
   {"id": 5, "cmd": "arm.move_j", "args": {"joints_deg": [...], "speed_percent": 10}}
-  {"id": 6, "cmd": "arm.hold"} / "arm.gripper" {gap_mm, force_n} / "bunny.housing" {to} / "bunny.platform" {steps}
+  {"id": 6, "cmd": "arm.hold"} / "arm.gripper" {gap_mm, force_n, speed_mm_s?: ramped, else full speed} / "bunny.housing" {to} / "bunny.platform" {steps}
   {"id": 7, "cmd": "arm.jog_pose", "args": {"tip_mm_deg": [x, y, z, rx, ry, rz], "speed_percent": 10}}
   {"id": 8, "cmd": "arm.jog_gripper", "args": {"gap_mm": 30, "force_n": 1}}
       LIVE driving from the twin's sliders: answered at once; the LATEST target wins — the gateway moves the
@@ -49,6 +49,7 @@ import json, math, os, secrets, signal, socketserver, subprocess, sys, threading
 PORT = int(os.environ.get("GATEWAY_PORT", 7803))
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KEY_FILE = os.path.expanduser("~/.config/railab-harness/gateway.key")
+GRIP_RAMP_STEP_M = 0.0015       # arm.gripper speed_mm_s: the ramp's step (within the node's 2 mm tolerance), one every step / speed s
 PIPER_YAML = os.path.join(ROOT, "src", "harness_arm", "config", "piper.yaml")
 # the calibration / planner packages from source, so a new module there needs no colcon rebuild
 sys.path[:0] = [os.path.join(ROOT, "src", "harness_calibration"), os.path.join(ROOT, "src", "harness_planner")]
@@ -921,8 +922,24 @@ class Conn(socketserver.StreamRequestHandler):
         if cmd == "arm.gripper":
             self.need("control")
             from harness_msgs.srv import SetGripper
-            r = gw.call(SetGripper, "/arm/gripper", SetGripper.Request(width_m=float(a["gap_mm"]) / 1000.0,
-                                                                       force=float(a.get("force_n") or 0.0)), 20)
+            gap, force = float(a["gap_mm"]) / 1000.0, float(a.get("force_n") or 0.0)
+            speed = float(a.get("speed_mm_s") or 0.0) / 1000.0
+            g = gw.fresh("grip", 2.0)
+            if speed > 0 and g is not None:
+                # a moderate closing / opening speed (twin 2026-10-25: closed at full speed the vial was gripped wrong):
+                # the gripper has no speed setting, so the target gap is RAMPED from where the jaws are at `speed`,
+                # a GRIP_RAMP_STEP_M step every step / speed seconds (each step's service call returns at once: within the node's
+                # tolerance); the last call is the real target, with the node's stall detection as before
+                w, t_last = float(g.width_m), time.time()
+                while abs(gap - w) > GRIP_RAMP_STEP_M:
+                    w += (GRIP_RAMP_STEP_M if gap > w else -GRIP_RAMP_STEP_M)
+                    gw.call(SetGripper, "/arm/gripper", SetGripper.Request(width_m=w, force=force, timeout_s=2.0), 10)
+                    t_last += GRIP_RAMP_STEP_M / speed
+                    time.sleep(max(0.0, t_last - time.time()))
+                    gn = gw.fresh("grip", 2.0)
+                    if gn is not None and gap < w and float(gn.width_m) > w + 4 * GRIP_RAMP_STEP_M:
+                        break                                    # closing: the jaws stopped on something — let the final call judge
+            r = gw.call(SetGripper, "/arm/gripper", SetGripper.Request(width_m=gap, force=force), 20)
             if not r.success:
                 raise RuntimeError(r.message)
             return {"gap_mm": round(r.width_m * 1000, 2), "stalled": r.stalled, "message": r.message}
