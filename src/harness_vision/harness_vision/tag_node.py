@@ -87,7 +87,11 @@ class TagNode(Node):
             self.dets.append((fam, cv2.aruco.ArucoDetector(d, dp)))
         self.P["family"] = fams[0]
 
-        self._open_camera()
+        self.pipe = None
+        try:
+            self._open_camera()
+        except Exception as e:  # noqa: BLE001  no camera at start (its cable loose, 2026-10-25): the loop waits for it
+            self.get_logger().error(f"camera: {e} - waiting for it (check its USB cable)")
         self.frames = 0
         self.last_img_t = 0.0
         self.running = True
@@ -143,6 +147,8 @@ class TagNode(Node):
         sq = (int(W / 2 - side / 2), int(H / 2 - side / 2), int(W / 2 + side / 2), int(H / 2 + side / 2))
         lo, hi = float(self.P["min_size_px"]), float(self.P["max_size_px"])
         failures = 0
+        if self.pipe is None:
+            self._reconnect()
         while self.running and rclpy.ok():
             try:
                 fr = self.pipe.wait_for_frames(2000)
@@ -243,7 +249,8 @@ class TagNode(Node):
         self.get_logger().error("camera lost: reconnecting until it is back (check its USB cable)")
         while self.running and rclpy.ok():
             try:
-                self.pipe.stop()
+                if self.pipe is not None:
+                    self.pipe.stop()
             except Exception:  # noqa: BLE001
                 pass
             time.sleep(1.0)
@@ -262,7 +269,8 @@ class TagNode(Node):
     def shutdown(self):
         self.running = False
         try:
-            self.pipe.stop()
+            if self.pipe is not None:
+                self.pipe.stop()
         except Exception:  # noqa: BLE001
             pass
 
