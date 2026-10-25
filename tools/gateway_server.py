@@ -33,7 +33,7 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   drag-teach mode is its wrist button (torque released) and cannot be entered from the PC; arm.hold also leaves
   that teach mode (the controller's resume only when every joint is unpowered already) and holds
   v5 (2026-10-24, spec "Emergency stop button"): state.arm.estop — true while the e-stop button is pressed (the arm
-  node holds the arm where it is and refuses every command; out again, the fault stays until arm.hold)
+  node holds the arm where it is and refuses every command; out again, the arm is ready at once, still holding)
 
 The gateway owns no hardware: it is an rclpy client of the module nodes, like harness_cmd.py. Releasing the
 arm is the explicit arm.release (operator 2026-10-23; before that it was CLI-only). `stop` is accepted from

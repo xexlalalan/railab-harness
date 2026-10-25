@@ -134,15 +134,15 @@ def test_pressing_the_button_holds_the_arm_where_it_is_and_refuses_every_command
     assert any(lvl == "error" and "E-STOP" in m and "holding joints" in m for lvl, m in n.lines)
 
 
-def test_twisting_it_out_keeps_the_fault_latched_until_hold():
+def test_twisting_it_out_makes_the_arm_ready_again_without_moving_it():
     n = _Node()
     n._estop_step(present=False)
     n._estop_step(present=True)
-    assert n.estop == "" and n.estop_hold is None
-    assert n.fault == "e-stop was pressed: press Hold to go on"
+    assert n.estop == "" and n.estop_hold is None and n.fault == ""
     assert n.robot.moves == [Q]                             # nothing sent on release: the controller keeps its target
-    assert "fault latched" in n._refuse()                   # goals stay refused; Hold is allowed through this one
-    assert n._refused_estop(_res()) is False
+    assert n._refuse() is None and n._refused_estop(_res()) is False   # ready: the operator's next command goes through
+    n._estop_step(present=True)
+    assert n.robot.moves == [Q] and n.fault == ""
 
 
 def test_an_unpowered_arm_is_left_in_the_operators_hands():

@@ -42,8 +42,9 @@ E-stop button (2026-10-24, PROJECT_SPEC.md "Emergency stop button"): its normall
 of a USB mouse (estop_usb_id); pressed, the mouse vanishes from the kernel's USB list. A thread of its own polls
 for it every estop_poll_s: gone -> the running goal is cancelled, joints 1-6 are re-targeted to where they are
 (and again every poll while pressed), the gripper keeps its last command, the fault latches and every command is
-refused until the button is out again and /arm/hold (or /arm/enable) clears the fault. Never the controller's own
-emergency stop (the arm sinks) or its resume (the arm drops). A mouse that is unplugged counts as pressed.
+refused until the button is out again; then the arm is ready at once, still holding where it was (nothing moves by
+itself; operator 2026-10-24: no latch until Hold). Never the controller's own emergency stop (the arm sinks) or its
+resume (the arm drops). A mouse that is unplugged counts as pressed.
 """
 import math
 import os
@@ -990,7 +991,7 @@ class PiperNode(Node):
         is not powered here (it is in the operator's hands): nothing is sent then. Never the controller's own
         emergency stop (the arm sinks) or its resume (the arm drops)."""
         self.estop = (f"{ESTOP_PRESSED}" + (" (or its USB mouse is unplugged)" if first else "")
-                      + ": the arm is held where it was; twist the button out, then Hold")
+                      + ": the arm is held where it was; twist the button out")
         self.cancel_requested = True
         self.fault = self.estop
         s = self._read()
@@ -1006,11 +1007,12 @@ class PiperNode(Node):
         self.get_logger().error(f"E-STOP: {self.estop}; goals cancelled, every command refused; {how}")
 
     def _estop_release(self):
-        """The button twisted out (the mouse is back): the hold stays the controller's last target and the fault stays
-        latched until /arm/hold or /arm/enable - nothing moves by itself."""
+        """The button twisted out (the mouse is back): the hold stays the controller's last target and the arm is ready
+        again at once - nothing moves by itself (a stopped run is started again by the operator). No latch until Hold:
+        the operator found the fault left behind a nuisance (2026-10-24); lost feedback / error bits re-latch on their own."""
         self.estop, self.estop_hold = "", None
-        self.fault = "e-stop was pressed: press Hold to go on"
-        self.get_logger().warning("e-stop released: the arm keeps holding where it was; Hold clears the fault")
+        self.fault = ""
+        self.get_logger().warning("e-stop released: the arm keeps holding where it was; ready")
 
     # ------------------------------------------------------------------ smooth moves (2026-10-24)
     # Every motion is a timed trajectory streamed at traj_rate_hz (_stream): minimum-jerk profiles, so the arm
