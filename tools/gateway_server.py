@@ -19,7 +19,8 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   {"cmd": "arm.release"}                                  joints 1-6 limp (the gripper keeps holding)
   {"cmd": "calib.handeye", "args": {"tag_id": 8}}         job: hand-eye around where the arm holds; state.calib
   {"cmd": "teach.plan_views", "args": {"from_model_deg": [...6], "backoff_mm": 40, "tilt_deg": 1.5}}   dry run
-  {"cmd": "teach.fine", "args": {"tag_id": 7, "black_mm": 37.5, "tilt_deg": 3, "views_model_deg": {...}}}   job: the cross
+  {"cmd": "teach.fine", "args": {"tag_id": 7, "black_mm": 37.5, "tilt_deg": 3, "views_model_deg": {...},
+                                 "family": "tag16h5"}}   job: the cross (family: only that family's tag, 2026-10-25)
   {"cmd": "arm.follow_joints", "args": {"waypoints_model_deg": [[...6], ...]}}   job: a planner's joint path
   {"cmd": "arm.move_linear", "args": {"delta_mm": [0, 0, 100], "speed_percent": 10}}   job: fingertip straight by delta
   v3 (2026-10-24, spec "Gripper release, hold and calibration"):
@@ -59,6 +60,11 @@ DEADMAN_S = 3.0
 HOLDER_STALE_S = 10.0     # a control holder silent this long (no ping, no command) can be taken over
 JOINTS = ["joint%d" % i for i in range(1, 7)]
 ARM_ACTIONS = ("/arm/move_j", "/arm/move_pose", "/arm/follow_trajectory")
+
+
+def tag_words(tid, family=None):
+    """'3 (36h11)' when the family is known, else '3'."""
+    return "%d (%s)" % (int(tid), str(family)[3:] if str(family).startswith("tag") else family) if family else "%d" % int(tid)
 HANDEYE_ACCEPT_RMS_MM = 3.0      # calib.handeye installs a new calibration only at or below this rms
 HANDEYE_SETTLE_S = 3.0           # wait after every hand-eye move before the images (operator: the arm shakes ~3 s)
 TEACH_VEL_RAD_S, TEACH_ACC_RAD_S2 = 0.35, 0.7     # arm.follow_joints: joint speed / acceleration of the path
@@ -213,7 +219,8 @@ class Gateway:
         out["cam_mm"] = [round(float(v) * 1000, 2) for v in Tbc[:3, 3]]
         for t in m.tags:
             Tbt = Tbc @ T_from_pose_msg(t.pose)
-            out["tags"].append({"id": int(t.id), "size_px": round(t.size_px, 1), "center_px": [round(v, 1) for v in t.center_px],
+            out["tags"].append({"id": int(t.id), "family": str(t.family), "size_px": round(t.size_px, 1),
+                                "center_px": [round(v, 1) for v in t.center_px],
                                 "distance_mm": round(t.distance_m * 1000, 1), "assumed_mm": round(t.size_m * 1000, 2),
                                 "base_mm": [round(float(v) * 1000, 2) for v in Tbt[:3, 3]],
                                 "base_R": [[round(float(v), 6) for v in row] for row in Tbt[:3, :3]],
@@ -298,9 +305,18 @@ class Gateway:
         return {"ok": not reasons, "reasons": reasons, "note": note, "backoff_mm": float(backoff_mm), "tilt_deg": float(tilt_deg),
                 "centre_model_deg": out[0]["joints_model_deg"], "views": out[1:]}
 
-    def fine(self, tid, black_mm, abort, tilt_deg=3.0, views_model_deg=None):
+    def camera_frames(self):
+        """Raise when the gripper camera sends no frames (2026-10-25: the D405 dropped off USB as the arm arrived at
+        tag 3, and the silence read as "tag 3 is not in view from here")."""
+        if self.fresh("tags", 1.0) is None:
+            last = self.last.get("tags")
+            raise RuntimeError("the gripper camera sends no frames%s: check its USB cable (the camera node reconnects by itself)"
+                               % (" (none for %.0f s)" % (time.time() - last[1]) if last else " since the gateway started"))
+
+    def fine(self, tid, black_mm, abort, tilt_deg=3.0, views_model_deg=None, family=None):
         """teach.fine: the five-view cross on tag tid from where the camera looks now (harness_calibration.fine);
-        views_model_deg {view: 6 corrected-model degrees} = go to exactly these (teach.plan_views) postures."""
+        views_model_deg {view: 6 corrected-model degrees} = go to exactly these (teach.plan_views) postures;
+        family (tag16h5 / tag36h11, what the twin's model says the tag is; 2026-10-25) = only that family's tag tid."""
         import datetime as dt, numpy as np, yaml
         from harness_calibration.fine import Aborted, cross_locate
         from harness_arm.kinematics import xyzrpy_from_T
@@ -310,16 +326,18 @@ class Gateway:
         c.wait_ready()
         if not (c.status and c.status.all_enabled):
             raise RuntimeError("the arm is not holding: press Hold first")
-        t = c.tag(tid)
+        self.camera_frames()
+        t = c.tag(tid, family=family)
         if t is None:
-            raise RuntimeError("tag %d is not in view from here" % tid)
+            raise RuntimeError("tag %s is not in view from here" % tag_words(tid, family))
         scale = (black_mm / 1000.0) / t.size_m if black_mm > 0 else 1.0
         vj = None
         if views_model_deg:
             off = list(self.kin.offsets)
             vj = {k: [math.radians(float(v)) - o for v, o in zip(q, off)] for k, q in views_model_deg.items()}
         try:
-            r = cross_locate(c, tid, self.Tfc, scale=scale, abort=abort.is_set, tilt_deg=float(tilt_deg), view_joints=vj)
+            r = cross_locate(c, tid, self.Tfc, scale=scale, abort=abort.is_set, tilt_deg=float(tilt_deg), view_joints=vj,
+                             family=family)
         except Aborted:
             raise RuntimeError(JOB.get("why") or "aborted")
         q = self.joints_rad()
@@ -877,7 +895,8 @@ class Conn(socketserver.StreamRequestHandler):
             self.need("control")
             tid, black = int(a["tag_id"]), float(a.get("black_mm") or 0.0)
             tilt, views = float(a.get("tilt_deg") or 3.0), a.get("views_model_deg") or None
-            return self.job("teach.fine", lambda ev: gw.fine(tid, black, ev, tilt, views))
+            fam = str(a.get("family") or "") or None
+            return self.job("teach.fine", lambda ev: gw.fine(tid, black, ev, tilt, views, fam))
         if cmd == "arm.move_linear":
             self.need("control")
             d = [float(v) for v in a.get("delta_mm") or []]

@@ -45,11 +45,12 @@ def cross_targets(T0, Tfc, tilt_deg=3.0):
 
 
 def cross_locate(c, tag_id, Tfc, scale=1.0, tilt_deg=3.0, frames=20, speed=10, accept_mm=3.0,
-                 min_px=40.0, abort=None, log=None, view_joints=None):
+                 min_px=40.0, abort=None, log=None, view_joints=None, family=None):
     """Returns {ok, reasons, T (4x4 base->tag, m), spread_mm, spread_deg, single_view_spread_mm,
     views [{view, base_mm, n, jitter_mm}], size_px, estimates}. Raises Aborted, RuntimeError.
     view_joints {view name: 6 joints (rad)}: go to exactly these postures (joint moves) instead of
-    solving the tilted poses here — the postures a caller has already checked (limits, floor, obstacles)."""
+    solving the tilted poses here — the postures a caller has already checked (limits, floor, obstacles).
+    family (tag16h5 / tag36h11): only that family's tag tag_id counts (2026-10-25; None = any family)."""
     abort = abort or (lambda: False)
     say = log or (lambda m: None)
 
@@ -64,9 +65,9 @@ def cross_locate(c, tag_id, Tfc, scale=1.0, tilt_deg=3.0, frames=20, speed=10, a
 
     check()
     settle()
-    t = c.tag(tag_id)
+    t = c.tag(tag_id, family=family)
     if t is None:
-        raise RuntimeError(f"tag {tag_id} is not in view from here")
+        raise RuntimeError(f"tag {tag_id}{' (' + family[3:] + ')' if family else ''} is not in view from here")
     size_px = float(t.size_px)
     T0 = c.tcp_T.copy()
     q0 = list(c.joints)
@@ -84,7 +85,7 @@ def cross_locate(c, tag_id, Tfc, scale=1.0, tilt_deg=3.0, frames=20, speed=10, a
                 say(f"{name}: move failed: {r.message}")
                 continue
             settle()
-        Ts, Tfs = c.collect_tag(tag_id, n=frames)
+        Ts, Tfs = c.collect_tag(tag_id, n=frames, family=family)
         if len(Ts) < 3:
             say(f"{name}: tag not seen - skipped")
             continue

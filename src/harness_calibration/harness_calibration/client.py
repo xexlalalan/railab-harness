@@ -22,6 +22,11 @@ from harness_msgs.srv import SetGripper
 from harness_vision.geom import T_from_pose_msg, xyzrpy_from_T
 
 
+def family_ok(t, family):
+    """Detection t is of `family` (None = any); a detection without a family (older camera node) counts for any."""
+    return not family or not getattr(t, "family", "") or t.family == family
+
+
 class HarnessClient:
     def __init__(self, name="harness_client"):
         if not rclpy.ok():
@@ -85,17 +90,19 @@ class HarnessClient:
             time.sleep(0.05)
         return time.time() - t0
 
-    def tag(self, tag_id, max_age=0.5):
-        """Latest detection of tag_id, or None."""
+    def tag(self, tag_id, max_age=0.5, family=None):
+        """Latest detection of tag_id — of `family` (tag16h5 / tag36h11) when given; a detection that names no family
+        (an older camera node) counts for any (2026-10-25) — or None."""
         if self.tags is None or time.time() - self._tags_t > max_age:
             return None
         for t in self.tags.tags:
-            if t.id == tag_id:
+            if t.id == tag_id and family_ok(t, family):
                 return t
         return None
 
-    def collect_tag(self, tag_id, n=10, timeout=3.0):
-        """Collect n distinct detections of tag_id (as 4x4 cam->tag) plus the flange poses seen with them."""
+    def collect_tag(self, tag_id, n=10, timeout=3.0, family=None):
+        """Collect n distinct detections of tag_id (of `family` when given; as 4x4 cam->tag) plus the flange poses
+        seen with them."""
         Ts, Tfs, last = [], [], None
         t0 = time.time()
         while len(Ts) < n and time.time() - t0 < timeout:
@@ -103,7 +110,7 @@ class HarnessClient:
             if m is not None and m is not last:
                 last = m
                 for t in m.tags:
-                    if t.id == tag_id:
+                    if t.id == tag_id and family_ok(t, family):
                         Ts.append(T_from_pose_msg(t.pose))
                         Tfs.append(self.tcp_T.copy())
             time.sleep(0.01)

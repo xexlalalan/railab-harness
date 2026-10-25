@@ -142,12 +142,19 @@ class TagNode(Node):
         side = float(self.P["center_fraction"]) * H
         sq = (int(W / 2 - side / 2), int(H / 2 - side / 2), int(W / 2 + side / 2), int(H / 2 + side / 2))
         lo, hi = float(self.P["min_size_px"]), float(self.P["max_size_px"])
+        failures = 0
         while self.running and rclpy.ok():
             try:
                 fr = self.pipe.wait_for_frames(2000)
+                failures = 0
             except Exception as e:  # noqa: BLE001
+                failures += 1
                 self.get_logger().error(f"camera: {e}")
-                time.sleep(0.5)
+                if failures >= 2:                 # not one late frame: the camera is gone (a USB drop) — open it again
+                    self._reconnect()
+                    failures = 0
+                else:
+                    time.sleep(0.5)
                 continue
             fr = self.align.process(fr)
             cf = fr.get_color_frame()
@@ -227,6 +234,27 @@ class TagNode(Node):
                     self.pub_img.publish(im)
                     self.info.header.stamp = now
                     self.pub_info.publish(self.info)
+
+    def _reconnect(self):
+        """The camera stopped delivering ("wait_for_frames cannot be called before start()" after a USB drop: five of
+        them in ten minutes on 2026-10-25, one as the arm arrived at a tag — and the node used to stay dead): close
+        the pipeline and open it again until it works. Nothing is published meanwhile, so the gateway reports the
+        camera offline and the twin says so instead of "tag … not in view"."""
+        self.get_logger().error("camera lost: reconnecting until it is back (check its USB cable)")
+        while self.running and rclpy.ok():
+            try:
+                self.pipe.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(1.0)
+            try:
+                self._open_camera()
+            except Exception as e:  # noqa: BLE001
+                self.get_logger().warning(f"camera: not back yet ({e})")
+                time.sleep(2.0)
+                continue
+            self.get_logger().info("camera back")
+            return
 
     def _report(self):
         self.get_logger().info(f"{self.frames / 5.0:.1f} fps"), setattr(self, "frames", 0)
