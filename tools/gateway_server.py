@@ -33,6 +33,9 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   v4 (2026-10-24, spec "Release = the controller's drag-teach mode"): arm.release stays joints 1-6 limp — the arm's
   drag-teach mode is its wrist button (torque released) and cannot be entered from the PC; arm.hold also leaves
   that teach mode (the controller's resume only when every joint is unpowered already) and holds
+  v6 (2026-10-25, the twin's "Run workflow"): {"cmd": "bunny.tare"} / {"cmd": "bunny.weigh_to", "args": {"target_g": 0.02,
+  "material": "powder", "powder": "<name or barcode id, '' = measure fresh>"}} / {"cmd": "bunny.dispense_volume",
+  "args": {"volume_ml": 10}} — jobs; `stop` aborts a dose (/bunny/abort)
   v5 (2026-10-24, spec "Emergency stop button"): state.arm.estop — true while the e-stop button is pressed (the arm
   node holds the arm where it is and refuses every command; out again, the arm is ready at once, still holding)
 
@@ -976,6 +979,38 @@ class Conn(socketserver.StreamRequestHandler):
             if not r.success:
                 raise RuntimeError(r.message)
             return {"position_steps": r.steps_done}
+        # v6 (2026-10-25, the twin's "Run workflow"): the Bunny's dosing, each THE job (one at a time, the dead-man
+        # watch on this connection; `stop` aborts a dose through /bunny/abort)
+        if cmd == "bunny.tare":
+            self.need("control")
+            return self.job("bunny.tare", lambda ev: gw.trigger("/bunny/tare", 60))
+        if cmd == "bunny.weigh_to":
+            self.need("control")
+            from harness_msgs.srv import WeighTo
+            g, mat, powder = float(a.get("target_g") or 0.0), str(a.get("material") or "powder"), str(a.get("powder") or "")
+            if not 0.0 < g <= 100.0 or mat not in ("powder", "liquid"):
+                raise ValueError("target_g must be in (0, 100] and material powder | liquid")
+
+            def weigh(ev):
+                r = gw.call(WeighTo, "/bunny/weigh_to", WeighTo.Request(target_g=g, material=mat, powder_id=powder), 1800)
+                if not r.success:
+                    raise RuntimeError("weigh_to %s: %s" % (r.outcome, r.message))
+                return {"outcome": r.outcome, "actual_g": round(r.actual_g, 5)}
+            return self.job("bunny.weigh_to", weigh)
+        if cmd == "bunny.dispense_volume":
+            self.need("control")
+            from harness_msgs.srv import DispenseVolume
+            ml = float(a.get("volume_ml") or 0.0)
+            if not 0.0 < ml <= 100.0:
+                raise ValueError("volume_ml must be in (0, 100]")
+
+            def dispense(ev):
+                r = gw.call(DispenseVolume, "/bunny/dispense_volume", DispenseVolume.Request(
+                    volume_ml=ml, density_g_per_ml=float(a.get("density_g_per_ml") or 0.0), rate=0), 600)
+                if not r.success:
+                    raise RuntimeError("dispense_volume: %s" % r.message)
+                return {"actual_ml": round(r.actual_ml, 3), "steps": r.steps}
+            return self.job("bunny.dispense_volume", dispense)
         raise ValueError("unknown cmd %r" % cmd)
 
     def job(self, kind, fn, background=False, extra=None):
