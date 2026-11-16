@@ -20,6 +20,13 @@ OpenCV detector per family runs on every frame (a detector identifies codes of
 its own dictionary only, so a 36h11 print was invisible while the node ran
 16h5 alone); every detection carries its family. Black-square sizes per
 family and id in `tag_sizes` ("family:id=size_m"); `tag_size_m` otherwise.
+
+tagStandard52h13 / tagStandard41h12 (2026-11-16): decoded by AprilTag 3 (the C
+library libapriltag through ctypes, `apriltag_*` parameters) and reported in
+the OpenCV families' convention (corner order, tag frame, pixel convention) —
+harness_vision/detect.py, where the detection and the report are pure
+functions. Without the library the node starts, says so in one line and
+decodes the OpenCV families only.
 """
 import threading
 import time
@@ -32,13 +39,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, CompressedImage
 
 from harness_msgs.msg import TagArray, TagDetection
-from harness_vision.geom import T_from_rvec_tvec, pose_msg_from_T
-
-FAMILIES = {
-    "tag36h11": cv2.aruco.DICT_APRILTAG_36h11,
-    "tag25h9": cv2.aruco.DICT_APRILTAG_25h9,
-    "tag16h5": cv2.aruco.DICT_APRILTAG_16h5,
-}
+from harness_vision.detect import AT3_INSTALL, Detector, measure, parse_tag_sizes, short_family
+from harness_vision.geom import pose_msg_from_T
 
 
 class TagNode(Node):
@@ -50,41 +52,28 @@ class TagNode(Node):
             ("center_fraction", 0.3333), ("min_size_px", 50), ("max_size_px", 260),
             ("image_rate_hz", 10.0), ("jpeg_quality", 70), ("exposure_us", 0),
             ("error_correction_rate", 0.0),
+            ("apriltag_lib", ""), ("apriltag_max_hamming", 1), ("apriltag_threads", 2), ("apriltag_decimate", 2.0),
         ])
         self.P = {x.name: x.value for x in prm}
         # black-square edge per (family, id) from tag_sizes "family:id=size_m"; the older tag_sizes_ids / tag_sizes_m
         # pairs count for any family; tag_size_m for everything else
         self.sizes_any = {int(i): float(s) for i, s in zip(self.P["tag_sizes_ids"] or [], self.P["tag_sizes_m"] or []) if s > 0}
-        self.sizes = {}
-        for e in self.P["tag_sizes"] or []:
-            e = str(e).strip()
-            if not e:
-                continue
-            try:
-                fam, rest = e.split(":", 1)
-                i, s = rest.split("=", 1)
-                self.sizes[(fam.strip(), int(i))] = float(s)
-            except ValueError:
-                raise ValueError(f"tag_sizes entry {e!r}: expected family:id=size_m, e.g. tag36h11:3=0.024") from None
+        self.sizes = parse_tag_sizes(self.P["tag_sizes"])
         fams = [str(f) for f in (self.P["families"] or []) if str(f).strip()] or [str(self.P["family"])]
-        bad = [f for f in fams if f not in FAMILIES]
-        if bad:
-            raise ValueError(f"unknown tag families {bad}: choose from {sorted(FAMILIES)}")
 
         self.pub_tags = self.create_publisher(TagArray, "/camera/tags", 10)
         self.pub_img = self.create_publisher(CompressedImage, "/camera/image/compressed", 5)
         self.pub_info = self.create_publisher(CameraInfo, "/camera/camera_info", 5)
 
-        self.dets = []                            # one detector per family, run on every frame
-        for fam in fams:
-            d = cv2.aruco.getPredefinedDictionary(FAMILIES[fam])
-            dp = cv2.aruco.DetectorParameters()
-            dp.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-            dp.adaptiveThreshWinSizeMin = 23          # one threshold scale: 5x faster on cluttered 720p scenes
-            dp.adaptiveThreshWinSizeMax = 23
-            dp.minMarkerPerimeterRate = 0.04          # ignore candidates smaller than ~13 px edge
-            dp.errorCorrectionRate = float(self.P["error_correction_rate"])  # 0 = exact code match (16h5 mis-decodes otherwise)
-            self.dets.append((fam, cv2.aruco.ArucoDetector(d, dp)))
+        # every family on every frame: OpenCV per family, AprilTag 3 once for the tagStandard ones (unknown names raise)
+        self.det = Detector(fams, error_correction_rate=float(self.P["error_correction_rate"]),
+                            apriltag_lib=str(self.P["apriltag_lib"]) or None,
+                            max_hamming=int(self.P["apriltag_max_hamming"]), threads=int(self.P["apriltag_threads"]),
+                            decimate=float(self.P["apriltag_decimate"]))
+        if self.det.missing:
+            self.get_logger().error(f"AprilTag 3 library missing: {', '.join(self.det.missing)} NOT decoded (the other "
+                                    f"families are) - install it ({AT3_INSTALL}) and restart the camera node; "
+                                    f"{next(iter(self.det.missing.values()))}")
         self.P["family"] = fams[0]
 
         self.pipe = None
@@ -99,7 +88,10 @@ class TagNode(Node):
         self.th.start()
         self.create_timer(5.0, self._report)
         self.get_logger().info(f"tag_node up: {self.P['width']}x{self.P['height']}@{self.P['fps']} families "
-                               f"{[f for f, _ in self.dets]}, default size {self.P['tag_size_m']} m, sizes "
+                               f"{self.det.families}"
+                               + (f" (AprilTag 3: {self.det.at3_path}, bits corrected {self.det.at3.hamming})"
+                                  if self.det.at3 else "")
+                               + f", default size {self.P['tag_size_m']} m, sizes "
                                + ", ".join(f"{f}:{i}={s * 1000:g} mm" for (f, i), s in sorted(self.sizes.items()))
                                + ("".join(f", any:{i}={s * 1000:g} mm" for i, s in sorted(self.sizes_any.items()))))
 
@@ -170,11 +162,7 @@ class TagNode(Node):
             img = np.asanyarray(cf.get_data())
             dep = np.asanyarray(df.get_data()) if df else None
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            found = []                            # (family, corners, id) over every family's detector
-            for fam, det in self.dets:
-                corners, ids, _ = det.detectMarkers(gray)
-                if ids is not None:
-                    found += [(fam, c, int(i)) for c, i in zip(corners, ids.flatten())]
+            found = self.det.detect(gray)         # (family, corners 4x2 in OpenCV's order, id) over every family
             now = self.get_clock().now().to_msg()
 
             msg = TagArray()
@@ -182,39 +170,18 @@ class TagNode(Node):
             msg.header.frame_id = "gripper_cam_optical"
             msg.image_width, msg.image_height = W, H
             msg.center_fraction = float(self.P["center_fraction"])
-            if found:
-                for fam, c, i in found:
-                    pts = c.reshape(4, 2)
-                    size = float(self.sizes.get((fam, i), self.sizes_any.get(i, self.P["tag_size_m"])))
-                    h = size / 2.0
-                    obj = np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]], np.float64)
-                    ok, rvec, tvec = cv2.solvePnP(obj, self._normalised(pts), np.eye(3), None,
-                                                  flags=cv2.SOLVEPNP_IPPE_SQUARE)
-                    if not ok:
-                        continue
-                    proj, _ = cv2.projectPoints(obj, rvec, tvec, np.eye(3), None)
-                    err = float(np.mean(np.linalg.norm(proj.reshape(4, 2) - self._normalised(pts), axis=1))) * self.intr.fx
-                    t = TagDetection()
-                    t.id, t.family, t.size_m = int(i), fam, size
-                    cx, cy = pts.mean(axis=0)
-                    t.center_px = [float(cx), float(cy)]
-                    t.corners_px = [float(v) for v in pts.flatten()]
-                    edges = [np.linalg.norm(pts[k] - pts[(k + 1) % 4]) for k in range(4)]
-                    t.size_px = float(np.mean(edges))
-                    T = T_from_rvec_tvec(rvec, tvec)
-                    pose_msg_from_T(T, t.pose)
-                    t.distance_m = float(np.linalg.norm(tvec))
-                    t.reproj_err_px = err
-                    t.in_center_square = bool(sq[0] <= cx <= sq[2] and sq[1] <= cy <= sq[3] and lo <= t.size_px <= hi)
-                    if dep is not None:
-                        mask = np.zeros(dep.shape, np.uint8)
-                        cv2.fillConvexPoly(mask, pts.astype(np.int32), 1)
-                        z = dep[mask == 1].astype(np.float64) * self.depth_scale
-                        z = z[(z > 0.05) & (z < 1.5)]
-                        if len(z) >= 20:
-                            t.depth_m = float(np.median(z))
-                            t.depth_size_m = float(size * t.depth_m / t.distance_m)   # foreshortening-free: S_true = S_assumed * depth / PnP range
-                    msg.tags.append(t)
+            for fam, pts, i in found:
+                size = float(self.sizes.get((fam, i), self.sizes_any.get(i, self.P["tag_size_m"])))
+                r = measure(fam, pts, i, size, self._normalised, self.intr.fx, sq, (lo, hi), dep, self.depth_scale)
+                if r is None:
+                    continue
+                t = TagDetection()
+                t.id, t.family, t.size_m = r["id"], r["family"], r["size_m"]
+                t.center_px, t.corners_px, t.size_px = r["center_px"], r["corners_px"], r["size_px"]
+                pose_msg_from_T(r["T"], t.pose)
+                t.distance_m, t.reproj_err_px, t.in_center_square = r["distance_m"], r["reproj_err_px"], r["in_center_square"]
+                t.depth_m, t.depth_size_m = r["depth_m"], r["depth_size_m"]
+                msg.tags.append(t)
             self.pub_tags.publish(msg)
             self.frames += 1
 
@@ -225,9 +192,10 @@ class TagNode(Node):
                 any_set = any(t.in_center_square for t in msg.tags)
                 cv2.rectangle(ov, sq[:2], sq[2:], (0, 200, 0) if any_set else (0, 200, 255), 2)
                 if found:
-                    cv2.aruco.drawDetectedMarkers(ov, [c for _, c, _ in found], np.array([[i] for _, _, i in found], np.int32))
+                    cv2.aruco.drawDetectedMarkers(ov, [np.asarray(c, np.float32).reshape(1, 4, 2) for _, c, _ in found],
+                                                  np.array([[i] for _, _, i in found], np.int32))
                 for t in msg.tags:
-                    fam = t.family[3:] if len(self.dets) > 1 else ""          # "36h11 id3" when more than one family runs
+                    fam = short_family(t.family) if len(self.det.families) > 1 else ""   # "36h11 id3" with several families
                     cv2.putText(ov, f"{fam + ' ' if fam else ''}id{t.id} {t.distance_m*1000:.0f}mm{' d' + format(t.depth_m*1000, '.0f') if t.depth_m else ''} {t.size_px:.0f}px{' SET' if t.in_center_square else ''}",
                                 (int(t.center_px[0]) + 10, int(t.center_px[1])), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                                 (0, 255, 0) if t.in_center_square else (0, 165, 255), 2)

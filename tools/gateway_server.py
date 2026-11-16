@@ -27,7 +27,8 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   {"cmd": "arm.gripper_release"}                          the gripper motor only goes free (the arm keeps holding)
   {"cmd": "arm.gripper_hold"}                             the gripper motor grips where the jaws are (5 N)
   {"cmd": "arm.gripper_cal", "args": {"step": "closed"}}  / {"step": "open", "gap_mm": 35.2} / {"step": "cancel"}
-  {"cmd": "teach.tag", "args": {"tag_id": 3}}             the stored fine result of a tag (calib/teach/tags.yaml)
+  {"cmd": "teach.tag", "args": {"tag_id": 3}}             the stored fine result of a tag (calib/teach/tags.yaml);
+                                                          + "family": "tag36h11" = that family's tag only (2026-11-16)
   {"cmd": "arm.teach_exit"}                               the controller out of teach (drag) mode (enables nothing)
   {"cmd": "arm.move_tip", "args": {"tip_mm_deg": [...6], "linear": true, "speed_percent": 10}}   job: fingertip to a pose
   v4 (2026-10-24, spec "Release = the controller's drag-teach mode"): arm.release stays joints 1-6 limp — the arm's
@@ -47,7 +48,7 @@ runs -> the goal is cancelled / the job aborted (the arm freezes, stays enabled)
   python3 tools/gateway_server.py          serve (process `gateway` under `harness nodes`)
   python3 tools/gateway_server.py --key    create the shared key if missing, print it (`harness gateway key`)
 """
-import json, math, os, secrets, signal, socketserver, subprocess, sys, threading, time
+import json, math, os, re, secrets, signal, socketserver, subprocess, sys, threading, time
 
 PORT = int(os.environ.get("GATEWAY_PORT", 7803))
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -58,7 +59,8 @@ PIPER_YAML = os.path.join(ROOT, "src", "harness_arm", "config", "piper.yaml")
 sys.path[:0] = [os.path.join(ROOT, "src", "harness_calibration"), os.path.join(ROOT, "src", "harness_planner")]
 KIN_FILE = os.path.join(ROOT, "calib", "kinematics.yaml")
 HANDEYE_FILE = os.path.join(ROOT, "calib", "handeye.yaml")
-TEACH_TAGS = os.path.join(ROOT, "calib", "teach", "tags.yaml")      # teach.fine results, by tag id
+TEACH_TAGS = os.path.join(ROOT, "calib", "teach", "tags.yaml")      # teach.fine results, by tag id (+ by "family:id")
+CV_FAMILIES = ("tag16h5", "tag25h9", "tag36h11")   # the only families stored before 2026-11-16 (records without a family)
 VERSION = 5
 DEADMAN_S = 3.0
 HOLDER_STALE_S = 10.0     # a control holder silent this long (no ping, no command) can be taken over
@@ -67,8 +69,9 @@ ARM_ACTIONS = ("/arm/move_j", "/arm/move_pose", "/arm/follow_trajectory")
 
 
 def tag_words(tid, family=None):
-    """'3 (36h11)' when the family is known, else '3'."""
-    return "%d (%s)" % (int(tid), str(family)[3:] if str(family).startswith("tag") else family) if family else "%d" % int(tid)
+    """'3 (36h11)' / '0 (52h13)' when the family is known, else '3'."""
+    m = re.search(r"\d+h\d+$", str(family or ""))
+    return "%d (%s)" % (int(tid), m.group(0) if m else family) if family else "%d" % int(tid)
 HANDEYE_ACCEPT_RMS_MM = 3.0      # calib.handeye installs a new calibration only at or below this rms
 HANDEYE_SETTLE_S = 3.0           # wait after every hand-eye move before the images (operator: the arm shakes ~3 s)
 TEACH_VEL_RAD_S, TEACH_ACC_RAD_S2 = 0.35, 0.7     # arm.follow_joints: joint speed / acceleration of the path
@@ -358,10 +361,15 @@ class Gateway:
                     doc = yaml.safe_load(f) or {}
             except OSError:
                 doc = {}
-            doc.setdefault("tags", {})[int(tid)] = {
+            rec = {
                 "base_to_tag_matrix": T.tolist(), "base_to_tag_xyzrpy": xyzrpy_from_T(T), "spread_mm": r["spread_mm"],
                 "spread_deg": r["spread_deg"], "black_mm": res["black_mm"], "size_px": r["size_px"], "joints_rad": q,
-                "handeye_date": self.he_info.get("date"), "date": dt.datetime.now().isoformat(timespec="seconds")}
+                "handeye_date": self.he_info.get("date"), "date": dt.datetime.now().isoformat(timespec="seconds"),
+                "family": family}
+            tags = doc.setdefault("tags", {})
+            tags[int(tid)] = rec                  # by id, as before: teach.tag without a family = the last one located
+            if family:                            # and by family + id: one number in two families (2026-11-16: 0 is
+                tags["%s:%d" % (family, int(tid))] = dict(rec)   # the Bunny's 52h13 main tag and the capper's 36h11 tag)
             os.makedirs(os.path.dirname(TEACH_TAGS), exist_ok=True)
             with open(TEACH_TAGS, "w") as f:
                 yaml.safe_dump(doc, f, sort_keys=False)
@@ -494,18 +502,26 @@ class Gateway:
             raise RuntimeError(r.message)
         return {"success": True, "message": r.message}
 
-    def stored_tag(self, tid):
+    def stored_tag(self, tid, family=None):
         """teach.tag: a tag's last accepted fine result (calib/teach/tags.yaml, written by teach.fine): where it is
-        (arm base) and the posture it was looked at from (the corrected model's degrees)."""
+        (arm base) and the posture it was looked at from (the corrected model's degrees). family (2026-11-16): that
+        family's tag tid only — its "family:id" record, else the id's record when it was located as that family (a
+        record from before 2026-11-16 names no family: it counts for the OpenCV families only)."""
         import yaml
         try:
             with open(TEACH_TAGS) as f:
                 doc = yaml.safe_load(f) or {}
         except OSError:
             doc = {}
-        rec = (doc.get("tags") or {}).get(int(tid))
+        tags = doc.get("tags") or {}
+        rec = tags.get("%s:%d" % (family, int(tid))) if family else None
+        if rec is None:
+            rec = tags.get(int(tid))
+            if rec and family and rec.get("family", "") != family and (rec.get("family") or family not in CV_FAMILIES):
+                rec = None                        # the id's last record is another family's tag
         if not rec:
-            raise RuntimeError("tag %d has not been located accurately yet (Find real positions of modules)" % int(tid))
+            raise RuntimeError("tag %s has not been located accurately yet (Find real positions of modules)"
+                               % tag_words(tid, family))
         T = rec["base_to_tag_matrix"]
         q = rec.get("joints_rad")
         return {"tag_id": int(tid), "base_mm": [round(float(T[i][3]) * 1000, 2) for i in range(3)],
@@ -910,7 +926,7 @@ class Conn(socketserver.StreamRequestHandler):
             return self.job("arm.move_linear", lambda ev: gw.move_linear(d, speed, ev))
         if cmd == "teach.tag":
             self.need("key")
-            return gw.stored_tag(int(a["tag_id"]))
+            return gw.stored_tag(int(a["tag_id"]), str(a.get("family") or "") or None)
         if cmd == "arm.move_tip":
             self.need("control")
             tip = [float(v) for v in a.get("tip_mm_deg") or []]

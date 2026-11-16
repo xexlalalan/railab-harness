@@ -3,14 +3,19 @@ tag_node:
     width: 1280
     height: 720
     fps: 30
-    families: ["tag16h5", "tag36h11"]   # one detector per family on every frame (2026-10-24): the lab's tags are 16h5; the Bunny platform's tag 3 is a 36h11 print
+    families: ["tag16h5", "tag36h11", "tagStandard52h13"]   # one detector per family on every frame (2026-10-24): the lab's tags are 16h5; the Bunny platform's tag 3 is a 36h11 print; tagStandard52h13 (2026-11-16: the Bunny's main tag 0, the studio holders, the capper) by AprilTag 3 - tagStandard41h12 works too
     family: "tag16h5"           # (only when `families` is empty)
     tag_size_m: 0.05            # black-square edge of a tag with no entry below (the Bunny's 16h5 tags: 50 mm print, 37.5 black)
     # black-square edge per family and id. 16h5 = printed x 6/8: Bunny 7 (50 mm print), 5 (35.8 by the 2026-09-18 range-scale
     # test; the twin says a 40 mm print = 30 - ruler check pending), holder 2 (30 mm print), 8 = wall tag 34.7 (stereo depth).
     # 36h11 = printed x 8/10: the Bunny platform's tag 3 (2026-10-24, was a 10 mm 16h5 print): a 27.5 mm print (the twin's
     # entry) in the platform's 30.5 mm pocket -> 22 mm black; a ruler check of the black square settles it
-    tag_sizes: ["tag16h5:7=0.0375", "tag16h5:5=0.0358", "tag16h5:8=0.0347", "tag16h5:2=0.0225", "tag36h11:3=0.022"]
+    # tagStandard52h13 = printed x 6/10 (the detector's square = the outer edge of its white ring, 6 of the tag's 10 cells:
+    # width_at_border / total_width in the library's family struct; the printed tag = all 10 cells, outer data ring included):
+    # the Bunny's main tag 0 and the studio holders' 4102-4104 = 50 mm prints -> 30 mm; the capper's 3970 = 30 mm -> 18 mm
+    tag_sizes: ["tag16h5:7=0.0375", "tag16h5:5=0.0358", "tag16h5:8=0.0347", "tag16h5:2=0.0225", "tag36h11:3=0.022",
+                "tagStandard52h13:0=0.030", "tagStandard52h13:4102=0.030", "tagStandard52h13:4103=0.030",
+                "tagStandard52h13:4104=0.030", "tagStandard52h13:3970=0.018"]
     center_fraction: 0.3333     # central square side = fraction of image height
     min_size_px: 40             # "set" needs mean edge length within [min, max] px (standoff gate); 40 was for the old 7.5 mm platform tag
     max_size_px: 260
@@ -18,3 +23,9 @@ tag_node:
     jpeg_quality: 70
     exposure_us: 0              # 0 = auto exposure
     error_correction_rate: 0.0  # exact code match; 16h5 flips IDs (7 -> 5) with the OpenCV default 0.6
+    # AprilTag 3 (the tagStandard families; harness_vision/detect.py): libapriltag 3.4.5 from `sudo apt install libapriltag3t64`
+    # (Ubuntu universe) or ros-lyrical-apriltag
+    apriltag_lib: ""            # "" = search (the loader's path, /usr/lib/x86_64-linux-gnu, /opt/ros/lyrical/lib[/x86_64-linux-gnu])
+    apriltag_max_hamming: 1     # bits corrected (52h13: Hamming distance 13); its decode table: 0 = 2 MB, 1 = 124 MB, 2 = 6.3 GB (lowered to 1)
+    apriltag_threads: 2
+    apriltag_decimate: 2.0      # quad search on a half-size image (the code is still read at full size)
