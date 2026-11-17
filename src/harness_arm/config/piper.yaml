@@ -56,5 +56,7 @@ piper:
     # --- e-stop button (2026-10-24): its normally-closed contact carries the 5 V of this USB mouse (lsusb vendor:product);
     # pressed = the mouse gone = goals cancelled, joints 1-6 held where they are, every command refused until it is out
     # (then ready at once, still holding). An unplugged mouse counts as pressed. "" = no button watched (the node says so at start)
-    estop_usb_id: "04f2:1459"      # HP USB Optical Mouse on the hub next to the CAN adapter (USB 1-8.2 on 2026-10-24)
+    # 2026-11-16 (operator: "去掉e-stop吧。没有这个功能了"): the e-stop button is GONE — no button is watched. With the mouse
+    # id set and the mouse unplugged, the node would latch "e-stop pressed" at start and refuse every command.
+    estop_usb_id: ""               # was "04f2:1459" (an HP USB mouse on the hub next to the CAN adapter)
     estop_poll_s: 0.02
