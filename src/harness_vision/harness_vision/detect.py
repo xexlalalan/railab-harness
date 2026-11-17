@@ -62,7 +62,8 @@ AT3_PIXEL_SHIFT_PX = -0.5
 AT3_LIB_ENV = "HARNESS_APRILTAG_LIB"
 AT3_LIB_NAMES = ("libapriltag.so.3", "libapriltag.so")
 AT3_LIB_DIRS = ("/usr/lib/x86_64-linux-gnu", "/opt/ros/lyrical/lib", "/opt/ros/lyrical/lib/x86_64-linux-gnu",
-                "/usr/lib/aarch64-linux-gnu", "/usr/local/lib")
+                "/usr/lib/aarch64-linux-gnu", "/usr/local/lib",
+                os.path.expanduser("~/lib"))      # the harness PC keeps a copy there (no sudo; 2026-11-16)
 AT3_INSTALL = "sudo apt install libapriltag3t64"
 # AprilTag 3's decode table per family = ncodes x (1 + nbits [+ nbits (nbits - 1)]) x 3 x 16 bytes for 0 / 1 / 2 bits
 # corrected: tagStandard52h13 2.3 MB / 124 MB / 6.3 GB. max_hamming is lowered per family to stay under this.

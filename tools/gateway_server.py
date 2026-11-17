@@ -42,6 +42,9 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   node holds the arm where it is and refuses every command; out again, the arm is ready at once, still holding)
   2026-11-16 (spec "the ChArUco board"): state.camera.charuco {seen, corners, corners_total, distance_m, reproj_err_px,
   age_s} from /camera/charuco; {"cmd": "calib.handeye", "args": {"target": "charuco"}} = the hand-eye on the board
+  2026-11-16 (spec "the nodes' watchdog"): {"cmd": "nodes.status"} -> {nodes: [...], watchdog: {running, at}} (anyone);
+  {"cmd": "nodes.restart", "args": {"node": "camera" | "all"}} -> {ok, restarted} (controller; at once, detached
+  `harness nodes restart`, the gateway itself last); state.nodes / state.watchdog = the same
 
 The gateway owns no hardware: it is an rclpy client of the module nodes, like harness_cmd.py. Releasing the
 arm is the explicit arm.release (operator 2026-10-23; before that it was CLI-only). `stop` is accepted from
@@ -76,6 +79,10 @@ def tag_words(tid, family=None):
     m = re.search(r"\d+h\d+$", str(family or ""))
     return "%d (%s)" % (int(tid), m.group(0) if m else family) if family else "%d" % int(tid)
 HANDEYE_ACCEPT_RMS_MM = 3.0      # calib.handeye installs a new calibration only at or below this rms
+CLI = os.path.join(ROOT, "tools", "harness")
+RESTART_LOG = "/tmp/nodes_restart.log"     # nodes.restart's detached shell
+NODES_READ_S = 2.0               # the watchdog's status file is read at most this often
+WATCHDOG_FRESH_S = 10.0          # ... and counts as running while it is this fresh (it writes every 3 s)
 HANDEYE_SETTLE_S = 3.0           # wait after every hand-eye move before the images (operator: the arm shakes ~3 s)
 TEACH_VEL_RAD_S, TEACH_ACC_RAD_S2 = 0.35, 0.7     # arm.follow_joints: joint speed / acceleration of the path
 FOLLOW_START_TOL_RAD = 0.1       # its first waypoint: this close to where the arm is
@@ -249,6 +256,33 @@ class Gateway:
                                 "base_R": [[round(float(v), 6) for v in row] for row in Tbt[:3, :3]],
                                 "reproj_px": round(t.reproj_err_px, 2)})
         return out
+
+    def nodes_view(self):
+        """The watchdog's status (tools/node_watchdog.py, ~/.cache/harness_watchdog.json), read at most every
+        NODES_READ_S: {nodes: [{name, running, healthy, why, restarts, last_restart_at, auto, ...}], watchdog:
+        {running, at}} - running = its file is fresh and its process alive."""
+        now = time.time()
+        c = getattr(self, "_nodes_cache", None)
+        if c is not None and now - c[0] < NODES_READ_S:
+            return c[1]
+        import node_watchdog
+        try:
+            with open(node_watchdog.STATUS_FILE) as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            doc = {}
+        at, pid = doc.get("at"), doc.get("pid")
+        alive = False
+        if pid:
+            try:
+                os.kill(int(pid), 0)
+                alive = True
+            except (OSError, ValueError):
+                pass
+        v = {"nodes": doc.get("nodes") or [],
+             "watchdog": {"running": bool(alive and at and now - float(at) < WATCHDOG_FRESH_S), "at": at}}
+        self._nodes_cache = (now, v)
+        return v
 
     def charuco_state(self):
         """camera.charuco (2026-11-16): seen = the board's pose solved on a frame at most 1 s old; corners = inner corners
@@ -650,7 +684,9 @@ class Gateway:
         if b:
             bunny.update({k: b.get(k) for k in ("unit", "housing", "weight_g", "dispensing", "busy", "load_open")})
         calib = {"busy": JOB["busy"], "kind": JOB["kind"], "lines": JOB["lines"][-8:], "result": JOB["result"]}
-        return {"arm": arm, "bunny": bunny, "camera": self.camera(), "calib": calib}
+        nv = self.nodes_view()
+        return {"arm": arm, "bunny": bunny, "camera": self.camera(), "calib": calib, "nodes": nv["nodes"],
+                "watchdog": nv["watchdog"]}
 
 
 # ---------------------------------------------------------------------------- server
@@ -677,6 +713,35 @@ def abort_job(why):
             pass
     gw.cancel_arm()
     return True
+
+
+def nodes_restart(want):
+    """nodes.restart: `harness nodes restart <name>` for the node (or every installed node: "all"), one after the
+    other in ONE detached shell (its own session: it outlives this gateway), the gateway itself last, after the
+    reply has gone out. A running job / arm goal is stopped first when the arm, the camera or the gateway restarts
+    (the arm freezes where it is, stays enabled; the PIPER holds its last target while its node is down)."""
+    import node_watchdog
+    listed = node_watchdog.node_list(CLI)
+    names = [n for n, _, _ in listed]
+    if want == "all":
+        todo = [n for n, _, c in listed if not node_watchdog.installed(c, ROOT)]
+        todo = [n for n in todo if n not in ("watchdog", "gateway")] + [n for n in ("watchdog", "gateway") if n in todo]
+    elif want in names:
+        todo = [want]
+    else:
+        raise ValueError("nodes.restart node: one of %s or \"all\"" % ", ".join(names))
+    if set(todo) & {"piper", "camera", "gateway"}:
+        jog["pose"] = jog["grip"] = None
+        abort_job("nodes.restart %s" % want)
+        if "piper" in todo and ctl["motion"]:      # a motion the gateway started (no job): its goal cancelled
+            gw.cancel_arm()
+    script = "sleep 0.5; " + "; ".join("%s nodes restart %s" % (CLI, n) for n in todo)
+    with open(RESTART_LOG, "a") as out:
+        out.write("%s nodes.restart %s: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), want, " ".join(todo)))
+        out.flush()
+        subprocess.Popen(["bash", "-c", script], stdout=out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                         cwd=ROOT, start_new_session=True)
+    return {"ok": True, "restarted": todo}
 
 
 def handeye_job(tid, abort, target="tag"):
@@ -871,6 +936,11 @@ class Conn(socketserver.StreamRequestHandler):
                 except RuntimeError as e:
                     r["bunny"] = str(e)
             return r
+        if cmd == "nodes.status":          # anyone: the watchdog's view of the harness nodes
+            return gw.nodes_view()
+        if cmd == "nodes.restart":
+            self.need("control")
+            return nodes_restart(str(a.get("node") or ""))
         if cmd == "take_control":
             self.need("key")
             with lock:
