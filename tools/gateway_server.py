@@ -44,6 +44,8 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   age_s} from /camera/charuco; {"cmd": "calib.handeye", "args": {"target": "charuco"}} = the hand-eye on the board
   2026-11-16 (spec "the board in the arm base"): state.camera.charuco also pose_base {R, p_mm}, centre_base_mm,
   joints_dt_s, handeye_at (the table calibration's input)
+  2026-11-16 (spec "the absolute calibration"): {"cmd": "calib.absolute", "args": {"action": "begin" | "collect"
+  (position 1..5: a job) | "solve" (a job) | "install" | "status"}}; state.absolute = the status
   2026-11-16 (spec "the nodes' watchdog"): {"cmd": "nodes.status"} -> {nodes: [...], watchdog: {running, at}} (anyone);
   {"cmd": "nodes.restart", "args": {"node": "camera" | "all"}} -> {ok, restarted} (controller; at once, detached
   `harness nodes restart`, the gateway itself last); state.nodes / state.watchdog = the same
@@ -85,6 +87,10 @@ CLI = os.path.join(ROOT, "tools", "harness")
 RESTART_LOG = "/tmp/nodes_restart.log"     # nodes.restart's detached shell
 NODES_READ_S = 2.0               # the watchdog's status file is read at most this often
 WATCHDOG_FRESH_S = 10.0          # ... and counts as running while it is this fresh (it writes every 3 s)
+ABS_DIR = os.path.join(ROOT, "calib", "absolute")    # calib.absolute: one folder per session, CURRENT names the open one
+ABS_MIN_CORNERS = 20
+BACKUP_DIR = os.path.join(ROOT, "calib", "handeye_backups")
+ABS_POSITIONS = 5
 CHARUCO_JOINTS_DT_S = 0.2        # camera.charuco.pose_base: the joints sample used was received at most this far from the
                                  # board's frame (the joints arrive at 100 Hz; a moving arm would skew the pose)
 HANDEYE_SETTLE_S = 3.0           # wait after every hand-eye move before the images (operator: the arm shakes ~3 s)
@@ -301,6 +307,20 @@ class Gateway:
         if best is None or not all(j in best[1].name for j in JOINTS):
             return None, None
         return [float(best[1].position[best[1].name.index(j)]) for j in JOINTS], abs(best[0] - t)
+
+    def reload_model(self):
+        """calib/kinematics.yaml + calib/handeye.yaml read again (after calib.absolute install)."""
+        from harness_arm.kinematics import PiperKinematics
+        self.kin = PiperKinematics.from_file(KIN_FILE, str(self.P.get("kinematics_model", "piper")))
+        self.load_handeye()
+
+    def absolute_view(self):
+        """state.absolute: absolute_status(), read from disk at most every NODES_READ_S."""
+        now = time.time()
+        c = getattr(self, "_abs_cache", None)
+        if c is None or now - c[0] >= NODES_READ_S:
+            c = self._abs_cache = (now, absolute_status())
+        return c[1]
 
     def charuco_state(self):
         """camera.charuco (2026-11-16): seen = the board's pose solved on a frame at most 1 s old; corners = inner corners
@@ -721,7 +741,7 @@ class Gateway:
         calib = {"busy": JOB["busy"], "kind": JOB["kind"], "lines": JOB["lines"][-8:], "result": JOB["result"]}
         nv = self.nodes_view()
         return {"arm": arm, "bunny": bunny, "camera": self.camera(), "calib": calib, "nodes": nv["nodes"],
-                "watchdog": nv["watchdog"]}
+                "watchdog": nv["watchdog"], "absolute": self.absolute_view()}
 
 
 # ---------------------------------------------------------------------------- server
@@ -748,6 +768,172 @@ def abort_job(why):
             pass
     gw.cancel_arm()
     return True
+
+
+# ---------------------------------------------------------------------------- calib.absolute (2026-11-16)
+def _read_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _write_json(path, doc):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(doc, f)
+    os.replace(tmp, path)
+
+
+def abs_current():
+    """The open session's folder, or None."""
+    try:
+        with open(os.path.join(ABS_DIR, "CURRENT")) as f:
+            sid = f.read().strip()
+    except OSError:
+        return None
+    d = os.path.join(ABS_DIR, sid)
+    return d if sid and os.path.isdir(d) else None
+
+
+SOLVE_KEYS = ("at", "ok", "n_samples", "positions", "params", "rms_before_mm", "rms_after_mm", "leave_one_out_mm",
+              "leave_one_out_before_mm", "loo", "offsets", "joint_offsets_deg", "alpha_offsets_deg", "handeye_change",
+              "improved", "why")
+
+
+def solve_view(res):
+    """The solve's result without its matrices (handeye = {xyz_mm, rpy_deg})."""
+    if not res:
+        return None
+    v = {k: res[k] for k in SOLVE_KEYS if k in res}
+    if res.get("handeye"):
+        v["handeye"] = {k: res["handeye"][k] for k in ("xyz_mm", "rpy_deg")}
+    return v
+
+
+def absolute_status():
+    """{session, positions [{position, samples, rejected, complete, at}], solve | None, installed_at} (times: ISO local)."""
+    d = abs_current()
+    if d is None:
+        return {"session": None, "positions": [], "solve": None, "installed_at": None}
+    pos = []
+    for k in range(1, ABS_POSITIONS + 1):
+        p = _read_json(os.path.join(d, "position_%d.json" % k))
+        if p:
+            pos.append({"position": k, "samples": len(p.get("samples") or []), "rejected": len(p.get("rejected") or []),
+                        "complete": bool(p.get("complete")), "at": p.get("at")})
+    sess = _read_json(os.path.join(d, "session.json")) or {}
+    return {"session": os.path.basename(d), "positions": pos, "solve": solve_view(_read_json(os.path.join(d, "solve.json"))),
+            "installed_at": sess.get("installed_at")}
+
+
+def absolute_begin():
+    import datetime as dt
+    sid = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    d = os.path.join(ABS_DIR, sid)
+    os.makedirs(d, exist_ok=True)
+    _write_json(os.path.join(d, "session.json"), {"session": sid, "created": dt.datetime.now().isoformat(timespec="seconds")})
+    with open(os.path.join(ABS_DIR, "CURRENT.tmp"), "w") as f:
+        f.write(sid + "\n")
+    os.replace(os.path.join(ABS_DIR, "CURRENT.tmp"), os.path.join(ABS_DIR, "CURRENT"))
+    gw._abs_cache = None
+    return {"session": sid}
+
+
+def absolute_job(action, abort, d, position=None):
+    """calib.absolute collect / solve: harness_calibration/absolute.py as a process (from source, like the gateway's other
+    calibration code); its output lines go to state.calib.lines; stop / the dead-man interrupt it (SIGINT)."""
+    cmd = [sys.executable, "-m", "harness_calibration.absolute", action, "--dir", d, "--kin", KIN_FILE, "--handeye", HANDEYE_FILE]
+    if action == "collect":
+        cmd += ["--position", str(int(position)), "--settle", str(HANDEYE_SETTLE_S)]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, bufsize=1,
+                         env=dict(os.environ, PYTHONUNBUFFERED="1"), start_new_session=True,
+                         cwd=os.path.join(ROOT, "src", "harness_calibration"))
+    JOB["proc"] = p
+    for line in p.stdout:
+        line = line.rstrip()
+        if line:
+            JOB["lines"] = (JOB["lines"] + [line])[-40:]
+            print("absolute: " + line, flush=True)
+    rc = p.wait()
+    gw._abs_cache = None
+    if action == "collect":
+        doc = _read_json(os.path.join(d, "position_%d.json" % int(position))) or {}
+        r = {"position": int(position), "samples": len(doc.get("samples") or []), "rejected": len(doc.get("rejected") or []),
+             "complete": bool(doc.get("complete"))}
+        if abort.is_set() or rc != 0:
+            r.update(ok=False, message=JOB["why"] or (JOB["lines"][-1] if JOB["lines"] else "exit %d" % rc))
+        return r
+    res = _read_json(os.path.join(d, "solve.json")) if rc == 0 else None
+    if res is None:
+        return {"ok": False, "message": JOB["why"] or (JOB["lines"][-1] if JOB["lines"] else "exit %d" % rc)}
+    return solve_view(res)
+
+
+def absolute_install():
+    """Write calib/kinematics.yaml + calib/handeye.yaml from the open session's last solve (the old files first to
+    calib/handeye_backups/), refused unless it improved on the files installed when it was solved; the gateway reads
+    them again at once; the arm node (which reads kinematics.yaml only at start) is restarted detached - a start never
+    enables or moves the arm, and the PIPER holds its last target meanwhile."""
+    import datetime as dt, shutil, yaml
+    from scipy.spatial.transform import Rotation as Rot
+    d = abs_current()
+    res = _read_json(os.path.join(d, "solve.json")) if d else None
+    if not res or not res.get("ok"):
+        raise RuntimeError("no solve to install (calib.absolute solve first)")
+    if not res.get("improved"):
+        raise RuntimeError("not installed: " + (res.get("why") or "the left-out error does not drop"))
+    if JOB["busy"] or ctl["motion"]:
+        raise RuntimeError("busy: %s is running" % (JOB["kind"] or "a motion"))
+    with open(KIN_FILE) as f:
+        kin_old = yaml.safe_load(f) or {}
+    fr = res.get("from") or {}
+    if fr.get("kinematics_date") != kin_old.get("date") or fr.get("handeye_date") != gw.he_info.get("date"):
+        raise RuntimeError("the installed calibration changed since this solve: solve again")
+    now = dt.datetime.now()
+    ts, iso = now.strftime("%Y-%m-%dT%H%M%S"), now.isoformat(timespec="seconds")
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    backups = []
+    for src, name in ((KIN_FILE, "kinematics_%s.yaml" % ts), (HANDEYE_FILE, "handeye_%s.yaml" % ts)):
+        if os.path.exists(src):
+            shutil.copy(src, os.path.join(BACKUP_DIR, name))
+            backups.append(os.path.join(BACKUP_DIR, name))
+    th, al = res["joint_offsets_rad"], res["alpha_offsets_rad"]
+    note = ("calib.absolute %s: %d samples over board positions %s; fitted %s with the hand-eye; left-out-position "
+            "prediction %.2f mm (installed model %.2f mm); rms %.2f -> %.2f mm"
+            % (res.get("session"), res["n_samples"], res["positions"], "+".join(res["params"]),
+               sum(res["leave_one_out_mm"]) / len(res["leave_one_out_mm"]),
+               sum(res["leave_one_out_before_mm"]) / len(res["leave_one_out_before_mm"]), res["rms_before_mm"], res["rms_after_mm"]))
+    kin = {"model": kin_old.get("model", 'piper MDH (pyAgxArm ROBOT_MDH_PRESET["piper"])'),
+           "joint_zero_offsets_rad": [float(v) for v in th], "joint_zero_offsets_deg": [round(math.degrees(v), 4) for v in th],
+           "alpha_offsets_rad": [float(v) for v in al], "alpha_offsets_deg": [round(math.degrees(v), 4) for v in al],
+           "note": note, "date": iso}
+    X = res["handeye"]["matrix"]
+    import numpy as np
+    Xm = np.array(X, float)
+    he = {"flange_to_camera": {"xyz_m": [float(v) for v in Xm[:3, 3]], "quat_xyzw": [float(v) for v in Rot.from_matrix(Xm[:3, :3]).as_quat()],
+                               "rpy_rad": [math.radians(v) for v in res["handeye"]["rpy_deg"]], "matrix": Xm.tolist()},
+          "method": "calib.absolute: joint fit with the kinematic corrections over %d ChArUco board positions" % len(res["positions"]),
+          "n_poses": res["n_samples"], "accepted": True, "rms_mm": res["rms_after_mm"], "residual_rms_mm": res["rms_after_mm"],
+          "residual_max_mm": res.get("max_after_mm"),
+          "predict_left_out_group_rms_mm": round(sum(res["leave_one_out_mm"]) / len(res["leave_one_out_mm"]), 3),
+          "accepted_by": "gateway calib.absolute install (left-out error dropped)", "date": iso,
+          "note": "valid only together with calib/kinematics.yaml of the same date; " + note}
+    for path, doc in ((KIN_FILE, kin), (HANDEYE_FILE, he)):
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            yaml.safe_dump(doc, f, sort_keys=False)
+        os.replace(tmp, path)
+    gw.reload_model()
+    sess_path = os.path.join(d, "session.json")
+    sess = _read_json(sess_path) or {}
+    sess["installed_at"] = iso
+    _write_json(sess_path, sess)
+    gw._abs_cache = None
+    nodes_restart("piper")
+    return {"ok": True, "installed_at": iso, "backups": backups,
+            "arm_node": "restarting (harness nodes restart piper): it reads calib/kinematics.yaml only at start"}
 
 
 def nodes_restart(want):
@@ -926,6 +1112,37 @@ class Conn(socketserver.StreamRequestHandler):
             else:
                 time.sleep(0.2)
 
+    def absolute(self, a):
+        """calib.absolute {action}: status (anyone) | begin | collect {position} (a job) | solve (a job) | install."""
+        act = str(a.get("action") or "status")
+        if act == "status":
+            return absolute_status()
+        self.need("control")
+        if act == "begin":
+            return absolute_begin()
+        d = abs_current()
+        if d is None:
+            raise RuntimeError("no calibration session: calib.absolute begin first")
+        if act == "collect":
+            k = int(a.get("position") or 0)
+            if not 1 <= k <= ABS_POSITIONS:
+                raise ValueError("position: 1..%d" % ABS_POSITIONS)
+            st = gw.fresh("arm", 1.0)
+            if st is None or not st.all_enabled:
+                raise RuntimeError("the arm is not holding: press Hold first (the routine moves it around where it is)")
+            b = gw.charuco_state()
+            if not b["seen"] or b["corners"] < ABS_MIN_CORNERS:
+                raise RuntimeError("the ChArUco board is not in view with >= %d corners (%d now)" % (ABS_MIN_CORNERS, b["corners"]))
+            return self.job("calib.absolute", lambda ev: absolute_job("collect", ev, d, k), background=True,
+                            extra={"action": "collect", "position": k})
+        if act == "solve":
+            if not absolute_status()["positions"]:
+                raise RuntimeError("no position collected yet")
+            return self.job("calib.absolute", lambda ev: absolute_job("solve", ev, d), background=True, extra={"action": "solve"})
+        if act == "install":
+            return absolute_install()
+        raise ValueError("calib.absolute action: begin | collect | solve | install | status")
+
     def dispatch(self, req):
         rid, cmd, args = req.get("id"), req.get("cmd"), req.get("args") or {}
         try:
@@ -971,6 +1188,8 @@ class Conn(socketserver.StreamRequestHandler):
                 except RuntimeError as e:
                     r["bunny"] = str(e)
             return r
+        if cmd == "calib.absolute":
+            return self.absolute(a)
         if cmd == "nodes.status":          # anyone: the watchdog's view of the harness nodes
             return gw.nodes_view()
         if cmd == "nodes.restart":

@@ -10,4 +10,5 @@ setup(name=p, version="0.1.0", packages=[p],
                                         "jog = harness_calibration.jog:main",
                                         "center = harness_calibration.center:main",
                                         "floor = harness_calibration.floor:main",
-                                        "locate = harness_calibration.locate:main"]})
+                                        "locate = harness_calibration.locate:main",
+                                        "absolute = harness_calibration.absolute:main"]})
