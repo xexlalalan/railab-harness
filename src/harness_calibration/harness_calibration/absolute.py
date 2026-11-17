@@ -281,14 +281,17 @@ def collect(a):
     c.wait_ready()
     st = c.status
     if not (st.ok and st.all_enabled):
-        print(f"the arm must be holding (ok={st.ok} enabled={st.all_enabled} fault='{st.fault}')")
+        print(f"refused: the arm must be holding (press Hold; ok={st.ok} enabled={st.all_enabled} fault='{st.fault}')")
         sys.exit(2)
-    if c.joints_outside_limits():
-        print("a joint is outside its limit: move the arm inside its limits first")
+    from harness_calibration.precheck import precheck_from_files, summary
+    pc = precheck_from_files(list(c.joints), a.kin, a.piper_yaml, trans=a.trans, tilt_deg=a.tilt_deg, roll_deg=a.roll_deg)
+    print(summary(pc))                        # the start-posture check (2026-11-17): before any motion
+    if not pc["ok"]:
+        print("refused: " + pc["why"])
         sys.exit(2)
     m = c.board(max_age=1.0)
     if m is None or m.corners < MIN_CORNERS:
-        print(f"the ChArUco board is not in view with >= {MIN_CORNERS} corners ({m.corners if m else 0})")
+        print(f"refused: the ChArUco board is not in view with >= {MIN_CORNERS} corners ({m.corners if m else 0})")
         sys.exit(2)
     os.makedirs(a.dir, exist_ok=True)
     doc = {"position": a.position, "started": dt.datetime.now().isoformat(timespec="seconds"), "complete": False,
@@ -370,6 +373,7 @@ def main():
     ap.add_argument("--speed", type=int, default=10)
     ap.add_argument("--kin", default=os.path.expanduser("~/bunny-harness-dev/calib/kinematics.yaml"))
     ap.add_argument("--handeye", default=os.path.expanduser("~/bunny-harness-dev/calib/handeye.yaml"))
+    ap.add_argument("--piper-yaml", default=os.path.expanduser("~/bunny-harness-dev/src/harness_arm/config/piper.yaml"))
     a = ap.parse_args()
     if a.action == "collect":
         collect(a)

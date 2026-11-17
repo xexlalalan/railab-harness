@@ -3,7 +3,7 @@
 calibration"): no ROS, no arm. A synthetic real arm = the PiPER's MDH table with KNOWN corrections (joint 4 -0.2°,
 joint 5 -5°, the joint-5 axis twist -0.5°, joint 6's -0.1°) and a known hand-eye; five ChArUco boards spread in 3D
 (flat on the table, raised, tilted, near-vertical). At each: the user's rough posture (the camera ~250 mm from the
-board), then calib.handeye's 23 viewpoints commanded in the INSTALLED model (as the arm node's IK does), each reached
+board), then calib.handeye's 15 viewpoints commanded in the INSTALLED model (as the arm node's IK does), each reached
 by the real arm, the 80 corners projected into a 1280 x 720 pinhole camera with 0.2 px noise (corners off the image
 dropped), the pose solved by the board detector's own solver, the reported joints with 0.01° noise. Then
 absolute.solve: (1) installed = no kinematic corrections + a hand-eye 2 mm / 0.8° off -> the fit recovers the truth,
@@ -38,7 +38,7 @@ AL_TRUE = np.array([0, 0, 0, 0, D(-0.5), D(-0.1)])
 with open(os.path.join(ROOT, "calib", "handeye.yaml")) as f:
     X_TRUE = np.array(yaml.safe_load(f)["flange_to_camera"]["matrix"], float)
 # five boards spread in 3D: found from postures the arm really holds (random joints inside the limits with margin, the
-# camera looking downward-ish, the board 250 mm before it, tilted up to 30° to it, at least 16 of the 23 viewpoints
+# camera looking downward-ish, the board 250 mm before it, tilted up to 30° to it, at least 12 of the 15 viewpoints
 # reachable), the five most different ones (board centre, its normal, joint 1)
 def frame_z(z, roll_deg):
     """A rotation whose z is z (normalised), x chosen and turned by roll about z."""
@@ -80,7 +80,7 @@ def pick_postures(kin_true, kin_inst, rng, n=5, tries=4000):
         best = cand.pop(max(range(len(cand)), key=lambda i: score(cand[i])))
         T0 = kin_inst.fk(best[0])
         ok = sum(kin_inst.ik(Tv, best[0], margin=0.02)[1] < 5e-5 for _, Tv in viewpoints(T0, 0.04, D(15), D(20)))
-        if ok >= 16:
+        if ok >= 12:
             picked.append(best)
     return picked
 

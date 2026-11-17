@@ -156,7 +156,7 @@ def test_board_poses():
 
 def test_handeye_recovers_the_flange_to_camera():
     r = handeye_proof(Charuco())
-    assert r["views"] >= 20 and r["x_mm"] < 0.5 and r["x_deg"] < 0.1 and r["rms_mm"] < 0.5, r
+    assert r["views"] >= 14 and r["x_mm"] < 0.5 and r["x_deg"] < 0.1 and r["rms_mm"] < 0.5, r
     r = handeye_proof(Charuco(), flange_noise_mm=1.0, flange_noise_deg=0.1)
     assert r["x_mm"] < 3.0 and r["rms_mm"] < 3.0, r
 

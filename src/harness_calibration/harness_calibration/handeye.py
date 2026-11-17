@@ -37,11 +37,24 @@ METHODS = {
 }
 
 
-def viewpoints(T0, trans_m, tilt_rad, roll_rad=math.radians(20)):
+# THE 15 VIEWPOINTS (operator 2026-11-17: "都改成15次", the hand-eye and the absolute calibration alike; the 23 reached
+# only 8 on the arm): the start, every pure rotation (tilts about flange x and y, rolls about z: the rotation spread
+# that makes the hand-eye observable), the six translations, and the two roll + tilt combinations IK reaches most often
+# (one about x, one about y; over 106 random held postures the dropped combinations failed 33-47 %, these 27 / 30 %)
+VIEW_SET = ("start", "rx+", "rx-", "ry+", "ry-", "rz+1", "rz-1", "tx+", "tx-", "ty+", "ty-", "tz+", "tz-",
+            "rz-1rx-1", "rz+1ry+1")
+
+
+def viewpoints(T0, trans_m, tilt_rad, roll_rad=math.radians(20), full=False):
     """Start pose; small base-frame translations; small tilts about flange x/y; large rolls
     about flange z (the camera looks roughly along flange z, so a roll keeps the tag in view
     and costs almost no camera motion) combined with the tilts. Rotation diversity is what
-    makes the hand-eye translation observable."""
+    makes the hand-eye translation observable. VIEW_SET's 15 of them (full=True: all 23)."""
+    out = _viewpoints_all(T0, trans_m, tilt_rad, roll_rad)
+    return out if full else [v for v in out if v[0] in VIEW_SET]
+
+
+def _viewpoints_all(T0, trans_m, tilt_rad, roll_rad):
     out = [("start", T0)]
     for ax, name in ((0, "x"), (1, "y"), (2, "z")):
         for s in (+1, -1):
@@ -186,6 +199,10 @@ def main():
     ap.add_argument("--check-convention", action="store_true")
     ap.add_argument("--accept-mm", type=float, default=1.5)
     ap.add_argument("--accept-deg", type=float, default=0.7)
+    ap.add_argument("--kin", default=os.path.expanduser("~/bunny-harness-dev/calib/kinematics.yaml"),
+                    help="the corrected arm model (the start-posture check)")
+    ap.add_argument("--piper-yaml", default=os.path.expanduser("~/bunny-harness-dev/src/harness_arm/config/piper.yaml"),
+                    help="the arm node's parameters (the start-posture check)")
     ap.add_argument("--resolve", nargs="+", default=None, help="re-solve from saved *_pairs_*.json files (merged) instead of moving the arm")
     ap.add_argument("--rescale", type=float, default=1.0, help="--resolve: multiply the recorded camera->tag translations by this (true_size/recorded_size)")
     a = ap.parse_args()
@@ -211,16 +228,25 @@ def main():
     c.wait_ready(camera=not a.check_convention or a.tag_id is not None)
     st = c.status
     if not (st.ok and st.all_enabled):
-        print(f"arm must be ok and enabled (holding). status ok={st.ok} enabled={st.all_enabled} errors={list(st.errors)} fault='{st.fault}'")
+        print(f"refused: the arm must be holding (press Hold; ok={st.ok} enabled={st.all_enabled} errors={list(st.errors)} fault='{st.fault}')")
         sys.exit(2)
 
-    bad = c.joints_outside_limits()
-    if bad:
-        for j, q, lo, hi in bad:
-            print(f"joint {j} = {math.degrees(q):.1f} deg is outside its limit [{math.degrees(lo):.0f}, {math.degrees(hi):.0f}] deg")
-        print("Cartesian moves are refused from here: move the arm inside its limits first (move_j), then retry")
-        c.close()
-        sys.exit(2)
+    if a.check_convention:
+        bad = c.joints_outside_limits()
+        if bad:
+            for j, q, lo, hi in bad:
+                print(f"joint {j} = {math.degrees(q):.1f} deg is outside its limit [{math.degrees(lo):.0f}, {math.degrees(hi):.0f}] deg")
+            print("Cartesian moves are refused from here: move the arm inside its limits first (move_j), then retry")
+            c.close()
+            sys.exit(2)
+    else:                                     # the start-posture check (2026-11-17): before any motion
+        from harness_calibration.precheck import precheck_from_files, summary
+        pc = precheck_from_files(list(c.joints), a.kin, a.piper_yaml, trans=a.trans, tilt_deg=a.tilt_deg, roll_deg=a.roll_deg)
+        print(summary(pc))
+        if not pc["ok"]:
+            print("refused: " + pc["why"])
+            c.close()
+            sys.exit(2)
 
     if a.check_convention:
         ok = check_convention(c, a.speed)
@@ -230,7 +256,7 @@ def main():
     if a.target == "charuco":
         m = c.board(max_age=1.0)
         if m is None:
-            print("the ChArUco board is not in view from the start pose (or no /camera/charuco: harness_msgs and "
+            print("refused: the ChArUco board is not in view from the start pose (or no /camera/charuco: harness_msgs and "
                   "harness_vision of 2026-11-16 built, camera node restarted?); point the camera at it, hold, retry")
             sys.exit(2)
         board = {"dictionary": m.dictionary, "squares": [int(m.squares_x), int(m.squares_y)],
@@ -244,7 +270,7 @@ def main():
             sys.exit(2)
         t = c.tag(a.tag_id)
         if t is None:
-            print(f"tag {a.tag_id} not visible from the start pose; drag the arm so it is, hold, retry")
+            print(f"refused: tag {a.tag_id} not visible from the start pose; drag the arm so it is, hold, retry")
             sys.exit(2)
         print(f"start: tag {a.tag_id} at {t.distance_m*1000:.0f} mm, {t.size_px:.0f} px, reproj {t.reproj_err_px:.2f} px")
     if not check_convention(c, a.speed):
