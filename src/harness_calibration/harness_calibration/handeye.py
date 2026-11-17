@@ -104,10 +104,17 @@ def solve(pairs):
         except (cv2.error, np.linalg.LinAlgError) as e:  # noqa: PERF203
             print(f"  {name}: failed ({str(e).splitlines()[0]})")
             continue
+        if np.linalg.det(Rfc) < 0.5 or not np.allclose(Rfc.T @ Rfc, np.eye(3), atol=1e-3):   # 2026-10-31: a method
+            print(f"  {name}: skipped (not a proper rotation, det {np.linalg.det(Rfc):.2f})")   # returned a mirrored
+            continue                                                                       # one and crashed the run
         Tfc = np.eye(4)
         Tfc[:3, :3], Tfc[:3, 3] = Rfc, tfc.reshape(3)
         Tbt = [p[0] @ Tfc @ p[1] for p in pairs]          # fixed tag reconstructed from every pose
-        d_t, d_r = spread(Tbt)
+        try:
+            d_t, d_r = spread(Tbt)
+        except ValueError as e:
+            print(f"  {name}: skipped ({str(e).splitlines()[0][:80]})")
+            continue
         res[name] = (Tfc, d_t, d_r)
         print(f"  {name:10s}: tag spread {d_t*1000:6.2f} mm / {math.degrees(d_r):5.2f} deg   "
               f"flange->cam xyz {tfc.reshape(3)*1000} mm")
