@@ -1,8 +1,9 @@
 """Synchronous convenience client for the arm node and the tag node.
 
 Spins its own executor in a background thread so the latest /arm/status,
-/joint_states, /arm/tcp_pose and /camera/tags are always available to a plain
-procedural script (hand-eye routine, teach CLI, cycle sequencer).
+/joint_states, /arm/tcp_pose, /camera/tags and /camera/charuco (the ChArUco
+board, 2026-11-16) are always available to a plain procedural script (hand-eye
+routine, teach CLI, cycle sequencer).
 """
 import threading
 import time
@@ -21,6 +22,11 @@ from harness_msgs.msg import ArmStatus, TagArray
 from harness_msgs.srv import SetGripper
 from harness_vision.geom import T_from_pose_msg, xyzrpy_from_T
 
+try:                                      # harness_msgs built before 2026-11-16 has no board message: tags still work
+    from harness_msgs.msg import CharucoDetection
+except ImportError:
+    CharucoDetection = None
+
 
 def family_ok(t, family):
     """Detection t is of `family` (None = any); a detection without a family (older camera node) counts for any."""
@@ -37,11 +43,15 @@ class HarnessClient:
         self.tcp_T = None
         self.tags = None
         self._tags_t = 0.0
+        self.charuco = None                   # the latest /camera/charuco message (seen or not)
+        self._charuco_t = 0.0
         n = self.node
         n.create_subscription(ArmStatus, "/arm/status", self._on_status, 10)
         n.create_subscription(JointState, "/joint_states", self._on_js, 10)
         n.create_subscription(PoseStamped, "/arm/tcp_pose", self._on_tcp, 10)
         n.create_subscription(TagArray, "/camera/tags", self._on_tags, 10)
+        if CharucoDetection is not None:
+            n.create_subscription(CharucoDetection, "/camera/charuco", self._on_charuco, 10)
         self.ac_pose = ActionClient(n, MovePose, "/arm/move_pose")
         self.ac_j = ActionClient(n, MoveJ, "/arm/move_j")
         self.ex = MultiThreadedExecutor(num_threads=2)
@@ -62,6 +72,10 @@ class HarnessClient:
     def _on_tags(self, m):
         self.tags = m
         self._tags_t = time.time()
+
+    def _on_charuco(self, m):
+        self.charuco = m
+        self._charuco_t = time.time()
 
     # ------------------------------------------------------------ waiting
     def wait_ready(self, camera=True, timeout=10.0):
@@ -113,6 +127,30 @@ class HarnessClient:
                     if t.id == tag_id and family_ok(t, family):
                         Ts.append(T_from_pose_msg(t.pose))
                         Tfs.append(self.tcp_T.copy())
+            time.sleep(0.01)
+        return Ts, Tfs
+
+    def board(self, max_age=0.5):
+        """The latest ChArUco board message when the board was seen on it (its pose solved), else None."""
+        m = self.charuco
+        if m is None or time.time() - self._charuco_t > max_age or not m.seen:
+            return None
+        return m
+
+    def collect_board(self, n=10, timeout=3.0):
+        """Collect n distinct board poses (4x4 camera -> the board's CENTRE, the board's axes) plus the flange poses
+        seen with them (the hand-eye's fixed target, 2026-11-16)."""
+        Ts, Tfs, last = [], [], None
+        t0 = time.time()
+        while len(Ts) < n and time.time() - t0 < timeout:
+            m = self.charuco
+            if m is not None and m is not last:
+                last = m
+                if m.seen:
+                    C = np.eye(4)
+                    C[:3, 3] = [m.squares_x * m.square_m / 2.0, m.squares_y * m.square_m / 2.0, 0.0]
+                    Ts.append(T_from_pose_msg(m.pose) @ C)
+                    Tfs.append(self.tcp_T.copy())
             time.sleep(0.01)
         return Ts, Tfs
 

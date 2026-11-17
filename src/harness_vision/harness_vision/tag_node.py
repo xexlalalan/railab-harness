@@ -5,6 +5,7 @@ Owns the RealSense D405. Publishes:
   /camera/tags               harness_msgs/TagArray      every frame (id, pixels, camera-frame pose, "set" flag)
   /camera/image/compressed   sensor_msgs/CompressedImage  at image_rate_hz, with the detection overlay
   /camera/camera_info        sensor_msgs/CameraInfo     with every image
+  /camera/charuco            harness_msgs/CharucoDetection  every frame: the ChArUco board (corners found, pose)
 
 Pose: corners are deprojected with the device's own distortion model
 (rs2_deproject_pixel_to_point), then solvePnP (IPPE_SQUARE) on normalised rays,
@@ -27,6 +28,13 @@ the OpenCV families' convention (corner order, tag frame, pixel convention) —
 harness_vision/detect.py, where the detection and the report are pure
 functions. Without the library the node starts, says so in one line and
 decodes the OpenCV families only.
+
+The ChArUco board (2026-11-16, the hand-eye target; camera.yaml `charuco`,
+`charuco.dict` "" = off): found on every frame and published on
+/camera/charuco whether seen or not (corners found, markers, and when seen
+the board pose by solvePnP on the device-normalised corners, like a tag's) —
+harness_vision/detect.py Charuco. A harness_msgs built before it has no
+CharucoDetection: the node then says so once and publishes tags only.
 """
 import threading
 import time
@@ -39,8 +47,13 @@ from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, CompressedImage
 
 from harness_msgs.msg import TagArray, TagDetection
-from harness_vision.detect import AT3_INSTALL, Detector, measure, parse_tag_sizes, short_family
+from harness_vision.detect import AT3_INSTALL, Charuco, Detector, measure, parse_tag_sizes, short_family
 from harness_vision.geom import pose_msg_from_T
+
+try:                                      # harness_msgs of 2026-11-16 or later
+    from harness_msgs.msg import CharucoDetection
+except ImportError:
+    CharucoDetection = None
 
 
 class TagNode(Node):
@@ -53,6 +66,8 @@ class TagNode(Node):
             ("image_rate_hz", 10.0), ("jpeg_quality", 70), ("exposure_us", 0),
             ("error_correction_rate", 0.0),
             ("apriltag_lib", ""), ("apriltag_max_hamming", 1), ("apriltag_threads", 2), ("apriltag_decimate", 2.0),
+            ("charuco.dict", "DICT_5X5_100"), ("charuco.squares_x", 9), ("charuco.squares_y", 11),
+            ("charuco.square_m", 0.022), ("charuco.marker_m", 0.016), ("charuco.min_corners", 6),
         ])
         self.P = {x.name: x.value for x in prm}
         # black-square edge per (family, id) from tag_sizes "family:id=size_m"; the older tag_sizes_ids / tag_sizes_m
@@ -75,6 +90,17 @@ class TagNode(Node):
                                     f"families are) - install it ({AT3_INSTALL}) and restart the camera node; "
                                     f"{next(iter(self.det.missing.values()))}")
         self.P["family"] = fams[0]
+        self.board, self.pub_board = None, None   # the ChArUco board (the hand-eye target)
+        if str(self.P["charuco.dict"]).strip():
+            self.board = Charuco(str(self.P["charuco.dict"]).strip(), int(self.P["charuco.squares_x"]),
+                                 int(self.P["charuco.squares_y"]), float(self.P["charuco.square_m"]),
+                                 float(self.P["charuco.marker_m"]), int(self.P["charuco.min_corners"]))
+            if CharucoDetection is None:
+                self.get_logger().error("ChArUco board: harness_msgs has no CharucoDetection (built before 2026-11-16) - "
+                                        "/camera/charuco NOT published: colcon build --symlink-install --packages-select "
+                                        "harness_msgs harness_vision, then restart the camera node")
+            else:
+                self.pub_board = self.create_publisher(CharucoDetection, "/camera/charuco", 10)
 
         self.pipe = None
         try:
@@ -93,7 +119,11 @@ class TagNode(Node):
                                   if self.det.at3 else "")
                                + f", default size {self.P['tag_size_m']} m, sizes "
                                + ", ".join(f"{f}:{i}={s * 1000:g} mm" for (f, i), s in sorted(self.sizes.items()))
-                               + ("".join(f", any:{i}={s * 1000:g} mm" for i, s in sorted(self.sizes_any.items()))))
+                               + ("".join(f", any:{i}={s * 1000:g} mm" for i, s in sorted(self.sizes_any.items())))
+                               + (f"; ChArUco board {self.board.dict_name} {self.board.squares[0]} x {self.board.squares[1]} "
+                                  f"x {self.board.square_m * 1000:g} mm (markers {self.board.marker_m * 1000:g} mm, "
+                                  f"{self.board.total} corners, pose from {self.board.min_corners})"
+                                  + ("" if self.pub_board else " NOT published") if self.board else "; no ChArUco board"))
 
     # ------------------------------------------------------------------ camera
     def _open_camera(self):
@@ -184,6 +214,12 @@ class TagNode(Node):
                 msg.tags.append(t)
             self.pub_tags.publish(msg)
             self.frames += 1
+            bd = None
+            if self.board is not None:
+                bids, bpts, bmk = self.board.detect(gray)
+                bd = self.board.measure(bids, bpts, bmk, self._normalised, self.intr.fx)
+                if self.pub_board is not None:
+                    self.pub_board.publish(self._board_msg(bd, msg.header))
 
             tnow = time.time()
             if tnow - self.last_img_t >= 1.0 / float(self.P["image_rate_hz"]):
@@ -194,6 +230,13 @@ class TagNode(Node):
                 if found:
                     cv2.aruco.drawDetectedMarkers(ov, [np.asarray(c, np.float32).reshape(1, 4, 2) for _, c, _ in found],
                                                   np.array([[i] for _, _, i in found], np.int32))
+                if bd is not None and bd["corners"]:
+                    cv2.aruco.drawDetectedCornersCharuco(ov, np.asarray(bd["corners_px"], np.float32).reshape(-1, 1, 2),
+                                                         np.asarray(bd["corner_ids"], np.int32).reshape(-1, 1), (255, 0, 255))
+                if bd is not None:
+                    cv2.putText(ov, f"board {bd['corners']}/{bd['corners_total']}"
+                                + (f" {bd['distance_m'] * 1000:.0f}mm {bd['reproj_err_px']:.2f}px" if bd["seen"] else ""),
+                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if bd["seen"] else (0, 165, 255), 2)
                 for t in msg.tags:
                     fam = short_family(t.family) if len(self.det.families) > 1 else ""   # "36h11 id3" with several families
                     cv2.putText(ov, f"{fam + ' ' if fam else ''}id{t.id} {t.distance_m*1000:.0f}mm{' d' + format(t.depth_m*1000, '.0f') if t.depth_m else ''} {t.size_px:.0f}px{' SET' if t.in_center_square else ''}",
@@ -208,6 +251,20 @@ class TagNode(Node):
                     self.pub_img.publish(im)
                     self.info.header.stamp = now
                     self.pub_info.publish(self.info)
+
+    def _board_msg(self, bd, header):
+        """detect.Charuco.measure's dict -> harness_msgs/CharucoDetection."""
+        b = self.board
+        m = CharucoDetection()
+        m.header = header
+        m.seen, m.corners, m.corners_total, m.markers = bd["seen"], bd["corners"], bd["corners_total"], bd["markers"]
+        m.dictionary, m.squares_x, m.squares_y = b.dict_name, b.squares[0], b.squares[1]
+        m.square_m, m.marker_m = b.square_m, b.marker_m
+        if bd["seen"]:
+            pose_msg_from_T(bd["T"], m.pose)
+            m.distance_m, m.reproj_err_px = bd["distance_m"], bd["reproj_err_px"]
+        m.corner_ids, m.corners_px = bd["corner_ids"], bd["corners_px"]
+        return m
 
     def _reconnect(self):
         """The camera stopped delivering ("wait_for_frames cannot be called before start()" after a USB drop: five of

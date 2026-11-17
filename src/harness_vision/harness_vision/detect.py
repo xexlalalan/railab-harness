@@ -16,6 +16,15 @@ images that both decoders read (test_detect.py) - and moved from AprilTag 3's pi
 (AT3_PIXEL_SHIFT_PX, measured the same way). The pose is the same for every family: solvePnP(IPPE_SQUARE) on the
 device-normalised corners, object points [-h, h], [h, h], [h, -h], [-h, -h] (x right, y up, z out of the tag).
 
+THE CHARUCO BOARD (2026-11-16, the hand-eye target; operator: "calibration hand-eye用的是ChArUco board"): `Charuco` finds
+the board (cv2.aruco.CharucoDetector: its ArUco markers, then the chessboard corners between them, interpolated) and
+refines every corner again with cv2.cornerSubPix (a window clear of the markers): OpenCV 4.12's detector puts the
+corners +0.5 px off in x and y (5.0's does not; test_charuco.py measures it), cornerSubPix is unbiased in both.
+`Charuco.measure` solves its pose the same way as a tag's: solvePnP on the device-normalised corners
+(IPPE for a plane, then Levenberg-Marquardt). Board frame = OpenCV's CharucoBoard frame: origin at the outer corner of
+square (0, 0) (the printed sheet's top-left), x along the squares_x squares, y along the squares_y (down the sheet),
+z into the board.
+
 SIZES: a tag's size for the pose = the edge of the square the detector finds. tag16h5 / 25h9 / 36h11: the black
 square = printed size x width_at_border / total_width (6/8, 7/9, 8/10). tagStandard52h13 / 41h12 ("reversed
 border"): the outer edge of the white ring between the outer and the inner data bits, the same share of the printed
@@ -321,3 +330,93 @@ def measure(fam, pts, tag_id, size_m, normalise, fx, square, size_gate, depth=No
             r["depth_m"] = float(np.median(z))
             r["depth_size_m"] = float(size_m * r["depth_m"] / r["distance_m"])  # S_true = S_assumed * depth / PnP range
     return r
+
+
+# ---------------------------------------------------------------------------------------------- the ChArUco board
+class Charuco:
+    """The ChArUco board of camera.yaml `charuco` (default = the lab's sheet: DICT_5X5_100, marker ids 0-48, 9 x 11
+    squares of 22 mm, markers 16 mm, 80 inner corners; an odd row count, so the pre-4.6 "legacy" pattern is the same)."""
+
+    def __init__(self, dict_name="DICT_5X5_100", squares_x=9, squares_y=11, square_m=0.022, marker_m=0.016, min_corners=6):
+        if not hasattr(cv2.aruco, str(dict_name)):
+            raise ValueError(f"charuco dict {dict_name!r}: not a cv2.aruco dictionary (e.g. DICT_5X5_100)")
+        self.dict_name, self.squares = str(dict_name), (int(squares_x), int(squares_y))
+        self.square_m, self.marker_m, self.min_corners = float(square_m), float(marker_m), max(4, int(min_corners))
+        self.board = cv2.aruco.CharucoBoard(self.squares, self.square_m, self.marker_m,
+                                            cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, self.dict_name)))
+        dp = cv2.aruco.DetectorParameters()
+        dp.adaptiveThreshWinSizeMin = 23          # one threshold scale, as for the tags
+        dp.adaptiveThreshWinSizeMax = 23
+        dp.minMarkerPerimeterRate = 0.04
+        self.det = cv2.aruco.CharucoDetector(self.board, cv2.aruco.CharucoParameters(), dp)
+        self.obj = np.asarray(self.board.getChessboardCorners(), np.float64).reshape(-1, 3)
+        self.total = len(self.obj)                # (squares_x - 1) x (squares_y - 1)
+        self.centre = np.array([self.squares[0] * self.square_m / 2, self.squares[1] * self.square_m / 2, 0.0])
+
+    def detect(self, gray):
+        """(corner ids (n,), corners (n, 2) px in OpenCV's pixel convention, markers decoded)."""
+        cc, ci, _mc, mi = self.det.detectBoard(gray)
+        nm = 0 if mi is None else len(mi)
+        if ci is None or cc is None or len(ci) == 0:
+            return np.zeros(0, np.int32), np.zeros((0, 2), np.float64), nm
+        ids, pts = np.asarray(ci, np.int32).ravel(), np.asarray(cc, np.float64).reshape(-1, 2)
+        return ids, self.refine(gray, pts), nm
+
+    def refine(self, gray, pts):
+        """cornerSubPix on every corner, its window half-size w clear of the markers: a marker's corner sits
+        (square - marker) / 2 from the chessboard corner along both board axes = MARGIN x the local square size s
+        (the distance to the nearest other corner found), so w = MARGIN s - 1 px, 2 <= w <= 6. A corner that moves
+        more than 1.5 px keeps the detector's position."""
+        n = len(pts)
+        if n == 0:
+            return pts
+        margin = (self.square_m - self.marker_m) / 2.0 / self.square_m
+        if n > 1:
+            d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=2)
+            np.fill_diagonal(d, np.inf)
+            sq = d.min(axis=1)
+        else:
+            sq = np.array([60.0])
+        w = np.clip(np.floor(margin * sq - 1.0), 2, 6).astype(int)
+        out = pts.copy()
+        crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 40, 0.001)
+        for k in np.unique(w):
+            sel = np.nonzero(w == k)[0]
+            r = cv2.cornerSubPix(gray, pts[sel].astype(np.float32).reshape(-1, 1, 2), (int(k), int(k)), (-1, -1), crit)
+            r = r.reshape(-1, 2).astype(np.float64)
+            ok = np.linalg.norm(r - pts[sel], axis=1) <= 1.5
+            out[sel[ok]] = r[ok]
+        return out
+
+    def collinear(self, ids):
+        f = getattr(self.board, "checkCharucoCornersCollinear", None)
+        if f is not None:
+            return bool(f(np.asarray(ids, np.int32)))
+        xy = self.obj[ids, :2] - self.obj[ids, :2].mean(axis=0)
+        return bool(np.linalg.svd(xy, compute_uv=False)[-1] < 0.25 * self.square_m)
+
+    def measure(self, ids, pts, markers, normalise, fx):
+        """The board on one frame as tag_node reports it (harness_msgs/CharucoDetection's fields): seen = the pose was
+        solved (>= min_corners corners, not all on one line); T = the board frame in the camera optical frame (4x4);
+        distance_m = camera -> the board's centre; reproj_err_px = mean corner reprojection error."""
+        r = {"seen": False, "corners": int(len(ids)), "corners_total": self.total, "markers": int(markers),
+             "T": None, "distance_m": 0.0, "reproj_err_px": 0.0, "corner_ids": [int(i) for i in ids],
+             "corners_px": [float(v) for v in np.asarray(pts, np.float64).flatten()]}
+        if len(ids) < self.min_corners or self.collinear(ids):
+            return r
+        obj, nrm = self.obj[ids], normalise(pts)
+        ok, rvec, tvec = cv2.solvePnP(obj, nrm, np.eye(3), None, flags=cv2.SOLVEPNP_IPPE)
+        if not ok:
+            return r
+        rvec, tvec = cv2.solvePnPRefineLM(obj, nrm, np.eye(3), None, rvec, tvec)
+        proj, _ = cv2.projectPoints(obj, rvec, tvec, np.eye(3), None)
+        T = T_from_rvec_tvec(rvec, tvec)
+        r.update(seen=True, T=T, distance_m=float(np.linalg.norm(T[:3, :3] @ self.centre + T[:3, 3])),
+                 reproj_err_px=float(np.mean(np.linalg.norm(proj.reshape(-1, 2) - nrm, axis=1))) * fx)
+        return r
+
+    def centre_T(self):
+        """Board frame -> its centre (same axes): T_cam_centre = T_cam_board @ this (the hand-eye's fixed point)."""
+        T = np.eye(4)
+        T[:3, 3] = self.centre
+        return T

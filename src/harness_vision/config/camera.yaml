@@ -29,3 +29,14 @@ tag_node:
     apriltag_max_hamming: 1     # bits corrected (52h13: Hamming distance 13); its decode table: 0 = 2 MB, 1 = 124 MB, 2 = 6.3 GB (lowered to 1)
     apriltag_threads: 2
     apriltag_decimate: 2.0      # quad search on a half-size image (the code is still read at full size)
+    # the ChArUco board (2026-11-16, the hand-eye target; operator: the lab's sheet, printed at 100 %): found on every frame,
+    # /camera/charuco (harness_msgs/CharucoDetection). OpenCV cv2.aruco CharucoBoard: dict = a cv2.aruco DICT_* name ("" = off),
+    # squares_x across x squares_y down, square / marker edges in m (a ruler-measured square size wins over the nominal),
+    # min_corners = inner corners needed (not all on one line) before a pose is solved
+    charuco:
+      dict: "DICT_5X5_100"      # marker ids 0-48
+      squares_x: 9
+      squares_y: 11             # odd: the pre-4.6 "legacy" pattern is the same
+      square_m: 0.022
+      marker_m: 0.016
+      min_corners: 6

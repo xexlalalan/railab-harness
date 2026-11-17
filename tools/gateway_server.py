@@ -18,6 +18,7 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   v2 (2026-10-23, spec "Release, hand-eye and tag teaching through the gateway"):
   {"cmd": "arm.release"}                                  joints 1-6 limp (the gripper keeps holding)
   {"cmd": "calib.handeye", "args": {"tag_id": 8}}         job: hand-eye around where the arm holds; state.calib
+  {"cmd": "calib.handeye", "args": {"target": "charuco"}}  the same with the ChArUco board as the target (2026-11-16)
   {"cmd": "teach.plan_views", "args": {"from_model_deg": [...6], "backoff_mm": 40, "tilt_deg": 1.5}}   dry run
   {"cmd": "teach.fine", "args": {"tag_id": 7, "black_mm": 37.5, "tilt_deg": 3, "views_model_deg": {...},
                                  "family": "tag16h5"}}   job: the cross (family: only that family's tag, 2026-10-25)
@@ -39,6 +40,8 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   "args": {"volume_ml": 10}} — jobs; `stop` aborts a dose (/bunny/abort)
   v5 (2026-10-24, spec "Emergency stop button"): state.arm.estop — true while the e-stop button is pressed (the arm
   node holds the arm where it is and refuses every command; out again, the arm is ready at once, still holding)
+  2026-11-16 (spec "the ChArUco board"): state.camera.charuco {seen, corners, corners_total, distance_m, reproj_err_px,
+  age_s} from /camera/charuco; {"cmd": "calib.handeye", "args": {"target": "charuco"}} = the hand-eye on the board
 
 The gateway owns no hardware: it is an rclpy client of the module nodes, like harness_cmd.py. Releasing the
 arm is the explicit arm.release (operator 2026-10-23; before that it was CLI-only). `stop` is accepted from
@@ -129,6 +132,18 @@ class Gateway:
         n.create_subscription(JointState, "/joint_states", put("joints"), 10)
         n.create_subscription(String, "/bunny/status", lambda m: self.last.__setitem__("bunny", (json.loads(m.data), time.time())), 10)
         n.create_subscription(TagArray, "/camera/tags", put("tags"), 10)
+        try:                                 # the ChArUco board (harness_msgs of 2026-11-16 or later)
+            from harness_msgs.msg import CharucoDetection
+
+            def on_board(m):
+                now = time.time()
+                self.last["charuco"] = (m, now)
+                if m.seen:
+                    self.last["charuco_seen"] = (m, now)
+            n.create_subscription(CharucoDetection, "/camera/charuco", on_board, 10)
+        except ImportError:
+            print("gateway: harness_msgs has no CharucoDetection (built before 2026-11-16): camera.charuco stays empty",
+                  flush=True)
         self.MoveJ, self.FollowTrajectory, self.MovePose = MoveJ, FollowTrajectory, MovePose
         self.ac_j = ActionClient(n, MoveJ, "/arm/move_j")
         self.ac_t = ActionClient(n, FollowTrajectory, "/arm/follow_trajectory")
@@ -219,7 +234,8 @@ class Gateway:
         m, q = self.fresh("tags", 1.0), self.joints_rad()
         last = self.last.get("tags")
         out = {"online": m is not None, "handeye": self.he_info, "tags": [],
-               "age_s": round(time.time() - last[1], 1) if last else None}      # None = no camera frame since the gateway started
+               "age_s": round(time.time() - last[1], 1) if last else None,      # None = no camera frame since the gateway started
+               "charuco": self.charuco_state()}
         if m is None or q is None or self.Tfc is None:
             return out
         Tbc = self.kin.fk(q) @ self.Tfc
@@ -233,6 +249,17 @@ class Gateway:
                                 "base_R": [[round(float(v), 6) for v in row] for row in Tbt[:3, :3]],
                                 "reproj_px": round(t.reproj_err_px, 2)})
         return out
+
+    def charuco_state(self):
+        """camera.charuco (2026-11-16): seen = the board's pose solved on a frame at most 1 s old; corners = inner corners
+        found on that frame (of corners_total); distance_m (camera -> the board's centre) / reproj_err_px / age_s = the
+        newest frame the board was seen on and its age (None: not seen since the gateway started)."""
+        b, sn = self.fresh("charuco", 1.0), self.last.get("charuco_seen")
+        return {"seen": bool(b is not None and b.seen), "corners": int(b.corners) if b is not None else 0,
+                "corners_total": int(b.corners_total) if b is not None else (int(sn[0].corners_total) if sn else None),
+                "distance_m": round(float(sn[0].distance_m), 4) if sn else None,
+                "reproj_err_px": round(float(sn[0].reproj_err_px), 3) if sn else None,
+                "age_s": round(time.time() - sn[1], 1) if sn else None}
 
     def teach_client(self):
         if self.hc is None:
@@ -652,14 +679,16 @@ def abort_job(why):
     return True
 
 
-def handeye_job(tid, abort):
-    """calib.handeye: the hand-eye routine as a process; its result is installed when rms <= HANDEYE_ACCEPT_RMS_MM."""
+def handeye_job(tid, abort, target="tag"):
+    """calib.handeye: the hand-eye routine as a process; its result is installed when rms <= HANDEYE_ACCEPT_RMS_MM.
+    target "charuco" (2026-11-16) = the ChArUco board as the fixed target instead of tag tid."""
     import datetime as dt, shutil, yaml
     new = os.path.join(ROOT, "calib", "handeye_new.yaml")
     if os.path.exists(new):
         os.remove(new)
-    cmd = ["ros2", "run", "harness_calibration", "handeye", "--tag-id", str(int(tid)), "--accept-mm", "6.0",
-           "--settle", str(HANDEYE_SETTLE_S), "--out", new]
+    what = ["--target", "charuco"] if target == "charuco" else ["--tag-id", str(int(tid))]
+    cmd = ["ros2", "run", "harness_calibration", "handeye"] + what + ["--accept-mm", "6.0",
+                                                                       "--settle", str(HANDEYE_SETTLE_S), "--out", new]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True,
                          bufsize=1, env=dict(os.environ, PYTHONUNBUFFERED="1"), start_new_session=True)
     JOB["proc"] = p
@@ -679,7 +708,7 @@ def handeye_job(tid, abort):
     os.remove(new)
     rms, mx = float(doc.get("residual_rms_mm") or 1e9), float(doc.get("residual_max_mm") or 1e9)
     x = doc.get("flange_to_camera") or {}
-    res = {"rms_mm": round(rms, 2), "max_mm": round(mx, 2), "n_poses": doc.get("n_poses"), "tag_id": tid,
+    res = {"rms_mm": round(rms, 2), "max_mm": round(mx, 2), "n_poses": doc.get("n_poses"), "tag_id": tid, "target": target,
            "xyz_mm": [round(v * 1000, 1) for v in x.get("xyz_m", [])], "rpy_deg": [round(math.degrees(v), 2) for v in x.get("rpy_rad", [])]}
     if rms > HANDEYE_ACCEPT_RMS_MM:
         return dict(res, ok=False, installed=False, message="rms %.2f mm > %.1f mm: the old calibration stays" % (rms, HANDEYE_ACCEPT_RMS_MM))
@@ -898,6 +927,13 @@ class Conn(socketserver.StreamRequestHandler):
             st = gw.fresh("arm", 1.0)
             if st is None or not st.all_enabled:
                 raise RuntimeError("the arm is not holding: press Hold first (the routine moves it around where it is)")
+            if str(a.get("target") or "tag") == "charuco":
+                if not gw.charuco_state()["seen"]:
+                    raise RuntimeError("the ChArUco board is not in view: point the camera at it 150-300 mm away")
+                return self.job("calib.handeye", lambda ev: handeye_job(None, ev, "charuco"), background=True,
+                                extra={"target": "charuco"})
+            if str(a.get("target") or "tag") != "tag":
+                raise ValueError("calib.handeye target: \"tag\" (tag_id) or \"charuco\"")
             seen = gw.camera()["tags"]
             tid = a.get("tag_id")
             if tid is None:

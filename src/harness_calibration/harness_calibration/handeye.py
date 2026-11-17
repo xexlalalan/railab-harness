@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Hand-eye calibration: flange -> gripper camera (eye-in-hand).
 
-Preconditions: piper node and tag node running; ONE tag fixed rigidly in the
-workspace; the arm HOLDING at a start pose that sees the tag from ~150-250 mm.
+Preconditions: piper node and tag node running; ONE fixed target rigidly in the
+workspace — a tag, or the ChArUco board (2026-11-16, operator: the hand-eye
+target is the board: camera.yaml `charuco`, /camera/charuco) — and the arm
+HOLDING at a start pose that sees it from ~150-250 mm.
 
     ros2 run harness_calibration handeye --tag-id 101 --tag-size 0.05
+    ros2 run harness_calibration handeye --target charuco          # the board (its centre is the fixed point)
     ros2 run harness_calibration handeye --check-convention        # only the rpy round-trip test
 
 The routine visits ~20 viewpoints around the start pose (translations +-trans m
@@ -26,7 +29,6 @@ import numpy as np
 import yaml
 from scipy.spatial.transform import Rotation as R
 
-from harness_calibration.client import HarnessClient
 from harness_vision.geom import angle_between, average_T, rot_about, spread, trans, xyzrpy_from_T
 
 METHODS = {
@@ -62,6 +64,30 @@ def viewpoints(T0, trans_m, tilt_rad, roll_rad=math.radians(20)):
     return out
 
 
+def park_martin(Rg, tg, Rt, tt):
+    """Park & Martin's closed form (1994) in numpy, the same answer as cv2.calibrateHandEye(..., PARK): for every
+    pair of poses i < j, A = flange_j^-1 flange_i and B = target_j target_i^-1 (A X = X B); R_X from the rotation
+    vectors (M = sum beta alpha^T, R_X = (M^T M)^-1/2 M^T), t_X by least squares from (R_A - I) t_X = R_X t_B - t_A.
+    For an OpenCV without calibrateHandEye (the opencv-python-headless 5.0 wheel exports only its constants)."""
+    n = len(Rg)
+    G = [np.block([[np.asarray(Rg[i]), np.asarray(tg[i]).reshape(3, 1)], [np.zeros((1, 3)), np.ones((1, 1))]]) for i in range(n)]
+    C = [np.block([[np.asarray(Rt[i]), np.asarray(tt[i]).reshape(3, 1)], [np.zeros((1, 3)), np.ones((1, 1))]]) for i in range(n)]
+    As, Bs, M = [], [], np.zeros((3, 3))
+    for i in range(n):
+        for j in range(i + 1, n):
+            A, B = np.linalg.inv(G[j]) @ G[i], C[j] @ np.linalg.inv(C[i])
+            As.append(A)
+            Bs.append(B)
+            M += np.outer(R.from_matrix(B[:3, :3]).as_rotvec(), R.from_matrix(A[:3, :3]).as_rotvec())
+    w, V = np.linalg.eigh(M.T @ M)
+    Rx = V @ np.diag(1.0 / np.sqrt(np.maximum(w, 1e-18))) @ V.T @ M.T
+    U, _, Vt = np.linalg.svd(Rx)                      # the nearest rotation
+    Rx = U @ np.diag([1.0, 1.0, np.linalg.det(U @ Vt)]) @ Vt
+    lhs = np.vstack([A[:3, :3] - np.eye(3) for A in As])
+    rhs = np.concatenate([Rx @ B[:3, 3] - A[:3, 3] for A, B in zip(As, Bs)])
+    return Rx, np.linalg.lstsq(lhs, rhs, rcond=None)[0].reshape(3, 1)
+
+
 def solve(pairs):
     """pairs: list of (T_base_flange, T_cam_tag). Returns dict method -> (T_flange_cam, dt, dr)."""
     Rg = [p[0][:3, :3] for p in pairs]
@@ -69,10 +95,13 @@ def solve(pairs):
     Rt = [p[1][:3, :3] for p in pairs]
     tt = [p[1][:3, 3] for p in pairs]
     res = {}
-    for name, m in METHODS.items():
+    methods = METHODS if hasattr(cv2, "calibrateHandEye") else {"PARK_NUMPY": None}
+    if methods is not METHODS:
+        print("  (this OpenCV has no calibrateHandEye: Park & Martin in numpy)")
+    for name, m in methods.items():
         try:
-            Rfc, tfc = cv2.calibrateHandEye(Rg, tg, Rt, tt, method=m)
-        except cv2.error as e:  # noqa: PERF203
+            Rfc, tfc = cv2.calibrateHandEye(Rg, tg, Rt, tt, method=m) if m is not None else park_martin(Rg, tg, Rt, tt)
+        except (cv2.error, np.linalg.LinAlgError) as e:  # noqa: PERF203
             print(f"  {name}: failed ({str(e).splitlines()[0]})")
             continue
         Tfc = np.eye(4)
@@ -135,6 +164,8 @@ def check_convention(c, speed):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--target", choices=("tag", "charuco"), default="tag",
+                    help="the fixed target: one tag (--tag-id) or the ChArUco board (2026-11-16)")
     ap.add_argument("--tag-id", type=int, default=None)
     ap.add_argument("--tag-size", type=float, default=None, help="edge length m (informational; the tag node sets the pose scale)")
     ap.add_argument("--trans", type=float, default=0.04, help="translation amplitude m")
@@ -165,9 +196,10 @@ def main():
         print(f"re-solving {len(pairs)} pairs from {len(a.resolve)} file(s) (tag {d.get('tag_id')}, size {d.get('tag_size_m')} m)")
         res = solve(pairs)
         a.resolve = ",".join(os.path.basename(x) for x in a.resolve)
-        finish(a, pairs, res, d.get("tag_id"), d.get("tag_size_m"), log)
+        finish(a, pairs, res, d.get("tag_id"), d.get("tag_size_m"), log, d.get("board"))
         return
 
+    from harness_calibration.client import HarnessClient      # ROS only here: the solver above runs without it
     c = HarnessClient("handeye")
     c.wait_ready(camera=not a.check_convention or a.tag_id is not None)
     st = c.status
@@ -187,15 +219,27 @@ def main():
         ok = check_convention(c, a.speed)
         c.close()
         sys.exit(0 if ok else 1)
-    if a.tag_id is None:
-        print("--tag-id required")
-        sys.exit(2)
-
-    t = c.tag(a.tag_id)
-    if t is None:
-        print(f"tag {a.tag_id} not visible from the start pose; drag the arm so it is, hold, retry")
-        sys.exit(2)
-    print(f"start: tag {a.tag_id} at {t.distance_m*1000:.0f} mm, {t.size_px:.0f} px, reproj {t.reproj_err_px:.2f} px")
+    board = None
+    if a.target == "charuco":
+        m = c.board(max_age=1.0)
+        if m is None:
+            print("the ChArUco board is not in view from the start pose (or no /camera/charuco: harness_msgs and "
+                  "harness_vision of 2026-11-16 built, camera node restarted?); point the camera at it, hold, retry")
+            sys.exit(2)
+        board = {"dictionary": m.dictionary, "squares": [int(m.squares_x), int(m.squares_y)],
+                 "square_m": float(m.square_m), "marker_m": float(m.marker_m)}
+        a.tag_size = float(m.square_m)          # the scale fit then reports the implied square size
+        print(f"start: ChArUco board {m.corners}/{m.corners_total} corners at {m.distance_m*1000:.0f} mm, "
+              f"reproj {m.reproj_err_px:.2f} px ({m.dictionary}, {m.squares_x} x {m.squares_y} x {m.square_m*1000:g} mm)")
+    else:
+        if a.tag_id is None:
+            print("--tag-id required")
+            sys.exit(2)
+        t = c.tag(a.tag_id)
+        if t is None:
+            print(f"tag {a.tag_id} not visible from the start pose; drag the arm so it is, hold, retry")
+            sys.exit(2)
+        print(f"start: tag {a.tag_id} at {t.distance_m*1000:.0f} mm, {t.size_px:.0f} px, reproj {t.reproj_err_px:.2f} px")
     if not check_convention(c, a.speed):
         sys.exit(1)
 
@@ -216,9 +260,9 @@ def main():
         time.sleep(a.settle)                   # settle
         ws = c.wait_still()                    # then wait until the arm has really stopped creeping
         print(f"still after {a.settle + ws:.1f}s", end="  ", flush=True)
-        Ts, Tfs = c.collect_tag(a.tag_id, n=a.frames)
+        Ts, Tfs = c.collect_board(n=a.frames) if board else c.collect_tag(a.tag_id, n=a.frames)
         if len(Ts) < max(3, a.frames // 2):
-            print(f"tag not seen ({len(Ts)} frames) - skipped")
+            print(f"{'board' if board else 'tag'} not seen ({len(Ts)} frames) - skipped")
             continue
         d_t, d_r = spread(Ts)
         if d_t > 0.002 or d_r > math.radians(1.0):
@@ -238,10 +282,12 @@ def main():
     print(f"solving with {len(pairs)} pairs:")
     res = solve(pairs)
     c.close()
-    finish(a, pairs, res, a.tag_id, a.tag_size, log)
+    finish(a, pairs, res, a.tag_id, a.tag_size, log, board)
 
 
-def finish(a, pairs, res, tag_id, tag_size, log):
+def finish(a, pairs, res, tag_id, tag_size, log, board=None):
+    """Refine, judge and write the result. board = the ChArUco board's description when it was the target (then
+    tag_size = its square size and the pairs' camera -> target = the board's centre)."""
     if not res:
         sys.exit(1)
     best = min(res, key=lambda k: res[k][1] + res[k][2] * 0.1)
@@ -250,7 +296,7 @@ def finish(a, pairs, res, tag_id, tag_size, log):
     X, k, rms, mx = refine(pairs, X0, fit_scale=True)
     Xn, _, rms_n, mx_n = refine(pairs, X0, fit_scale=False)
     print(f"position-only refinement, scale fitted : rms {rms*1000:.2f} mm, max {mx*1000:.2f} mm, k = {k:.4f} "
-          f"(implied tag size {tag_size*k*1000 if tag_size else float('nan'):.1f} mm)")
+          f"(implied {'square' if board else 'tag'} size {tag_size*k*1000 if tag_size else float('nan'):.2f} mm)")
     print(f"position-only refinement, scale fixed 1: rms {rms_n*1000:.2f} mm, max {mx_n*1000:.2f} mm")
     names = [e.get("name", str(i)) for i, e in enumerate(log)]
     X, k, rms, mx = refine(pairs, X0, fit_scale=True)   # recompute so last_per matches the scaled fit
@@ -264,7 +310,8 @@ def finish(a, pairs, res, tag_id, tag_size, log):
     raw = a.out.replace(".yaml", f"_pairs_{ts.replace(':', '')}.json")
     if not a.resolve:
         with open(raw, "w") as f:
-            json.dump({"tag_id": tag_id, "tag_size_m": tag_size, "pairs": log}, f)
+            json.dump({"tag_id": tag_id, "tag_size_m": tag_size, "target": "charuco" if board else "tag",
+                       "board": board, "pairs": log}, f)
     q = R.from_matrix(Tfc[:3, :3]).as_quat()
     doc = {
         "flange_to_camera": {
@@ -278,7 +325,8 @@ def finish(a, pairs, res, tag_id, tag_size, log):
         "residual_rms_mm": float(rms_used * 1000), "residual_max_mm": float(mx_used * 1000),
         "closed_form_spread_mm": float(d_t * 1000), "closed_form_spread_deg": float(math.degrees(d_r)),
         "tag_scale_k": float(k), "implied_tag_size_m": float(tag_size * k) if tag_size else None,
-        "accepted": bool(ok), "tag_id": tag_id, "tag_size_m": tag_size,
+        "accepted": bool(ok), "target": "charuco" if board else "tag", "board": board,
+        "tag_id": tag_id, "tag_size_m": tag_size,
         "date": ts, "raw_pairs": os.path.basename(a.resolve or raw),
         "note": "T_base_cam = T_base_flange @ flange_to_camera.matrix; camera optical frame x right, y down, z forward",
     }
