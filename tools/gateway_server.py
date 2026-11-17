@@ -42,6 +42,8 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   node holds the arm where it is and refuses every command; out again, the arm is ready at once, still holding)
   2026-11-16 (spec "the ChArUco board"): state.camera.charuco {seen, corners, corners_total, distance_m, reproj_err_px,
   age_s} from /camera/charuco; {"cmd": "calib.handeye", "args": {"target": "charuco"}} = the hand-eye on the board
+  2026-11-16 (spec "the board in the arm base"): state.camera.charuco also pose_base {R, p_mm}, centre_base_mm,
+  joints_dt_s, handeye_at (the table calibration's input)
   2026-11-16 (spec "the nodes' watchdog"): {"cmd": "nodes.status"} -> {nodes: [...], watchdog: {running, at}} (anyone);
   {"cmd": "nodes.restart", "args": {"node": "camera" | "all"}} -> {ok, restarted} (controller; at once, detached
   `harness nodes restart`, the gateway itself last); state.nodes / state.watchdog = the same
@@ -83,6 +85,8 @@ CLI = os.path.join(ROOT, "tools", "harness")
 RESTART_LOG = "/tmp/nodes_restart.log"     # nodes.restart's detached shell
 NODES_READ_S = 2.0               # the watchdog's status file is read at most this often
 WATCHDOG_FRESH_S = 10.0          # ... and counts as running while it is this fresh (it writes every 3 s)
+CHARUCO_JOINTS_DT_S = 0.2        # camera.charuco.pose_base: the joints sample used was received at most this far from the
+                                 # board's frame (the joints arrive at 100 Hz; a moving arm would skew the pose)
 HANDEYE_SETTLE_S = 3.0           # wait after every hand-eye move before the images (operator: the arm shakes ~3 s)
 TEACH_VEL_RAD_S, TEACH_ACC_RAD_S2 = 0.35, 0.7     # arm.follow_joints: joint speed / acceleration of the path
 FOLLOW_START_TOL_RAD = 0.1       # its first waypoint: this close to where the arm is
@@ -136,7 +140,14 @@ class Gateway:
         put = lambda k: (lambda m: self.last.__setitem__(k, (m, time.time())))
         n.create_subscription(ArmStatus, "/arm/status", put("arm"), 10)
         n.create_subscription(GripperStatus, "/arm/gripper_status", put("grip"), 10)
-        n.create_subscription(JointState, "/joint_states", put("joints"), 10)
+        import collections
+        self.joint_hist = collections.deque(maxlen=300)      # (received, joint_states): ~3 s at 100 Hz
+
+        def on_joints(m):
+            now = time.time()
+            self.last["joints"] = (m, now)
+            self.joint_hist.append((now, m))
+        n.create_subscription(JointState, "/joint_states", on_joints, 10)
         n.create_subscription(String, "/bunny/status", lambda m: self.last.__setitem__("bunny", (json.loads(m.data), time.time())), 10)
         n.create_subscription(TagArray, "/camera/tags", put("tags"), 10)
         try:                                 # the ChArUco board (harness_msgs of 2026-11-16 or later)
@@ -284,16 +295,40 @@ class Gateway:
         self._nodes_cache = (now, v)
         return v
 
+    def joints_near(self, t):
+        """(joints rad, |received - t| s) of the /joint_states sample received nearest to time t, or (None, None)."""
+        best = min(self.joint_hist, key=lambda e: abs(e[0] - t), default=None)
+        if best is None or not all(j in best[1].name for j in JOINTS):
+            return None, None
+        return [float(best[1].position[best[1].name.index(j)]) for j in JOINTS], abs(best[0] - t)
+
     def charuco_state(self):
         """camera.charuco (2026-11-16): seen = the board's pose solved on a frame at most 1 s old; corners = inner corners
         found on that frame (of corners_total); distance_m (camera -> the board's centre) / reproj_err_px / age_s = the
-        newest frame the board was seen on and its age (None: not seen since the gateway started)."""
+        newest frame the board was seen on and its age (None: not seen since the gateway started).
+        pose_base {R (3 x 3 rows), p_mm} = the board frame (OpenCV's: origin the sheet's top-left outer corner, x along
+        the squares_x squares, y down the squares_y, z into the board) in the ARM BASE, and centre_base_mm = the board's
+        centre there: the corrected FK of the joints x calib/handeye.yaml (handeye_at = its date) x the camera -> board
+        pose, as for the tags; null unless the board is seen now, a hand-eye is loaded and the /joint_states sample
+        nearest to the board's frame was received within CHARUCO_JOINTS_DT_S (joints_dt_s) of it."""
         b, sn = self.fresh("charuco", 1.0), self.last.get("charuco_seen")
-        return {"seen": bool(b is not None and b.seen), "corners": int(b.corners) if b is not None else 0,
-                "corners_total": int(b.corners_total) if b is not None else (int(sn[0].corners_total) if sn else None),
-                "distance_m": round(float(sn[0].distance_m), 4) if sn else None,
-                "reproj_err_px": round(float(sn[0].reproj_err_px), 3) if sn else None,
-                "age_s": round(time.time() - sn[1], 1) if sn else None}
+        out = {"seen": bool(b is not None and b.seen), "corners": int(b.corners) if b is not None else 0,
+               "corners_total": int(b.corners_total) if b is not None else (int(sn[0].corners_total) if sn else None),
+               "distance_m": round(float(sn[0].distance_m), 4) if sn else None,
+               "reproj_err_px": round(float(sn[0].reproj_err_px), 3) if sn else None,
+               "age_s": round(time.time() - sn[1], 1) if sn else None,
+               "pose_base": None, "centre_base_mm": None, "joints_dt_s": None, "handeye_at": self.he_info.get("date")}
+        if out["seen"] and self.Tfc is not None:
+            import numpy as np
+            from harness_vision.geom import T_from_pose_msg
+            q, dt = self.joints_near(self.last["charuco"][1])
+            if q is not None and dt <= CHARUCO_JOINTS_DT_S:
+                Tbb = self.kin.fk(q) @ self.Tfc @ T_from_pose_msg(b.pose)
+                c = Tbb @ np.array([b.squares_x * b.square_m / 2.0, b.squares_y * b.square_m / 2.0, 0.0, 1.0])
+                out.update(pose_base={"R": [[round(float(v), 6) for v in row] for row in Tbb[:3, :3]],
+                                      "p_mm": [round(float(v) * 1000, 2) for v in Tbb[:3, 3]]},
+                           centre_base_mm=[round(float(v) * 1000, 2) for v in c[:3]], joints_dt_s=round(dt, 3))
+        return out
 
     def teach_client(self):
         if self.hc is None:
