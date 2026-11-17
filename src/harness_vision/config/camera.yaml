@@ -14,8 +14,8 @@ tag_node:
     # width_at_border / total_width in the library's family struct; the printed tag = all 10 cells, outer data ring included):
     # the Bunny's main tag 0 and the studio holders' 4102-4104 = 50 mm prints -> 30 mm; the capper's 3970 = 30 mm -> 18 mm
     tag_sizes: ["tag16h5:7=0.0375", "tag16h5:5=0.0358", "tag16h5:8=0.0347", "tag16h5:2=0.0225", "tag36h11:3=0.022",
-                "tagStandard52h13:0=0.030", "tagStandard52h13:4102=0.030", "tagStandard52h13:4103=0.030",
-                "tagStandard52h13:4104=0.030", "tagStandard52h13:3970=0.018"]
+                "tagStandard52h13:0=0.030", "tagStandard52h13:1=0.030", "tagStandard52h13:2=0.030",
+                "tagStandard52h13:3=0.030", "tagStandard52h13:3970=0.018"]   # 2026-11-16: the studio holders are 1 (powder dispenser), 2 (22-400), 3 (liquid doser) — were 4102 / 4104 / 4103
     center_fraction: 0.3333     # central square side = fraction of image height
     min_size_px: 40             # "set" needs mean edge length within [min, max] px (standoff gate); 40 was for the old 7.5 mm platform tag
     max_size_px: 260
