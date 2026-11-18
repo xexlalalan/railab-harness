@@ -283,15 +283,34 @@ def collect(a):
     if not (st.ok and st.all_enabled):
         print(f"refused: the arm must be holding (press Hold; ok={st.ok} enabled={st.all_enabled} fault='{st.fault}')")
         sys.exit(2)
-    from harness_calibration.precheck import precheck_from_files, summary
-    pc = precheck_from_files(list(c.joints), a.kin, a.piper_yaml, trans=a.trans, tilt_deg=a.tilt_deg, roll_deg=a.roll_deg)
-    print(summary(pc))                        # the start-posture check (2026-11-17): before any motion
-    if not pc["ok"]:
-        print("refused: " + pc["why"])
-        sys.exit(2)
     m = c.board(max_age=1.0)
     if m is None or m.corners < MIN_CORNERS:
         print(f"refused: the ChArUco board is not in view with >= {MIN_CORNERS} corners ({m.corners if m else 0})")
+        sys.exit(2)
+    # the start-posture check + the re-pose (2026-11-17 / 18): before any motion; the arm fixes a bad posture itself
+    from harness_calibration import precheck as PC
+    kin, P = PC.load_model(a.kin, a.piper_yaml)
+    X = PC.load_handeye(a.handeye)
+
+    def target():
+        b = c.board(max_age=1.0)
+        if b is None or b.corners < MIN_CORNERS:
+            return None
+        C = np.eye(4)
+        C[:3, 3] = [b.squares_x * b.square_m / 2.0, b.squares_y * b.square_m / 2.0, 0.0]
+        return T_from_pose_msg(b.pose) @ C
+    kw = dict(trans=a.trans, tilt_deg=a.tilt_deg, roll_deg=a.roll_deg)
+    pc = PC.assess(kin, list(c.joints), P, X, target(), **kw)
+    print(PC.summary(pc) + ("" if not pc["why"] else "; " + pc["why"]))
+    if not pc["ok"]:
+        print("refused: " + pc["words"])
+        sys.exit(2)
+    if pc["needs_repose"] and not PC.do_repose(c, kin, P, X, target, speed=a.speed, settle_s=a.settle, **kw):
+        print("refused: " + PC.PLAIN_FAIL)
+        sys.exit(2)
+    m = c.board(max_age=1.0)
+    if m is None:
+        print("refused: " + PC.PLAIN_NO_TARGET)
         sys.exit(2)
     os.makedirs(a.dir, exist_ok=True)
     doc = {"position": a.position, "started": dt.datetime.now().isoformat(timespec="seconds"), "complete": False,

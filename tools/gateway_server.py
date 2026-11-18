@@ -48,6 +48,7 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   (position 1..5: a job) | "solve" (a job) | "install" | "status"}}; state.absolute = the status
   2026-11-17 (spec "the start-posture check"): state.calib_precheck {ok, reachable, of, joints, unreachable, why, board_seen,
   at}; calib.handeye / calib.absolute collect refused up front with its words; 15 viewpoints
+  2026-11-18 (spec "the re-pose"): + fixable, needs_repose, words (plain), repose; ok = the routine can go (it re-poses itself)
   2026-11-16 (spec "the nodes' watchdog"): {"cmd": "nodes.status"} -> {nodes: [...], watchdog: {running, at}} (anyone);
   {"cmd": "nodes.restart", "args": {"node": "camera" | "all"}} -> {ok, restarted} (controller; at once, detached
   `harness nodes restart`, the gateway itself last); state.nodes / state.watchdog = the same
@@ -313,10 +314,27 @@ class Gateway:
             return None, None
         return [float(best[1].position[best[1].name.index(j)]) for j in JOINTS], abs(best[0] - t)
 
+    def precheck_target(self):
+        """The calibration target in the camera (4 x 4, its centre): the ChArUco board when seen with >= 20 corners,
+        else the largest tag in view, else None."""
+        import numpy as np
+        from harness_vision.geom import T_from_pose_msg
+        b = self.fresh("charuco", 1.0)
+        if b is not None and b.seen and b.corners >= ABS_MIN_CORNERS:
+            C = np.eye(4)
+            C[:3, 3] = [b.squares_x * b.square_m / 2.0, b.squares_y * b.square_m / 2.0, 0.0]
+            return T_from_pose_msg(b.pose) @ C
+        m = self.fresh("tags", 1.0)
+        if m is not None and m.tags:
+            return T_from_pose_msg(max(m.tags, key=lambda t: t.size_px).pose)
+        return None
+
     def update_precheck(self, force=False):
-        """state.calib_precheck (2026-11-17): the calibrations' start-posture check (harness_calibration/precheck.py, the
-        same function the routines run before any motion) for where the arm holds now: the joints' margins always; the
-        15 views' reachability while the arm holds (recomputed when the joints moved, at most every PRECHECK_S)."""
+        """state.calib_precheck (2026-11-17 / 18): the calibrations' start-posture check + the re-pose search
+        (harness_calibration/precheck.py assess, the same the routines run before any motion) for where the arm holds
+        now: the joints' margins always; the 15 views and, when they fail, the search for a posture the arm can turn to
+        by itself (keeping the camera on the target) while the arm holds (recomputed when the joints moved). ok = the
+        routine can go (as is or after its own re-pose); words = plain, for the page; why = technical, for the logs."""
         from harness_calibration import precheck as PC
         from harness_calibration.handeye import VIEW_SET
         now, q = time.time(), self.joints_rad()
@@ -324,20 +342,35 @@ class Gateway:
         b = self.charuco_state()
         base = {"board_seen": b["seen"], "board_corners": b["corners"], "at": round(now, 2)}
         if q is None:
-            pc = {"ok": False, "reachable": None, "of": len(VIEW_SET), "joints": [], "unreachable": [], "why": "no arm feedback"}
+            pc = {"ok": False, "reachable": None, "of": len(VIEW_SET), "joints": [], "unreachable": [], "why": "no arm feedback",
+                  "fixable": False, "needs_repose": False, "words": "the arm does not answer: check that it is on"}
         elif st is None or not st.all_enabled:
             pc = {"ok": False, "reachable": None, "of": len(VIEW_SET), "joints": PC.joint_margins(self.kin, q), "unreachable": [],
-                  "why": "the arm is not holding (press Hold where the camera sees the target)"}
+                  "why": "the arm is not holding", "fixable": False, "needs_repose": False,
+                  "words": "hold the arm where the camera sees the board, then press Hold"}
         else:
             last = getattr(self, "_pc_last", None)
             if (not force and last is not None and now - last[0] < PRECHECK_MAX_AGE_S
                     and max(abs(a - c) for a, c in zip(q, last[1])) < math.radians(PRECHECK_SAME_DEG)):
                 pc = last[2]
             else:
-                pc = PC.precheck(self.kin, q, self.P)
+                pc = PC.assess(self.kin, q, self.P, self.Tfc, self.precheck_target())
+                rp = pc.pop("repose")
+                pc["repose"] = None if rp is None else {k: rp[k] for k in ("roll_deg", "orbit", "flip", "margin_deg",
+                                                                           "reachable", "of", "motion_deg")}
                 self._pc_last = (now, list(q), pc)
         self.precheck = dict(pc, **base)
         return self.precheck
+
+    def precheck_cached(self):
+        """The last start-posture assessment when it is for the joints the arm holds now (the 1 Hz worker keeps it), else
+        None - the commands never wait for the re-pose search (seconds); the routine runs its own."""
+        last, q = getattr(self, "_pc_last", None), self.joints_rad()
+        if last is None or q is None or time.time() - last[0] > PRECHECK_MAX_AGE_S:
+            return None
+        if max(abs(a - c) for a, c in zip(q, last[1])) >= math.radians(PRECHECK_SAME_DEG):
+            return None
+        return last[2]
 
     def reload_model(self):
         """calib/kinematics.yaml + calib/handeye.yaml read again (after calib.absolute install)."""
@@ -1027,7 +1060,8 @@ def handeye_job(tid, abort, target="tag"):
     what = ["--target", "charuco"] if target == "charuco" else ["--tag-id", str(int(tid))]
     cmd = ["ros2", "run", "harness_calibration", "handeye"] + what + ["--accept-mm", "6.0",
                                                                        "--settle", str(HANDEYE_SETTLE_S), "--out", new,
-                                                                       "--kin", KIN_FILE, "--piper-yaml", PIPER_YAML]
+                                                                       "--kin", KIN_FILE, "--piper-yaml", PIPER_YAML,
+                                                                       "--handeye-file", HANDEYE_FILE]
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True,
                          bufsize=1, env=dict(os.environ, PYTHONUNBUFFERED="1"), start_new_session=True)
     JOB["proc"] = p
@@ -1185,9 +1219,9 @@ class Conn(socketserver.StreamRequestHandler):
             b = gw.charuco_state()
             if not b["seen"] or b["corners"] < ABS_MIN_CORNERS:
                 raise RuntimeError("the ChArUco board is not in view with >= %d corners (%d now)" % (ABS_MIN_CORNERS, b["corners"]))
-            pc = gw.update_precheck(force=True)
-            if not pc["ok"]:
-                raise RuntimeError(pc["why"])
+            pc = gw.precheck_cached()
+            if pc is not None and not pc["ok"]:
+                raise RuntimeError(pc.get("words") or pc["why"])
             return self.job("calib.absolute", lambda ev: absolute_job("collect", ev, d, k), background=True,
                             extra={"action": "collect", "position": k})
         if act == "solve":
@@ -1307,18 +1341,18 @@ class Conn(socketserver.StreamRequestHandler):
             if st is None or not st.all_enabled:
                 raise RuntimeError("the arm is not holding: press Hold first (the routine moves it around where it is)")
             if str(a.get("target") or "tag") == "charuco":
-                pc = gw.update_precheck(force=True)
-                if not pc["ok"]:
-                    raise RuntimeError(pc["why"])
+                pc = gw.precheck_cached()
+                if pc is not None and not pc["ok"]:
+                    raise RuntimeError(pc.get("words") or pc["why"])
                 if not gw.charuco_state()["seen"]:
                     raise RuntimeError("the ChArUco board is not in view: point the camera at it 150-300 mm away")
                 return self.job("calib.handeye", lambda ev: handeye_job(None, ev, "charuco"), background=True,
                                 extra={"target": "charuco"})
             if str(a.get("target") or "tag") != "tag":
                 raise ValueError("calib.handeye target: \"tag\" (tag_id) or \"charuco\"")
-            pc = gw.update_precheck(force=True)
-            if not pc["ok"]:
-                raise RuntimeError(pc["why"])
+            pc = gw.precheck_cached()
+            if pc is not None and not pc["ok"]:
+                raise RuntimeError(pc.get("words") or pc["why"])
             seen = gw.camera()["tags"]
             tid = a.get("tag_id")
             if tid is None:

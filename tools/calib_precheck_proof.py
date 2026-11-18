@@ -102,7 +102,8 @@ def main():
            "refused: " + want]
     print(f"5. a job's error = the routine's own words: old output -> \"{G.last_error(run2)}\"; now -> \"{G.last_error(now)}\"")
     ok &= G.last_error(now) == want
-    gw = types.SimpleNamespace(kin=kin, P=P, last={})
+    gw = types.SimpleNamespace(kin=kin, P=P, last={}, Tfc=X)
+    gw.precheck_target = lambda: None
     gw.joints_rad = lambda: list(q_c)
     gw.charuco_state = lambda: {"seen": True, "corners": 64}
     gw.fresh = lambda k, a: types.SimpleNamespace(all_enabled=True) if k == "arm" else None

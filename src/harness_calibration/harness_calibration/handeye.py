@@ -203,6 +203,8 @@ def main():
                     help="the corrected arm model (the start-posture check)")
     ap.add_argument("--piper-yaml", default=os.path.expanduser("~/bunny-harness-dev/src/harness_arm/config/piper.yaml"),
                     help="the arm node's parameters (the start-posture check)")
+    ap.add_argument("--handeye-file", default=os.path.expanduser("~/bunny-harness-dev/calib/handeye.yaml"),
+                    help="the installed hand-eye: where the camera is, for the re-pose that keeps it on the target")
     ap.add_argument("--resolve", nargs="+", default=None, help="re-solve from saved *_pairs_*.json files (merged) instead of moving the arm")
     ap.add_argument("--rescale", type=float, default=1.0, help="--resolve: multiply the recorded camera->tag translations by this (true_size/recorded_size)")
     a = ap.parse_args()
@@ -239,14 +241,6 @@ def main():
             print("Cartesian moves are refused from here: move the arm inside its limits first (move_j), then retry")
             c.close()
             sys.exit(2)
-    else:                                     # the start-posture check (2026-11-17): before any motion
-        from harness_calibration.precheck import precheck_from_files, summary
-        pc = precheck_from_files(list(c.joints), a.kin, a.piper_yaml, trans=a.trans, tilt_deg=a.tilt_deg, roll_deg=a.roll_deg)
-        print(summary(pc))
-        if not pc["ok"]:
-            print("refused: " + pc["why"])
-            c.close()
-            sys.exit(2)
 
     if a.check_convention:
         ok = check_convention(c, a.speed)
@@ -273,6 +267,7 @@ def main():
             print(f"refused: tag {a.tag_id} not visible from the start pose; drag the arm so it is, hold, retry")
             sys.exit(2)
         print(f"start: tag {a.tag_id} at {t.distance_m*1000:.0f} mm, {t.size_px:.0f} px, reproj {t.reproj_err_px:.2f} px")
+    start_posture(c, a, board)                # the start-posture check + the re-pose (2026-11-17 / 18): before any motion
     if not check_convention(c, a.speed):
         sys.exit(1)
 
@@ -316,6 +311,37 @@ def main():
     res = solve(pairs)
     c.close()
     finish(a, pairs, res, a.tag_id, a.tag_size, log, board)
+
+
+def start_posture(c, a, board):
+    """The start-posture check (precheck.py) before any motion; a posture too close to a joint end or reaching too few
+    views is fixed by the arm itself (the re-pose keeps the camera on the target), never by the user."""
+    from harness_calibration import precheck as PC
+    from harness_vision.geom import T_from_pose_msg
+    kin, P = PC.load_model(a.kin, a.piper_yaml)
+    X = PC.load_handeye(a.handeye_file)
+
+    def target():
+        if board:
+            m = c.board(max_age=1.0)
+            if m is None or m.corners < 20:
+                return None
+            C = np.eye(4)
+            C[:3, 3] = [m.squares_x * m.square_m / 2.0, m.squares_y * m.square_m / 2.0, 0.0]
+            return T_from_pose_msg(m.pose) @ C
+        t = c.tag(a.tag_id)
+        return T_from_pose_msg(t.pose) if t is not None else None
+    kw = dict(trans=a.trans, tilt_deg=a.tilt_deg, roll_deg=a.roll_deg)
+    pc = PC.assess(kin, list(c.joints), P, X, target(), **kw)
+    print(PC.summary(pc) + ("" if not pc["why"] else "; " + pc["why"]))
+    if not pc["ok"]:
+        print("refused: " + pc["words"])
+        c.close()
+        sys.exit(2)
+    if pc["needs_repose"] and not PC.do_repose(c, kin, P, X, target, speed=a.speed, settle_s=a.settle, **kw):
+        print("refused: " + PC.PLAIN_FAIL)
+        c.close()
+        sys.exit(2)
 
 
 def finish(a, pairs, res, tag_id, tag_size, log, board=None):
