@@ -129,12 +129,20 @@ def smooth_fraction(t: np.ndarray, T: float, ramp: float) -> np.ndarray:
     return np.clip(u, 0.0, 1.0)
 
 
-def min_jerk(q0, q1, vmax: float, amax: float, rate_hz: float, t_min: float = 2.0):
+def _per_joint(x, n: int = 6) -> np.ndarray:
+    """A joint limit given as one number for every joint or one per joint (2026-11-19: the base joint's own) -> (n,)."""
+    a = np.asarray(x, float)
+    return np.full(n, float(a)) if a.ndim == 0 else a.reshape(-1)[:n]
+
+
+def min_jerk(q0, q1, vmax, amax, rate_hz: float, t_min: float = 2.0):
     """Joint-space move q0 -> q1 (minimum-jerk profile), duration from the limits: peak speed
-    1.875 d / T, peak acceleration 5.774 d / T^2 (d = largest joint distance). Returns (t, q)."""
+    1.875 d / T, peak acceleration 5.774 d / T^2 (d = each joint's distance against its own limit: vmax / amax one
+    number for every joint, or one per joint). Returns (t, q)."""
     q0, q1 = np.asarray(q0, float), np.asarray(q1, float)
-    d = float(np.abs(q1 - q0).max())
-    T = max(t_min, 1.875 * d / vmax, math.sqrt(5.774 * d / amax))
+    d = np.abs(q1 - q0)
+    vm, am = _per_joint(vmax, len(d)), _per_joint(amax, len(d))
+    T = max(t_min, float((1.875 * d / vm).max()), math.sqrt(float((5.774 * d / am).max())))
     n = max(2, int(math.ceil(T * rate_hz)) + 1)
     t = np.linspace(0.0, T, n)
     tau = t / T
@@ -161,21 +169,25 @@ def _corner_runs(W, corner_deg: float = CORNER_DEG):
     return runs
 
 
-def _run_motion(P, vmax: float, amax: float, rate_hz: float, t_min: float):
+def _run_motion(P, vmax, amax, rate_hz: float, t_min: float):
     """Nearly-collinear waypoints P (>= 3) as ONE motion (2026-10-24, operator: smooth, no stop-and-go): a C2
-    spline through every waypoint (parameter = the largest joint's distance along the polyline), minimum-jerk
-    along it, stretched in time until joint speed and acceleration are within vmax / amax. Returns (t, q)."""
-    u = np.concatenate([[0.0], np.cumsum(np.abs(np.diff(P, axis=0)).max(axis=1))])
+    spline through every waypoint (parameter = the largest joint's distance along the polyline, each joint weighted by
+    the slowest joint's limit over its own — 2026-11-19: a faster base joint), minimum-jerk along it, stretched in time
+    until every joint's speed and acceleration are within vmax / amax (one number, or one per joint). Returns (t, q)."""
+    vm, am = _per_joint(vmax, P.shape[1]), _per_joint(amax, P.shape[1])
+    w = vm.min() / vm
+    u = np.concatenate([[0.0], np.cumsum((np.abs(np.diff(P, axis=0)) * w).max(axis=1))])
     L = float(u[-1])
+    La = float(np.abs(np.diff(P, axis=0) * (am.min() / am)).max(axis=1).sum())
     sp = CubicSpline(u, P, axis=0, bc_type="natural")
-    T = max(t_min, 1.875 * L / vmax, math.sqrt(5.774 * L / amax))
+    T = max(t_min, 1.875 * L / float(vm.min()), math.sqrt(5.774 * La / float(am.min())))
     for _ in range(8):
         t = np.linspace(0.0, T, max(3, int(math.ceil(T * rate_hz)) + 1))
         tau = t / T
         q = sp(L * (10 * tau ** 3 - 15 * tau ** 4 + 6 * tau ** 5))
         v = np.diff(q, axis=0) / np.diff(t)[:, None]
         a = np.diff(v, axis=0) / np.diff(t)[1:, None]
-        r = max(float(np.abs(v).max()) / vmax, math.sqrt(float(np.abs(a).max()) / amax))
+        r = max(float((np.abs(v) / vm).max()), math.sqrt(float((np.abs(a) / am).max())))
         if r <= 1.0:
             break
         T *= r * 1.02
@@ -186,7 +198,8 @@ def _run_motion(P, vmax: float, amax: float, rate_hz: float, t_min: float):
 # ---------------------------------------------------------------------------------- the plan
 @dataclass
 class Limits:
-    """Planner limits + the safety parameters it shares with the arm node (piper.yaml)."""
+    """Planner limits + the safety parameters it shares with the arm node (piper.yaml). The joint speed / acceleration:
+    one number for every joint, or one per joint (2026-11-19, arm.follow_joints: the base joint twice the others)."""
     max_joint_vel_rad_s: float = 0.5
     max_joint_acc_rad_s2: float = 1.0
     ik_margin_rad: float = 0.02
@@ -346,24 +359,25 @@ def validate(kin, traj: Trajectory, lim: Limits, at=None, L=None, ramp=None, loo
         raise PlanError("trajectory time does not increase")
     v = np.diff(q, axis=0) / dt[:, None]
     vmax = np.abs(v).max(axis=0)
-    i, j = np.unravel_index(np.abs(v).argmax(), v.shape)
-    if abs(v[i, j]) > lim.max_joint_vel_rad_s * 1.001:
+    vlim, alim = _per_joint(lim.max_joint_vel_rad_s, q.shape[1]), _per_joint(lim.max_joint_acc_rad_s2, q.shape[1])
+    i, j = np.unravel_index((np.abs(v) / vlim).argmax(), v.shape)
+    if abs(v[i, j]) > vlim[j] * 1.001:
         need = ""
         if duration_s and loop and loop[1] <= i < loop[2]:
             # cruise speed ~ 1 / (T - ramp), ramp = min(2 s, T / 4): the loop time that brings this joint to the limit
             r = ramp if ramp is not None else min(2.0, duration_s / 4.0)
-            T_need = (duration_s - r) * abs(v[i, j]) / lim.max_joint_vel_rad_s
+            T_need = (duration_s - r) * abs(v[i, j]) / vlim[j]
             T_need = T_need + 2.0 if T_need >= 6.0 else T_need * 4.0 / 3.0
             need = f"; a loop of about {math.ceil(T_need * 1.05)} s or longer fits (--duration)"
         raise PlanError(f"joint {j + 1} would turn at {math.degrees(abs(v[i, j])):.1f} deg/s > the "
-                        f"{math.degrees(lim.max_joint_vel_rad_s):.1f} deg/s limit ({where(i)}){need}")
+                        f"{math.degrees(vlim[j]):.1f} deg/s limit ({where(i)}){need}")
     acc = np.diff(v, axis=0) / dt[1:, None]
     amax = np.abs(acc).max(axis=0) if len(acc) else np.zeros(6)
     if len(acc):
-        i, j = np.unravel_index(np.abs(acc).argmax(), acc.shape)
-        if abs(acc[i, j]) > lim.max_joint_acc_rad_s2 * 1.001:
+        i, j = np.unravel_index((np.abs(acc) / alim).argmax(), acc.shape)
+        if abs(acc[i, j]) > alim[j] * 1.001:
             raise PlanError(f"joint {j + 1} would accelerate at {abs(acc[i, j]):.2f} rad/s^2 > the "
-                            f"{lim.max_joint_acc_rad_s2:.2f} limit ({where(i + 1)}); slow it down (--duration)")
+                            f"{alim[j]:.2f} limit ({where(i + 1)}); slow it down (--duration)")
     a, b, c = lim.floor_plane
     wmin, wmax = np.array(lim.workspace_min), np.array(lim.workspace_max)
     clear_min, dev_m, dev_r = 1e9, 0.0, 0.0

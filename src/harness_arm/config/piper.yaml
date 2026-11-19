@@ -55,6 +55,11 @@ piper:
     traj_rate_hz: 100.0            # move_j re-targeted this often while a trajectory runs
     traj_max_joint_vel_rad_s: 0.75 # refuse trajectories faster than this (+10 %) between points (0.6 until 2026-11-18,
                                    # operator: "保持网关上限速度，把机械臂节点的速度硬上限提高" — the gateway's paths at 0.70)
+    traj_j1_vel_factor: 2.0        # the base joint's gate = traj_max_joint_vel_rad_s x this (2026-11-19, operator: "机械臂基座那个
+                                   # 关节，速度加倍": the gateway plans j1 at 2 x the others, 1.40 rad/s at its speed 2)
+    traj_stream_speed_percent: 60  # the controller's speed ceiling while a timed trajectory streams (the trajectory's own
+                                   # timing limits the motion; 30 % ~ 0.94 rad/s on j1 would clip the 1.40). move_j /
+                                   # move_pose requests keep max_speed_percent
     traj_tracking_error_rad: 0.30  # freeze + fail when |measured - commanded| exceeds this on any joint (0.15 until
                                    # 2026-11-18, operator: "直接把这个误差也放宽一倍" — with the faster paths)
     traj_start_tol_rad: 0.2        # the first point must be this close to the current joints (0.05 until 2026-11-19)

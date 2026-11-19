@@ -111,6 +111,10 @@ FOLLOW_SPEED_MAX, FOLLOW_CORNER_MAX = 2.0, 45.0
 # "point 329: joint 5 would turn at 0.70 rad/s > 0.66" when it was 0.6; the operator then raised it to 0.75): the path is
 # planned to at most this = 2 x TEACH_VEL_RAD_S
 FOLLOW_VEL_CAP_RAD_S = 0.70
+# THE BASE JOINT TWICE AS FAST (2026-11-19, operator: "机械臂基座那个关节，速度加倍"): arm.follow_joints plans j1 with
+# FOLLOW_J1_FACTOR x the others' speed AND acceleration (the cap too: 1.40 rad/s at speed 2) — the arm node's gate
+# follows (piper.yaml traj_j1_vel_factor), and the controller's ceiling while it streams (traj_stream_speed_percent)
+FOLLOW_J1_FACTOR = 2.0
 FOLLOW_START_TOL_RAD = 0.35      # its first waypoint: this close to where the arm is (0.1 until 2026-11-19, relaxed)
 FOLLOW_CLAMP_RAD = math.radians(10.0)  # waypoints beyond the controller limits by up to this are clamped inside (3 until 2026-11-19)
 FOLLOW_RECOVER_RAD = math.radians(20.0) # an arm held past a limit by up to this: the path first brings it back inside (6 until 2026-11-19)
@@ -605,8 +609,10 @@ class Gateway:
         kin, lim = load_model(ROOT)
         from harness_planner.trajectory import CORNER_DEG
         k = max(0.25, min(FOLLOW_SPEED_MAX, float(speed or 1.0)))
-        lim.max_joint_vel_rad_s = min(TEACH_VEL_RAD_S * k, FOLLOW_VEL_CAP_RAD_S)
-        lim.max_joint_acc_rad_s2 = TEACH_ACC_RAD_S2 * k
+        v = min(TEACH_VEL_RAD_S * k, FOLLOW_VEL_CAP_RAD_S)
+        f = np.array([FOLLOW_J1_FACTOR, 1.0, 1.0, 1.0, 1.0, 1.0])     # j1 first (THE BASE JOINT TWICE AS FAST)
+        lim.max_joint_vel_rad_s = v * f
+        lim.max_joint_acc_rad_s2 = TEACH_ACC_RAD_S2 * k * f
         corner = max(CORNER_DEG, min(FOLLOW_CORNER_MAX, float(corner_deg or CORNER_DEG)))
         try:
             tr = plan_joint_path(self.kin, W, lim, from_outside=True, corner_deg=corner)
