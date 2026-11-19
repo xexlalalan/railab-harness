@@ -4,17 +4,21 @@ piper:
     rate_hz: 100.0
     default_speed_percent: 10
     max_speed_percent: 30          # hard cap this sprint; raise deliberately
-    watchdog_s: 0.25               # feedback silence that cancels the goal and latches a fault (the arm stays enabled)
-    move_timeout_s: 30.0
-    max_joint_delta_rad: 1.2       # one goal may not ask any joint to jump further than this (~70 deg)
+    watchdog_s: 1.0                # feedback silence that cancels the goal and latches a fault (the arm stays enabled; 0.25
+                                   # until 2026-11-19, operator: "奥卡姆剃刀。能彻底取消的彻底取消，能放宽限制的就放宽限制")
+    move_timeout_s: 60.0           # (30 until 2026-11-19, relaxed)
+    max_joint_delta_rad: 3.0       # one goal may not ask any joint to jump further than this (1.2 until 2026-11-19, relaxed)
     pose_max_joint_delta_rad: 1.2  # (unused since 2026-10-24: a straight line is planned whole; a joint jumping > smooth_knot_jump_rad between knots refuses it)
     joint_tol_rad: 0.01
     pos_tol_m: 0.003
     ang_tol_rad: 0.03
     settle_samples: 5              # consecutive in-tolerance samples at 20 Hz
-    workspace_min: [-0.70, -0.70, -0.05]   # arm_base frame, metres (the floor is guarded by the tip check below, not by this box)
-    workspace_max: [ 0.70,  0.70,  0.90]
-    floor_enabled: true            # from 'ros2 run harness_calibration floor' 2026-09-17: 181 samples, 23x23 cm, rms 2.2 / max 4.8 mm
+    # the workspace box is OFF (2026-11-19, 2026-11-19, operator: "奥卡姆剃刀。能彻底取消的彻底取消，能放宽限制的就放宽限制"): the twin's planner checks the arm against the set-up;
+    # it was [-0.70, -0.70, -0.05] .. [0.70, 0.70, 0.90]
+    workspace_min: [-5.0, -5.0, -5.0]
+    workspace_max: [ 5.0,  5.0,  5.0]
+    floor_enabled: false           # OFF 2026-11-19 (operator, Occam: the twin plans the table); the plane below is the
+                                   # 'ros2 run harness_calibration floor' 2026-09-17 fit: 181 samples, 23x23 cm, rms 2.2 / max 4.8 mm
     floor_plane: [-0.01221, -0.00446, 0.00453]   # base frame z = a*x + b*y + c (m); both 2026-09-18 drags with the 4-parameter wrist model: tilt 0.74 deg, rms 1.74 mm
     tcp_offset_m: 0.1441           # finger set #3, gripper base face -> fingertip, from the floor fit; ruler check welcome
     floor_margin_m: 0.015          # 10 mm requested safe space + 5 mm fit uncertainty; targets closer than this are refused
@@ -29,14 +33,14 @@ piper:
     gripper_hold_force: 5.0        # N: /arm/gripper_enable (Hold gripper) grips where the jaws are with this (operator 2026-10-24)
     gripper_force: 1.0
     gripper_tol_m: 0.002
-    gripper_timeout_s: 4.0
+    gripper_timeout_s: 10.0        # (4 until 2026-11-19, relaxed: a close to 0 mm from wide open)
     # --- corrected kinematic model (2026-09-18): harness FK/IK over the SDK MDH table + joint zero offsets
     kinematics_file: /home/bunny-harness/bunny-harness-dev/calib/kinematics.yaml
     kinematics_model: piper
     ik_limit_margin_rad: 0.02
     linear_step_m: 0.02            # (unused since 2026-10-24: straight lines are smooth, not 20 mm hops)
     linear_step_rad: 0.1
-    pose_total_jump_rad: 2.5       # point-to-point move_pose: one smooth joint move up to this jump; beyond = refused
+    pose_total_jump_rad: 6.0       # point-to-point move_pose: one smooth joint move up to this jump; beyond = refused (2.5 until 2026-11-19)
     stall_s: 2.0                   # (unused since 2026-10-24: a joint the controller clamps shows as a tracking error)
     # --- smooth moves (2026-10-24): move_j / move_pose are minimum-jerk trajectories streamed like follow_trajectory.
     # speed_percent scales these peaks (10 % = 0.3 rad/s joints, 50 mm/s and 0.3 rad/s tool); acceleration peak =
@@ -46,14 +50,14 @@ piper:
     smooth_tool_vel_rad_s: 3.0
     smooth_acc_per_s: 2.0
     smooth_knot_s: 0.04            # straight lines: IK every 40 ms of the profile, joints interpolated at traj_rate_hz
-    smooth_knot_jump_rad: 0.15     # a joint changing more than this between two knots = a wrist flip: refused
+    smooth_knot_jump_rad: 0.5      # a joint changing more than this between two knots = a wrist flip: refused (0.15 until 2026-11-19)
     # --- /arm/follow_trajectory (2026-10-22, planner bedrock): streamed joint trajectories
     traj_rate_hz: 100.0            # move_j re-targeted this often while a trajectory runs
     traj_max_joint_vel_rad_s: 0.75 # refuse trajectories faster than this (+10 %) between points (0.6 until 2026-11-18,
                                    # operator: "保持网关上限速度，把机械臂节点的速度硬上限提高" — the gateway's paths at 0.70)
     traj_tracking_error_rad: 0.30  # freeze + fail when |measured - commanded| exceeds this on any joint (0.15 until
                                    # 2026-11-18, operator: "直接把这个误差也放宽一倍" — with the faster paths)
-    traj_start_tol_rad: 0.05       # the first point must be this close to the current joints
+    traj_start_tol_rad: 0.2        # the first point must be this close to the current joints (0.05 until 2026-11-19)
     traj_max_points: 20000
     # --- e-stop button (2026-10-24): its normally-closed contact carries the 5 V of this USB mouse (lsusb vendor:product);
     # pressed = the mouse gone = goals cancelled, joints 1-6 held where they are, every command refused until it is out

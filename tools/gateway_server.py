@@ -76,7 +76,7 @@ HANDEYE_FILE = os.path.join(ROOT, "calib", "handeye.yaml")
 TEACH_TAGS = os.path.join(ROOT, "calib", "teach", "tags.yaml")      # teach.fine results, by tag id (+ by "family:id")
 CV_FAMILIES = ("tag16h5", "tag25h9", "tag36h11")   # the only families stored before 2026-11-16 (records without a family)
 VERSION = 5
-DEADMAN_S = 3.0
+DEADMAN_S = 10.0                 # (3 until 2026-11-19, relaxed: a network hiccup froze the arm)
 HOLDER_STALE_S = 10.0     # a control holder silent this long (no ping, no command) can be taken over
 JOINTS = ["joint%d" % i for i in range(1, 7)]
 ARM_ACTIONS = ("/arm/move_j", "/arm/move_pose", "/arm/follow_trajectory")
@@ -111,9 +111,9 @@ FOLLOW_SPEED_MAX, FOLLOW_CORNER_MAX = 2.0, 45.0
 # "point 329: joint 5 would turn at 0.70 rad/s > 0.66" when it was 0.6; the operator then raised it to 0.75): the path is
 # planned to at most this = 2 x TEACH_VEL_RAD_S
 FOLLOW_VEL_CAP_RAD_S = 0.70
-FOLLOW_START_TOL_RAD = 0.1       # its first waypoint: this close to where the arm is
-FOLLOW_CLAMP_RAD = math.radians(3.0)   # waypoints beyond the controller limits by up to this are clamped inside
-FOLLOW_RECOVER_RAD = math.radians(6.0)  # an arm held past a limit by up to this: the path first brings it back inside
+FOLLOW_START_TOL_RAD = 0.35      # its first waypoint: this close to where the arm is (0.1 until 2026-11-19, relaxed)
+FOLLOW_CLAMP_RAD = math.radians(10.0)  # waypoints beyond the controller limits by up to this are clamped inside (3 until 2026-11-19)
+FOLLOW_RECOVER_RAD = math.radians(20.0) # an arm held past a limit by up to this: the path first brings it back inside (6 until 2026-11-19)
 VIEW_CONE_DEG = 22.0             # teach.plan_views: an approximate centre view keeps the tag this close to the camera axis
 VIEW_ROOM_RAD = math.radians(4.0)      # ... and this much more room from the joint limits (so the tilts fit)
 
@@ -662,8 +662,8 @@ class Gateway:
             raise RuntimeError("no arm feedback")
         flange = self.flange_from_tip(tip_mm_deg)
         far = float(np.linalg.norm(np.array(flange[:3]) - self.kin.fk(q)[:3, 3]))
-        if far > 0.4:
-            raise RuntimeError("refused: the target is %.0f mm away (> 400 mm): plan a free move there first" % (far * 1000))
+        if far > 1.0:                                     # (0.4 until 2026-11-19, relaxed)
+            raise RuntimeError("refused: the target is %.0f mm away (> 1000 mm): plan a free move there first" % (far * 1000))
         return self.move_pose_goal(flange, bool(linear), speed, abort)
 
     def move_pose_goal(self, pose, linear, speed, abort):
@@ -1390,8 +1390,8 @@ class Conn(socketserver.StreamRequestHandler):
         if cmd == "arm.move_linear":
             self.need("control")
             d = [float(v) for v in a.get("delta_mm") or []]
-            if len(d) != 3 or math.sqrt(sum(v * v for v in d)) > 300.0:
-                raise ValueError("delta_mm needs x y z (mm), at most 300 mm long")
+            if len(d) != 3 or math.sqrt(sum(v * v for v in d)) > 1000.0:      # (300 until 2026-11-19, relaxed)
+                raise ValueError("delta_mm needs x y z (mm), at most 1000 mm long")
             speed = max(1, min(int(gw.P.get("max_speed_percent", 30)), int(a.get("speed_percent") or 10)))
             return self.job("arm.move_linear", lambda ev: gw.move_linear(d, speed, ev))
         if cmd == "teach.tag":
