@@ -51,7 +51,8 @@ piper:
     traj_rate_hz: 100.0            # move_j re-targeted this often while a trajectory runs
     traj_max_joint_vel_rad_s: 0.75 # refuse trajectories faster than this (+10 %) between points (0.6 until 2026-11-18,
                                    # operator: "保持网关上限速度，把机械臂节点的速度硬上限提高" — the gateway's paths at 0.70)
-    traj_tracking_error_rad: 0.15  # freeze + fail when |measured - commanded| exceeds this on any joint
+    traj_tracking_error_rad: 0.30  # freeze + fail when |measured - commanded| exceeds this on any joint (0.15 until
+                                   # 2026-11-18, operator: "直接把这个误差也放宽一倍" — with the faster paths)
     traj_start_tol_rad: 0.05       # the first point must be this close to the current joints
     traj_max_points: 20000
     # --- e-stop button (2026-10-24): its normally-closed contact carries the 5 V of this USB mouse (lsusb vendor:product);
