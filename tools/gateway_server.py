@@ -23,6 +23,7 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   {"cmd": "teach.fine", "args": {"tag_id": 7, "black_mm": 37.5, "tilt_deg": 3, "views_model_deg": {...},
                                  "family": "tag16h5"}}   job: the cross (family: only that family's tag, 2026-10-25)
   {"cmd": "arm.follow_joints", "args": {"waypoints_model_deg": [[...6], ...]}}   job: a planner's joint path
+                                                          (+ "speed": 1-2 x, "corner_deg": 5-45, 2026-11-18)
   {"cmd": "arm.move_linear", "args": {"delta_mm": [0, 0, 100], "speed_percent": 10}}   job: fingertip straight by delta
   v3 (2026-10-24, spec "Gripper release, hold and calibration"):
   {"cmd": "arm.gripper_release"}                          the gripper motor only goes free (the arm keeps holding)
@@ -101,6 +102,11 @@ CHARUCO_JOINTS_DT_S = 0.2        # camera.charuco.pose_base: the joints sample u
                                  # board's frame (the joints arrive at 100 Hz; a moving arm would skew the pose)
 HANDEYE_SETTLE_S = 3.0           # wait after every hand-eye move before the images (operator: the arm shakes ~3 s)
 TEACH_VEL_RAD_S, TEACH_ACC_RAD_S2 = 0.35, 0.7     # arm.follow_joints: joint speed / acceleration of the path
+# arm.follow_joints {speed, corner_deg} (2026-11-18, operator: "在非装载线的步骤，把机械臂的运行速度提升一倍，且大幅提高waypoint节点的
+# 速度，不要有卡顿感"): `speed` scales TEACH_VEL / TEACH_ACC (1 … FOLLOW_SPEED_MAX); `corner_deg` = the turn below which a
+# waypoint is passed without stopping (trajectory.CORNER_DEG 5 … FOLLOW_CORNER_MAX): a dense planner path turns a few
+# degrees at many knots and stopped at each
+FOLLOW_SPEED_MAX, FOLLOW_CORNER_MAX = 2.0, 45.0
 FOLLOW_START_TOL_RAD = 0.1       # its first waypoint: this close to where the arm is
 FOLLOW_CLAMP_RAD = math.radians(3.0)   # waypoints beyond the controller limits by up to this are clamped inside
 FOLLOW_RECOVER_RAD = math.radians(6.0)  # an arm held past a limit by up to this: the path first brings it back inside
@@ -555,8 +561,9 @@ class Gateway:
                 yaml.safe_dump(doc, f, sort_keys=False)
         return res
 
-    def follow_joints(self, conn, wps_deg, label, abort):
-        """arm.follow_joints: a planner's joint path (corrected-model degrees) -> validated, streamed trajectory."""
+    def follow_joints(self, conn, wps_deg, label, abort, speed: float = 1.0, corner_deg=None):
+        """arm.follow_joints: a planner's joint path (corrected-model degrees) -> validated, streamed trajectory
+        (`speed` x the teach speed / acceleration, `corner_deg` the stop-at-corner turn: FOLLOW_SPEED_MAX / _CORNER_MAX)."""
         import numpy as np
         from harness_planner.demo import load_model, to_msg
         from harness_planner.trajectory import PlanError, plan_joint_path
@@ -592,9 +599,12 @@ class Gateway:
         if out.max() > 1e-6:                             # held past a limit (2026-10-24): first straight back inside
             W = np.vstack([qa, W])
         kin, lim = load_model(ROOT)
-        lim.max_joint_vel_rad_s, lim.max_joint_acc_rad_s2 = TEACH_VEL_RAD_S, TEACH_ACC_RAD_S2
+        from harness_planner.trajectory import CORNER_DEG
+        k = max(0.25, min(FOLLOW_SPEED_MAX, float(speed or 1.0)))
+        lim.max_joint_vel_rad_s, lim.max_joint_acc_rad_s2 = TEACH_VEL_RAD_S * k, TEACH_ACC_RAD_S2 * k
+        corner = max(CORNER_DEG, min(FOLLOW_CORNER_MAX, float(corner_deg or CORNER_DEG)))
         try:
-            tr = plan_joint_path(self.kin, W, lim, from_outside=True)
+            tr = plan_joint_path(self.kin, W, lim, from_outside=True, corner_deg=corner)
         except PlanError as e:
             raise RuntimeError("refused: %s" % e)
         if not self.ac_t.wait_for_server(timeout_sec=3.0):
@@ -1392,7 +1402,8 @@ class Conn(socketserver.StreamRequestHandler):
         if cmd == "arm.follow_joints":
             self.need("control")
             wps, label = a.get("waypoints_model_deg"), str(a.get("label") or "")
-            return self.job("arm.follow_joints", lambda ev: gw.follow_joints(self, wps, label, ev))
+            speed, corner = float(a.get("speed") or 1.0), a.get("corner_deg")
+            return self.job("arm.follow_joints", lambda ev: gw.follow_joints(self, wps, label, ev, speed, corner))
         if cmd == "arm.gripper":
             self.need("control")
             from harness_msgs.srv import SetGripper

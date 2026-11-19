@@ -145,15 +145,15 @@ def min_jerk(q0, q1, vmax: float, amax: float, rate_hz: float, t_min: float = 2.
 CORNER_DEG = 5.0      # plan_joint_path: waypoints whose path turns less than this are passed without stopping
 
 
-def _corner_runs(W):
+def _corner_runs(W, corner_deg: float = CORNER_DEG):
     """Split a joint polyline (no zero-length segments) into runs of waypoint indices whose consecutive
-    segments turn by less than CORNER_DEG: a run is driven as one motion, a real corner stops."""
+    segments turn by less than corner_deg (default CORNER_DEG): a run is driven as one motion, a real corner stops."""
     runs, cur = [], [0]
     for k in range(1, len(W) - 1):
         a, b = W[k] - W[k - 1], W[k + 1] - W[k]
         c = float(a @ b) / max(1e-12, float(np.linalg.norm(a) * np.linalg.norm(b)))
         cur.append(k)
-        if math.degrees(math.acos(max(-1.0, min(1.0, c)))) >= CORNER_DEG:
+        if math.degrees(math.acos(max(-1.0, min(1.0, c)))) >= corner_deg:
             runs.append(cur)
             cur = [k]
     cur.append(len(W) - 1)
@@ -283,7 +283,7 @@ def plan_path_run(kin, path: CartesianPath, q_now, duration_s: float, lim: Limit
 
 
 def plan_joint_path(kin, waypoints, lim: Limits, rate_hz: float = 100.0, t_min: float = 0.8,
-                    from_outside: bool = False) -> Trajectory:
+                    from_outside: bool = False, corner_deg: float = CORNER_DEG) -> Trajectory:
     """A joint path from a planner (rad, K x 6, the first = where the arm is; PROJECT_SPEC.md
     "2026-10-23 — Release, hand-eye and tag teaching"): each segment a STRAIGHT line in joint space —
     what a collision-checked joint path assumes between its waypoints — timed as a minimum-jerk move
@@ -300,7 +300,8 @@ def plan_joint_path(kin, waypoints, lim: Limits, rate_hz: float = 100.0, t_min: 
     ts, qs, segs, t_off = [], [], [], 0.0
     # 2026-10-24: waypoints on a nearly straight run (a planned straight rise, a curve sampled densely) are driven
     # through without stopping; the arm comes to rest only at real corners (CORNER_DEG) and at the end
-    for run in (_corner_runs(W) if len(W) >= 2 else []):
+    for run in (_corner_runs(W, corner_deg) if len(W) >= 2 else []):   # (corner_deg: 2026-11-18, the caller may
+                                                                           # pass small turns of a dense planner path)
         P = W[run]
         if len(P) == 2:
             t, q = min_jerk(P[0], P[1], lim.max_joint_vel_rad_s, lim.max_joint_acc_rad_s2, rate_hz, t_min=t_min)
