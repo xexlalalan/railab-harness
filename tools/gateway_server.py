@@ -24,6 +24,9 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
                                  "family": "tag16h5"}}   job: the cross (family: only that family's tag, 2026-10-25)
   {"cmd": "arm.follow_joints", "args": {"waypoints_model_deg": [[...6], ...]}}   job: a planner's joint path
                                                           (+ "speed": 1-2 x, "corner_deg": 5-45, 2026-11-18)
+                                                          (+ "blend": true = ONE smooth motion through every waypoint,
+                                                          at rest only at the ends; "speeds": [K-1] per segment,
+                                                          0.25-2 x like "speed" (missing = speed); 2026-11-19)
   {"cmd": "arm.move_linear", "args": {"delta_mm": [0, 0, 100], "speed_percent": 10}}   job: fingertip straight by delta
   v3 (2026-10-24, spec "Gripper release, hold and calibration"):
   {"cmd": "arm.gripper_release"}                          the gripper motor only goes free (the arm keeps holding)
@@ -569,12 +572,16 @@ class Gateway:
                 yaml.safe_dump(doc, f, sort_keys=False)
         return res
 
-    def follow_joints(self, conn, wps_deg, label, abort, speed: float = 1.0, corner_deg=None):
+    def follow_joints(self, conn, wps_deg, label, abort, speed: float = 1.0, corner_deg=None, blend=False, speeds=None):
         """arm.follow_joints: a planner's joint path (corrected-model degrees) -> validated, streamed trajectory
-        (`speed` x the teach speed / acceleration, `corner_deg` the stop-at-corner turn: FOLLOW_SPEED_MAX / _CORNER_MAX)."""
+        (`speed` x the teach speed / acceleration, `corner_deg` the stop-at-corner turn: FOLLOW_SPEED_MAX / _CORNER_MAX).
+        blend (2026-11-19, THE SMOOTH PATH, the workflow repo's docs/plans/no_pause_motion.md): ONE motion through all
+        waypoints, at rest only at the first and the last (trajectory.plan_smooth_path; corner_deg unused); `speeds` =
+        one factor per segment (K - 1), each clamped and capped like `speed` (missing = `speed` for every segment).
+        Without blend / speeds: exactly as before."""
         import numpy as np
         from harness_planner.demo import load_model, to_msg
-        from harness_planner.trajectory import PlanError, plan_joint_path
+        from harness_planner.trajectory import PlanError, plan_joint_path, plan_smooth_path
         q = self.joints_rad()
         if q is None:
             raise RuntimeError("no arm feedback")
@@ -583,6 +590,10 @@ class Gateway:
             raise RuntimeError("the arm is not holding: press Hold first")
         if not isinstance(wps_deg, list) or len(wps_deg) < 1 or any(not isinstance(w, list) or len(w) != 6 for w in wps_deg):
             raise ValueError("waypoints_model_deg needs a list of 6-joint waypoints")
+        if speeds is not None:
+            if (not isinstance(speeds, list) or len(speeds) != len(wps_deg) - 1
+                    or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in speeds)):
+                raise ValueError("speeds needs %d numbers (one per segment)" % (len(wps_deg) - 1))
         off = np.array(self.kin.offsets, float)
         W = np.radians(np.array(wps_deg, float)) - off             # corrected-model angles -> controller joints
         lo = np.array([l[0] for l in self.limits]) + 0.02
@@ -604,8 +615,14 @@ class Gateway:
         if d0 > FOLLOW_START_TOL_RAD:
             raise RuntimeError("refused: the path starts %.1f deg from where the arm is; plan it from the current posture" % math.degrees(d0))
         W[0] = qin
+        seg_k = None
+        if blend:                                        # each segment's factor, like `speed` (THE SMOOTH PATH)
+            base = float(speed or 1.0)
+            seg_k = [float(x) for x in speeds] if speeds is not None else [base] * (len(W) - 1)
         if out.max() > 1e-6:                             # held past a limit (2026-10-24): first straight back inside
             W = np.vstack([qa, W])
+            if seg_k is not None:
+                seg_k = [float(speed or 1.0)] + seg_k        # ... at `speed`
         kin, lim = load_model(ROOT)
         from harness_planner.trajectory import CORNER_DEG
         k = max(0.25, min(FOLLOW_SPEED_MAX, float(speed or 1.0)))
@@ -615,7 +632,13 @@ class Gateway:
         lim.max_joint_acc_rad_s2 = TEACH_ACC_RAD_S2 * k * f
         corner = max(CORNER_DEG, min(FOLLOW_CORNER_MAX, float(corner_deg or CORNER_DEG)))
         try:
-            tr = plan_joint_path(self.kin, W, lim, from_outside=True, corner_deg=corner)
+            if seg_k is not None:
+                ks = np.clip(np.array(seg_k, float), 0.25, FOLLOW_SPEED_MAX)
+                sv = np.minimum(TEACH_VEL_RAD_S * ks, FOLLOW_VEL_CAP_RAD_S)[:, None] * f
+                sa = (TEACH_ACC_RAD_S2 * ks)[:, None] * f
+                tr = plan_smooth_path(self.kin, W, lim, sv, sa, from_outside=True)
+            else:
+                tr = plan_joint_path(self.kin, W, lim, from_outside=True, corner_deg=corner)
         except PlanError as e:
             raise RuntimeError("refused: %s" % e)
         if not self.ac_t.wait_for_server(timeout_sec=3.0):
@@ -1414,7 +1437,11 @@ class Conn(socketserver.StreamRequestHandler):
             self.need("control")
             wps, label = a.get("waypoints_model_deg"), str(a.get("label") or "")
             speed, corner = float(a.get("speed") or 1.0), a.get("corner_deg")
-            return self.job("arm.follow_joints", lambda ev: gw.follow_joints(self, wps, label, ev, speed, corner))
+            blend, speeds = bool(a.get("blend")), a.get("speeds")          # THE SMOOTH PATH (2026-11-19)
+            if speeds is not None and not blend:
+                raise ValueError("speeds needs blend: true")
+            return self.job("arm.follow_joints",
+                            lambda ev: gw.follow_joints(self, wps, label, ev, speed, corner, blend, speeds))
         if cmd == "arm.gripper":
             self.need("control")
             from harness_msgs.srv import SetGripper

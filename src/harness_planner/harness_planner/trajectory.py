@@ -402,3 +402,381 @@ def validate(kin, traj: Trajectory, lim: Limits, at=None, L=None, ramp=None, loo
             "peak_joint_acc_rad_s2": [round(float(x), 2) for x in amax],
             "min_floor_clearance_mm": round(float(clear_min) * 1000, 1) if lim.floor_enabled else None,
             "max_curve_deviation_mm": round(dev_m * 1000, 3), "max_curve_deviation_deg": round(math.degrees(dev_r), 3)}
+
+
+# ---------------------------------------------------------------------------------- the smooth path
+# THE SMOOTH PATH (2026-11-19, operator: "想一想怎么让waypoint之间不停顿"; the workflow repo's docs/plans/no_pause_motion.md):
+# arm.follow_joints {blend: true, speeds} drives ALL its waypoints as ONE motion, at rest only at the first and the last.
+# Geometry: every vertex of the joint polyline rounded by a Gaussian of its own width (closed form, C-infinity), the width
+# shrunk until the curve stays within SMOOTH_DEV_RAD per joint and SMOOTH_DEV_M at the TCP of the polyline (a corner that
+# cannot be rounded more is passed slowly, never cut further). Timing: a time-optimal speed profile along the curve
+# (forward / backward pass on a dense grid, every joint's speed and acceleration within ITS segment's limits), then
+# smoothed in time by a SMOOTH_WINDOW_S Hann window (continuous acceleration, no chatter), re-checked, slowed locally
+# where the smoothing overshot. plan_joint_path and everything above are unchanged.
+SMOOTH_DEV_RAD = math.radians(0.3)        # the streamed curve within this of the commanded polyline, per joint ...
+SMOOTH_DEV_M = 0.001                      # ... and within this at the TCP
+SMOOTH_SIGMA_MAX_RAD = math.radians(2.0)  # the widest rounding (the Gaussian's sigma along the path, rad of joint path)
+SMOOTH_WINDOW_S = 0.2                     # the time window smoothing the speed profile (Hann, full width)
+SMOOTH_GRID_RAD = math.radians(0.25)      # the speed profile's grid along the path (finer at tight roundings)
+SMOOTH_LEVER_M = 1.0                      # an upper bound of the TCP's distance from any joint axis (the PiPER: < 0.8 m)
+_SQ2PI = 1.0 / math.sqrt(2.0 * math.pi)
+
+
+def _ndtr(z):
+    """The standard normal CDF (vectorised)."""
+    from scipy.special import ndtr
+    return ndtr(z)
+
+
+def _pairs(s, centres, radii):
+    """(point index, centre index) of every sorted point s within radii of each centre."""
+    lo = np.searchsorted(s, centres - radii, "left")
+    hi = np.searchsorted(s, centres + radii, "right")
+    cnt = np.maximum(hi - lo, 0)
+    tot = int(cnt.sum())
+    if not tot:
+        return np.zeros(0, int), np.zeros(0, int)
+    mm = np.repeat(np.arange(len(centres)), cnt)
+    ii = np.arange(tot) - np.repeat(np.cumsum(cnt) - cnt, cnt) + np.repeat(lo, cnt)
+    return ii, mm
+
+
+class _SmoothCurve:
+    """The joint polyline W (K x 6, no zero-length segment) with vertex k (1 … K-2) rounded by a Gaussian of width
+    sigma[k - 1] along the path: the polyline is W[0] + d0 s + sum_k Dk ramp(s - sk); each ramp is convolved with its own
+    Gaussian (R(x) = sigma (z Phi(z) + phi(z)), z = x / sigma), mirrored at both ends so the curve starts and ends exactly
+    at W[0] / W[-1] with zero curvature. Parameter s = the polyline's arc length (rad)."""
+
+    def __init__(self, W, sigma):
+        self.W = W
+        D = np.diff(W, axis=0)
+        self.seg = np.linalg.norm(D, axis=1)
+        self.d = D / self.seg[:, None]
+        self.sk = np.concatenate([[0.0], np.cumsum(self.seg)])
+        self.L = float(self.sk[-1])
+        self.jump = self.d[1:] - self.d[:-1]             # (K-2, 6): the direction change at vertex 1 … K-2
+        self.sv = self.sk[1:-1]
+        self.sigma = np.asarray(sigma, float)
+
+    def polyline(self, s):
+        """(segment index, the polyline's point) at s."""
+        j = np.clip(np.searchsorted(self.sk, s, "right") - 1, 0, len(self.seg) - 1)
+        return j, self.W[j] + self.d[j] * (s - self.sk[j])[:, None]
+
+    def eval(self, s):
+        """q, q', q'' at the sorted parameters s (rad of polyline)."""
+        s = np.asarray(s, float)
+        n = len(s)
+        j, q = self.polyline(s)
+        dq = self.d[j].copy()
+        ddq = np.zeros_like(q)
+        nv = len(self.sv)
+        if nv:
+            sg, sv, L = self.sigma, self.sv, self.L
+            r = 6.0 * sg
+            acc = [np.zeros((n, 6)) for _ in range(3)]
+
+            def add(ii, mm, val, d1, d2):
+                J = self.jump[mm]
+                for c in range(6):
+                    w = J[:, c]
+                    acc[0][:, c] += np.bincount(ii, weights=w * val, minlength=n)
+                    acc[1][:, c] += np.bincount(ii, weights=w * d1, minlength=n)
+                    acc[2][:, c] += np.bincount(ii, weights=w * d2, minlength=n)
+
+            ii, mm = _pairs(s, sv, r)                     # the rounding of each vertex
+            if len(ii):
+                x = s[ii] - sv[mm]
+                g = sg[mm]
+                z = x / g
+                Phi, phi = _ndtr(z), _SQ2PI * np.exp(-0.5 * z * z)
+                passed = (mm + 1 <= j[ii]).astype(float)  # the polyline already turned there
+                add(ii, mm, g * (z * Phi + phi) - passed * x, Phi - passed, phi / g)
+            near0 = np.nonzero(sv < r)[0]                 # the mirror at the start (odd: W[0] exact, zero curvature)
+            if len(near0):
+                ii, k = _pairs(s, -sv[near0], r[near0])
+                mm = near0[k]
+                y = (s[ii] + sv[mm]) / sg[mm]
+                Phi, phi = _ndtr(-y), _SQ2PI * np.exp(-0.5 * y * y)
+                add(ii, mm, -sg[mm] * (-y * Phi + phi), Phi, -phi / sg[mm])
+            near1 = np.nonzero(L - sv < r)[0]             # the mirror at the end
+            if len(near1):
+                ii, k = _pairs(s, 2.0 * L - sv[near1], r[near1])
+                mm = near1[k]
+                y = (s[ii] + sv[mm] - 2.0 * L) / sg[mm]
+                Phi, phi = _ndtr(y), _SQ2PI * np.exp(-0.5 * y * y)
+                add(ii, mm, -sg[mm] * (y * Phi + phi), -Phi, -phi / sg[mm])
+            q, dq, ddq = q + acc[0], dq + acc[1], ddq + acc[2]
+        return q, dq, ddq
+
+
+def _tcp(kin, Q, tcp_offset_m):
+    out = np.empty((len(Q), 3))
+    for i, qq in enumerate(Q):
+        out[i] = _tip(kin, qq, tcp_offset_m)[1]
+    return out
+
+
+def _smooth_grid(cv, h0):
+    """The speed profile's grid: every h0, every vertex, finer (sigma / 2) round a tight rounding."""
+    L = cv.L
+    n = max(2, int(math.ceil(L / h0)) + 1)
+    parts = [np.linspace(0.0, L, n), cv.sk]
+    tight = np.nonzero(cv.sigma < 3.0 * h0)[0]
+    if len(tight):
+        parts.append((cv.sv[tight, None] + cv.sigma[tight, None] * np.linspace(-6.0, 6.0, 25)[None, :]).ravel())
+    s = np.unique(np.clip(np.concatenate(parts), 0.0, L))
+    keep = np.concatenate([[True], np.diff(s) > 1e-9 * max(1.0, L)])
+    s = s[keep]
+    s[-1] = L
+    return s
+
+
+def _smooth_sigmas(kin, W, cv, lim, dev_rad, dev_m, sigma_max):
+    """Each vertex's rounding width: wide where the curve allows it, narrowed until the curve (same parameter) stays
+    within 0.8 x the joint / TCP bounds of the polyline everywhere on the grid. Returns the curve."""
+    sig = np.full(len(cv.sv), min(sigma_max, cv.L / 12.0))
+    if not len(sig):
+        return cv
+    jmax = np.abs(cv.jump).max(axis=1)
+    sig = np.minimum(sig, 0.5 * dev_rad / np.maximum(1e-12, 0.3989 * jmax))
+    big = np.nonzero(0.3989 * sig * SMOOTH_LEVER_M * np.abs(cv.jump).sum(axis=1) > 0.5 * dev_m)[0]
+    for m in big:                                         # the TCP bound of a single rounding (the arm's Jacobian there)
+        q0 = W[m + 1]
+        p0 = _tip(kin, q0, lim.tcp_offset_m)[1]
+        Jp = np.empty((3, 6))
+        for c in range(6):
+            dq = np.zeros(6)
+            dq[c] = 1e-6
+            Jp[:, c] = (_tip(kin, q0 + dq, lim.tcp_offset_m)[1] - p0) / 1e-6
+        sig[m] = min(sig[m], 0.5 * dev_m / max(1e-12, 0.3989 * float(np.linalg.norm(Jp @ cv.jump[m]))))
+    sig = np.maximum(sig, 1e-5)
+    cv.sigma = sig
+    tj, tm = 0.8 * dev_rad, 0.8 * dev_m
+    for _ in range(16):
+        s = _smooth_grid(cv, SMOOTH_GRID_RAD)
+        q = cv.eval(s)[0]
+        _, qp = cv.polyline(s)
+        e = q - qp
+        ratio = np.abs(e).max(axis=1) / tj
+        chk = np.nonzero(np.abs(e).sum(axis=1) * SMOOTH_LEVER_M > tm)[0]     # the TCP: only where it may matter
+        if len(chk):
+            dm = np.linalg.norm(_tcp(kin, q[chk], lim.tcp_offset_m) - _tcp(kin, qp[chk], lim.tcp_offset_m), axis=1)
+            ratio[chk] = np.maximum(ratio[chk], dm / tm)
+        bad = np.nonzero(ratio > 1.0)[0]
+        if not len(bad):
+            return cv
+        ii, mm = _pairs(s[bad], cv.sv, 4.0 * cv.sigma)     # the roundings reaching a point off the bounds
+        if not len(ii):
+            ii, mm = _pairs(s[bad], cv.sv, 6.0 * cv.sigma)
+        f = np.ones(len(sig))
+        np.minimum.at(f, mm, np.maximum(0.3, 0.9 / ratio[bad][ii]))
+        sig = np.maximum(sig * f, 1e-5)
+        cv.sigma = sig
+    raise PlanError("the smooth path cannot keep within %.2f deg / %.1f mm of the waypoints"
+                    % (math.degrees(dev_rad), dev_m * 1000))
+
+
+def _topp(dq, ddq, ds, vlim, alim, cap):
+    """Time-optimal x = sdot^2 on the grid: every joint |q' sdot| <= vlim, |q' sddot + q'' sdot^2| <= alim (per point,
+    per joint), x <= cap; at rest at both ends (forward / backward pass)."""
+    N = len(ds) + 1
+    A, B = dq, ddq
+    absA = np.abs(A)
+    small = absA < 1e-9
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mvc = np.where(small, np.inf, (vlim / absA) ** 2).min(axis=1)
+        mvc = np.minimum(mvc, np.where(small & (np.abs(B) > 1e-12), alim / np.abs(B), np.inf).min(axis=1))
+        P = np.where(small, 1e30, alim / absA)                # u in [-P + r x, P + r x] per joint
+        R = np.where(small, 0.0, -B / np.where(small, 1.0, A))
+        dr = R[:, :, None] - R[:, None, :]                    # pair (j, k): (r_j - r_k) x <= P_j + P_k
+        lim2 = np.where(dr > 1e-12, (P[:, :, None] + P[:, None, :]) / np.where(dr > 1e-12, dr, 1.0), np.inf)
+    mvc = np.minimum(np.minimum(mvc, lim2.reshape(N, -1).min(axis=1)), cap)
+    mvc[0] = mvc[-1] = 0.0
+    Pl, Rl, ml, dl = P.tolist(), R.tolist(), mvc.tolist(), ds.tolist()
+    x = [0.0] * N
+    for i in range(N - 1):                                    # forward: as fast as the acceleration allows
+        xi, p, r = x[i], Pl[i], Rl[i]
+        um = min(p[0] + r[0] * xi, p[1] + r[1] * xi, p[2] + r[2] * xi, p[3] + r[3] * xi, p[4] + r[4] * xi, p[5] + r[5] * xi)
+        xn = xi + 2.0 * dl[i] * um
+        c = ml[i + 1]
+        x[i + 1] = c if xn > c else (xn if xn > 0.0 else 0.25 * min(xi, c))
+    x[-1] = 0.0
+    for i in range(N - 2, -1, -1):                            # backward: slow down in time
+        xn, p, r = x[i + 1], Pl[i + 1], Rl[i + 1]
+        lm = max(r[0] * xn - p[0], r[1] * xn - p[1], r[2] * xn - p[2], r[3] * xn - p[3], r[4] * xn - p[4], r[5] * xn - p[5])
+        xb = xn - 2.0 * dl[i] * lm
+        if xb < x[i]:
+            x[i] = xb if xb > 0.0 else 0.25 * min(x[i], xn)
+    x[0] = 0.0
+    return np.array(x)
+
+
+def _time_smooth(s, x, window_s, dt=0.001):
+    """The profile x(s) as s(t) on a dt grid (sdot linear in t between grid points), convolved with a Hann window of
+    window_s (at rest before and after): (t, s) from 0 to the end, smooth acceleration."""
+    v = np.sqrt(np.maximum(x, 0.0))
+    dts = 2.0 * np.diff(s) / np.maximum(v[:-1] + v[1:], 1e-12)
+    t = np.concatenate([[0.0], np.cumsum(dts)])
+    T = float(t[-1])
+    tf = np.arange(0.0, T + dt, dt)
+    tf[-1] = min(tf[-1], T)
+    i = np.clip(np.searchsorted(t, tf, "right") - 1, 0, len(dts) - 1)
+    tau = tf - t[i]
+    a = (v[i + 1] - v[i]) / np.maximum(dts[i], 1e-12)
+    sf = np.minimum(s[i] + v[i] * tau + 0.5 * a * tau * tau, s[-1])
+    sf[-1] = s[-1]
+    m = max(3, int(round(window_s / dt)) | 1)
+    k = np.hanning(m + 2)[1:-1]
+    k /= k.sum()
+    pad = np.concatenate([np.zeros(m - 1), sf, np.full(m - 1, s[-1])])
+    out = np.convolve(pad, k, "valid")
+    out[0], out[-1] = 0.0, s[-1]
+    return np.arange(len(out)) * dt, np.maximum.accumulate(out)
+
+
+def plan_smooth_path(kin, waypoints, lim: Limits, seg_vel=None, seg_acc=None, rate_hz: float = 100.0,
+                     from_outside: bool = False, dev_rad: float = SMOOTH_DEV_RAD, dev_m: float = SMOOTH_DEV_M,
+                     window_s: float = SMOOTH_WINDOW_S) -> Trajectory:
+    """THE SMOOTH PATH: a planner's joint path (rad, K x 6, the first = where the arm is) driven as ONE motion through
+    every waypoint, at rest only at the first and the last. seg_vel / seg_acc: each segment's joint speed / acceleration
+    limits (K - 1 rows of 6, or K - 1 numbers; None = lim's for every segment). The curve stays within dev_rad per joint
+    and dev_m at the TCP of the polyline (a tight corner is passed slowly, never cut more); each streamed sample keeps
+    every joint within its segment's limits. Validated like every other trajectory (validate, against the segments'
+    largest limits, + every sample against its own segment's); raises PlanError naming the reason."""
+    import time as _time
+    t_start = _time.perf_counter()
+    W = np.asarray(waypoints, float)
+    if W.ndim != 2 or W.shape[1] != 6 or len(W) < 2:
+        raise PlanError("a joint path needs at least 2 waypoints of 6 joints")
+    K = len(W)
+
+    def per_seg(v, default):
+        if v is None:
+            return np.tile(_per_joint(default, 6), (K - 1, 1))
+        a = np.asarray(v, float)
+        if a.ndim == 1 and len(a) == K - 1:
+            a = np.repeat(a[:, None], 6, axis=1)
+        if a.shape != (K - 1, 6) or not np.isfinite(a).all() or (a <= 0).any():
+            raise PlanError("the segment limits need %d positive rows (one per segment)" % (K - 1))
+        return a
+    sv_, sa_ = per_seg(seg_vel, lim.max_joint_vel_rad_s), per_seg(seg_acc, lim.max_joint_acc_rad_s2)
+    keep = [0] + [k for k in range(1, K) if float(np.abs(W[k] - W[k - 1]).max()) >= 1e-6]
+    if len(keep) < 2:
+        raise PlanError("the path does not move")
+    # a kept segment spans the caller's segments keep[i-1] … keep[i]-1 (the dropped ones have no length): their slowest
+    seg_v = np.array([sv_[a:b].min(axis=0) for a, b in zip(keep[:-1], keep[1:])])
+    seg_a = np.array([sa_[a:b].min(axis=0) for a, b in zip(keep[:-1], keep[1:])])
+    W = W[keep]
+    cv = _smooth_sigmas(kin, W, _SmoothCurve(W, np.zeros(len(W) - 2)), lim, dev_rad, dev_m, SMOOTH_SIGMA_MAX_RAD)
+
+    # ---- the speed profile on the grid; each point's limits = the slower of the segments its two grid steps touch
+    s = _smooth_grid(cv, SMOOTH_GRID_RAD)
+    _, dq, ddq = cv.eval(s)
+    jseg = np.clip(np.searchsorted(cv.sk, 0.5 * (s[:-1] + s[1:]), "right") - 1, 0, len(cv.seg) - 1)
+    iv, ia = seg_v[jseg], seg_a[jseg]                     # per grid step
+    vpt = np.minimum(np.vstack([iv[:1], iv]), np.vstack([iv, iv[-1:]]))
+    apt = np.minimum(np.vstack([ia[:1], ia]), np.vstack([ia, ia[-1:]]))
+    ds = np.diff(s)
+    cap = np.full(len(s), np.inf)
+    ascale = np.full(len(s), 0.85)                        # the speed profile's margin for the time smoothing
+    vscale = 0.98
+    n_fix = 0
+    for it in range(10):
+        x = _topp(dq, ddq, ds, vpt * vscale, apt * ascale[:, None], cap)
+        tf, sf = _time_smooth(s, x, window_s)
+        T = float(tf[-1])
+        n = max(3, int(math.ceil(T * rate_hz)) + 1)
+        t = np.linspace(0.0, T, n)
+        su = np.interp(t, tf, sf)
+        su[0], su[-1] = 0.0, cv.L
+        q = cv.eval(su)[0]
+        q[0], q[-1] = W[0], W[-1]
+        v = np.diff(q, axis=0) / np.diff(t)[:, None]
+        a = np.diff(v, axis=0) / np.diff(t)[1:, None]
+        # every sample against the slowest segment it touches (speed: its step; acceleration: its two steps)
+        j0 = np.clip(np.searchsorted(cv.sk, su, "right") - 1, 0, len(cv.seg) - 1)
+        jl = np.clip(np.searchsorted(cv.sk, su, "left") - 1, 0, len(cv.seg) - 1)
+        lv = _span_min(seg_v, j0[:-1], jl[1:])
+        la = _span_min(seg_a, j0[:-2], jl[2:])
+        rv = (np.abs(v) / lv).max(axis=1)
+        ra = (np.abs(a) / la).max(axis=1)
+        worst = max(float(rv.max()), float(ra.max()))
+        if worst <= 0.999:
+            break
+        n_fix += 1
+        sd = np.abs(np.diff(su)) / np.diff(t)              # path speed per step
+        for idx, r, kind in [(i, rv[i], "v") for i in np.nonzero(rv > 0.999)[0]] + \
+                            [(i + 1, ra[i], "a") for i in np.nonzero(ra > 0.999)[0]]:
+            sc = float(su[idx])
+            reach = max(3.0 * SMOOTH_GRID_RAD, float(sd[max(0, idx - 1):idx + 2].max()) * window_s * 0.75)
+            lo, hi = np.searchsorted(s, [sc - reach, sc + reach])
+            sl = slice(max(0, lo - 1), min(len(s), hi + 1))
+            f = r * r if kind == "v" else r
+            cap[sl] = np.minimum(cap[sl], x[sl] / (f * 1.05))
+            if kind == "a":
+                ascale[sl] = np.minimum(ascale[sl], ascale[sl] / (r * 1.05))
+    else:
+        # still over after the local fixes: the whole motion slowed evenly (speed / k, acceleration / k^2)
+        k = max(float(rv.max()), math.sqrt(float(ra.max()))) * 1.01
+        T2 = T * k
+        n = max(3, int(math.ceil(T2 * rate_hz)) + 1)
+        t = np.linspace(0.0, T2, n)
+        su = np.interp(t / k, tf, sf)
+        su[0], su[-1] = 0.0, cv.L
+        q = cv.eval(su)[0]
+        q[0], q[-1] = W[0], W[-1]
+        v = np.diff(q, axis=0) / np.diff(t)[:, None]
+        a = np.diff(v, axis=0) / np.diff(t)[1:, None]
+        j0 = np.clip(np.searchsorted(cv.sk, su, "right") - 1, 0, len(cv.seg) - 1)
+        jl = np.clip(np.searchsorted(cv.sk, su, "left") - 1, 0, len(cv.seg) - 1)
+        rv = (np.abs(v) / _span_min(seg_v, j0[:-1], jl[1:])).max(axis=1)
+        ra = (np.abs(a) / _span_min(seg_a, j0[:-2], jl[2:])).max(axis=1)
+        n_fix = -n_fix
+    i_v, i_a = int(rv.argmax()), int(ra.argmax())
+    if rv[i_v] > 1.001:
+        j = int(np.argmax(np.abs(v[i_v]) / _span_min(seg_v, j0[i_v:i_v + 1], jl[i_v + 1:i_v + 2])[0]))
+        raise PlanError("joint %d would turn at %.1f deg/s > its segment's limit (t = %.2f s)"
+                        % (j + 1, math.degrees(abs(v[i_v, j])), t[i_v]))
+    if ra[i_a] > 1.001:
+        raise PlanError("a joint would accelerate past its segment's limit (t = %.2f s)" % t[i_a + 1])
+
+    # ---- the streamed samples on the curve: within the bounds of the polyline (same parameter: an upper bound)
+    _, qp = cv.polyline(su)
+    e = np.abs(q - qp)
+    dev_j = float(e.max())
+    if dev_j > dev_rad:
+        i = int(e.max(axis=1).argmax())
+        raise PlanError("streamed sample %.2f deg off the waypoints' path (t = %.2f s)" % (math.degrees(dev_j), t[i]))
+    chk = np.nonzero(e.sum(axis=1) * SMOOTH_LEVER_M > 0.05 * dev_m)[0]
+    dev_t = 0.0
+    if len(chk):
+        dm = np.linalg.norm(_tcp(kin, q[chk], lim.tcp_offset_m) - _tcp(kin, qp[chk], lim.tcp_offset_m), axis=1)
+        dev_t = float(dm.max())
+        if dev_t > dev_m:
+            raise PlanError("streamed sample %.2f mm off the waypoints' path at the TCP (t = %.2f s)"
+                            % (dev_t * 1000, t[chk[int(dm.argmax())]]))
+    traj = Trajectory(t, q, [("smooth path", 0, len(t))], {})
+    env = Limits(**{f: getattr(lim, f) for f in lim.__dataclass_fields__})
+    env.max_joint_vel_rad_s, env.max_joint_acc_rad_s2 = seg_v.max(axis=0), seg_a.max(axis=0)
+    traj.report = validate(kin, traj, env, from_outside=from_outside)
+    speed = np.abs(v).max(axis=1)                         # the fastest joint per step; inside = past the start's
+    inner = (t[1:] > window_s) & (t[:-1] < t[-1] - window_s)   # and before the end's smoothing window
+    traj.report.update({
+        "smooth": True, "segments": 1, "samples": len(t), "rate_hz": rate_hz, "duration_s": round(traj.duration, 2),
+        "waypoints": len(W), "max_path_deviation_deg": round(math.degrees(dev_j), 3),
+        "max_path_deviation_mm": round(dev_t * 1000, 3),
+        "min_inner_speed_deg_s": (round(math.degrees(float(speed[inner].min())), 2) if inner.any() else None),
+        "slowed_locally": abs(n_fix), "slowed_evenly": n_fix < 0,
+        "plan_s": round(_time.perf_counter() - t_start, 3)})
+    return traj
+
+
+def _span_min(lim_seg, ja, jb):
+    """Per sample step: the elementwise minimum of the segment limits from segment ja to jb (inclusive)."""
+    lo, hi = np.minimum(ja, jb), np.maximum(ja, jb)
+    out = np.minimum(lim_seg[lo], lim_seg[hi])
+    wide = np.nonzero(hi - lo > 1)[0]
+    for i in wide:
+        out[i] = lim_seg[lo[i]:hi[i] + 1].min(axis=0)
+    return out
