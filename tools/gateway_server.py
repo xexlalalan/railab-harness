@@ -67,6 +67,15 @@ runs -> the goal is cancelled / the job aborted (the arm freezes, stays enabled)
 """
 import json, math, os, re, secrets, signal, socketserver, subprocess, sys, threading, time
 
+# THE GATEWAY'S ROS LINKS ARE UDP ONLY (2026-11-19): with Fast DDS's shared-memory transport, the gateway's own data port
+# (/dev/shm/fastdds_port16417) was unlinked and re-created by another process's "zombie port" check after the 09:52
+# restart while the gateway kept listening on the old, deleted segment. The nodes that had opened it before (the arm:
+# joints) still reached the gateway; every node started after that (the camera node, restarted by the watchdog and by
+# nodes.restart) wrote into a segment nobody reads: camera.online false with age_s None for an hour while the camera
+# ran at 13.6 fps and `ros2 topic hz /camera/tags` saw every frame. A UDP socket cannot be orphaned that way (same-host
+# traffic goes over loopback). Set before rclpy loads Fast DDS; an explicit FASTDDS_BUILTIN_TRANSPORTS wins.
+os.environ.setdefault("FASTDDS_BUILTIN_TRANSPORTS", "UDPv4")
+
 PORT = int(os.environ.get("GATEWAY_PORT", 7803))
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KEY_FILE = os.path.expanduser("~/.config/railab-harness/gateway.key")
