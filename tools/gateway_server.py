@@ -107,6 +107,9 @@ TEACH_VEL_RAD_S, TEACH_ACC_RAD_S2 = 0.35, 0.7     # arm.follow_joints: joint spe
 # waypoint is passed without stopping (trajectory.CORNER_DEG 5 … FOLLOW_CORNER_MAX): a dense planner path turns a few
 # degrees at many knots and stopped at each
 FOLLOW_SPEED_MAX, FOLLOW_CORNER_MAX = 2.0, 45.0
+# ... but never past the arm node's last gate (piper.yaml traj_max_joint_vel_rad_s 0.6, refused above + 10 %: 2026-11-18
+# "point 329: joint 5 would turn at 0.70 rad/s > 0.66" with speed 2 = 0.70): the path is planned to at most this
+FOLLOW_VEL_CAP_RAD_S = 0.55
 FOLLOW_START_TOL_RAD = 0.1       # its first waypoint: this close to where the arm is
 FOLLOW_CLAMP_RAD = math.radians(3.0)   # waypoints beyond the controller limits by up to this are clamped inside
 FOLLOW_RECOVER_RAD = math.radians(6.0)  # an arm held past a limit by up to this: the path first brings it back inside
@@ -601,7 +604,8 @@ class Gateway:
         kin, lim = load_model(ROOT)
         from harness_planner.trajectory import CORNER_DEG
         k = max(0.25, min(FOLLOW_SPEED_MAX, float(speed or 1.0)))
-        lim.max_joint_vel_rad_s, lim.max_joint_acc_rad_s2 = TEACH_VEL_RAD_S * k, TEACH_ACC_RAD_S2 * k
+        lim.max_joint_vel_rad_s = min(TEACH_VEL_RAD_S * k, FOLLOW_VEL_CAP_RAD_S)
+        lim.max_joint_acc_rad_s2 = TEACH_ACC_RAD_S2 * k
         corner = max(CORNER_DEG, min(FOLLOW_CORNER_MAX, float(corner_deg or CORNER_DEG)))
         try:
             tr = plan_joint_path(self.kin, W, lim, from_outside=True, corner_deg=corner)
