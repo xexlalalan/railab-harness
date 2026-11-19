@@ -107,9 +107,10 @@ TEACH_VEL_RAD_S, TEACH_ACC_RAD_S2 = 0.35, 0.7     # arm.follow_joints: joint spe
 # waypoint is passed without stopping (trajectory.CORNER_DEG 5 … FOLLOW_CORNER_MAX): a dense planner path turns a few
 # degrees at many knots and stopped at each
 FOLLOW_SPEED_MAX, FOLLOW_CORNER_MAX = 2.0, 45.0
-# ... but never past the arm node's last gate (piper.yaml traj_max_joint_vel_rad_s 0.6, refused above + 10 %: 2026-11-18
-# "point 329: joint 5 would turn at 0.70 rad/s > 0.66" with speed 2 = 0.70): the path is planned to at most this
-FOLLOW_VEL_CAP_RAD_S = 0.55
+# ... but never past the arm node's last gate (piper.yaml traj_max_joint_vel_rad_s, refused above + 10 %: 2026-11-18
+# "point 329: joint 5 would turn at 0.70 rad/s > 0.66" when it was 0.6; the operator then raised it to 0.75): the path is
+# planned to at most this = 2 x TEACH_VEL_RAD_S
+FOLLOW_VEL_CAP_RAD_S = 0.70
 FOLLOW_START_TOL_RAD = 0.1       # its first waypoint: this close to where the arm is
 FOLLOW_CLAMP_RAD = math.radians(3.0)   # waypoints beyond the controller limits by up to this are clamped inside
 FOLLOW_RECOVER_RAD = math.radians(6.0)  # an arm held past a limit by up to this: the path first brings it back inside
