@@ -13,8 +13,8 @@ to ask it, one `state` it pushes. This class is that upward half, so a new modul
         def do_cap(self, args, run): ...      # one method per action; returns = done
         def check_cap(self, args): ...        # optional: refuse before accepting (raise Refused)
         def set_<field>(self, value): ...     # optional: refuse a told value (raise Refused)
-        def safe_state(self): ...             # make the device stop NOW (what this node started)
-        def on_stop_request(self): ...        # optional: what an explicit `stop` does beyond that
+        def safe_state(self): ...             # make the device stop NOW (only what this node started)
+        def on_stop_request(self): ...        # optional: what a `stop` of scope "device" does beyond that
         def check_clear_fault(self, args): ...   # optional: refuse clear_fault while the cause persists
 
 and, from the adapter's own threads (a watch on the device): sensed / told / estimated / unknown
@@ -103,14 +103,18 @@ class Module:
 
     # ------------------------------------------------------------ for the subclass
     def safe_state(self) -> None:
-        """Make the device stop NOW (called on every stop: a `stop` request, no harness beat, close, a
-        latched fault). Must be quick. It touches only what THIS node started: an adapter may run beside
-        another path to the same device, and the automatic safe state must never stop that path."""
+        """Make the device stop NOW. Must be quick. It touches only what THIS node started (its own goal,
+        its own job): an adapter may run beside another path to the same device, and the automatic safe
+        state must never stop that path — with nothing of its own running it does nothing at all.
+        Called: while an action of this node runs, on any stop (a `stop` request, no harness beat, the
+        harness's own stop of scope "own"); and on a `stop` request of scope "device", close and a
+        latched fault even when none runs."""
 
     def on_stop_request(self) -> None:
-        """Optional: what an explicit `stop` REQUEST does beyond safe_state() — called right after it,
-        never on the automatic safe state. WHY: a `stop` asked for by the twin stops the device whoever
-        moves it (another client's motion too); going safe by itself (no beat, close, a fault) must not."""
+        """Optional: what a `stop` REQUEST of scope "device" (the default: the twin's stop) does beyond
+        safe_state() — called right after it, never on the automatic safe state (no beat, close, a fault,
+        the harness's own stop of scope "own"). WHY: a stop the twin asks for stops the device whoever
+        moves it (another client's motion too); going safe by itself must not."""
 
     def check_clear_fault(self, args) -> None:
         """Optional: refuse clear_fault (raise Refused) while the device still has the fault's cause.
@@ -210,9 +214,14 @@ class Module:
             if "set" in request:
                 self._set(request["set"])
             elif request["do"] == M.STOP:
-                why = (request.get("args") or {}).get("reason")
-                self._stop(f"stop #{rid}" + (f": {why}" if why else ""), rid)
-                self.on_stop_request()
+                args = request.get("args") or {}
+                why = args.get("reason")
+                reason = f"stop #{rid}" + (f": {why}" if why else "")
+                if args.get("scope", M.STOP_DEVICE) == M.STOP_OWN:
+                    self._stop(reason, quiet=True)   # the harness going safe: only an action of ours, if any
+                else:
+                    self._stop(reason, rid)
+                    self.on_stop_request()
             else:
                 self._do(rid, request["do"], request.get("args") or {})
         except Refused as refusal:
@@ -268,11 +277,17 @@ class Module:
             self._current = self._action_run = None
         self._publish()
 
-    def _stop(self, reason: str, rid=None) -> None:
-        """Never refused. A running action ends "stopped" with this reason; then the device is made safe."""
+    def _stop(self, reason: str, rid=None, quiet: bool = False) -> None:
+        """Never refused. A running action ends "stopped" with this reason; then the device is made safe.
+
+        quiet = an AUTOMATIC stop (no harness beat, the harness's own stop of scope "own"): with no action
+        of this node running it does nothing at all — no safe_state, no `last` (an action of the old path
+        to the same device is not this node's to stop, and the result someone waits for stays)."""
         with self._lock:
             if self._action_run is not None:
                 self._action_run.ask_stop(reason)
+            elif quiet:
+                return
             elif rid is not None:
                 self._last = {"id": rid, "do": M.STOP, "result": M.DONE}
         self.safe_state()
@@ -344,7 +359,7 @@ class Module:
             now = time.monotonic()
             if self._harness_alive and now - self._beat_at > timing.module_silent_s:
                 self._harness_alive = False   # nobody supervises: do not keep moving
-                self._stop("harness silent")
+                self._stop("harness silent", quiet=True)
                 self._publish()
             elif now - self._published_at >= timing.idle_state_s:
                 self._publish()

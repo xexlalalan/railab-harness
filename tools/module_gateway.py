@@ -92,10 +92,11 @@ def main(argv=None) -> int:
     while not done.wait(1.0) and server.is_alive():
         pass
 
-    print("module gateway: closing (the controlling client's link ends → every module is stopped)", flush=True)
-    front.close()          # ends every connection: the controller's ending stops every module
+    print("module gateway: closing (the controlling client's link ends → the actions this layer started are stopped)",
+          flush=True)
+    front.close()          # ends every connection: the controller's ending stops this layer's running actions
     server.join(2)
-    gateway.close()        # the beat ends: every module node goes safe by itself
+    gateway.close()        # waits for those stops; the beat ends: every module node goes safe by itself (its own actions)
     for module in modules:
         module.close()
     close = getattr(bus, "close", None)

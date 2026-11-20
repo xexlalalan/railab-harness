@@ -24,7 +24,12 @@ cannot measure its height; the adapter keeps the height tied to the Bunny server
     (the describe's range, before anything moves);
   - `set platform_mm` = told, tied to the counter as last read (refused while the counter is not read);
   - `platform_to` sends the step difference; the reply's counter must be the old one + our steps → estimated;
-    any other counter, a failed / timed-out call → "unknown";
+    any other counter, a failed / stopped call, a call answered after its budget, or the Bunny's link lost while it
+    ran (offline, `stm32: false`) → "unknown", and it stays unknown (the move's answer never overwrites it);
+  - no answer within the budget is NOT a failure: nobody knows whether the platform still moves. A fault NO_REPLY is
+    latched at once, but the action — and with it the zone platform_travel — goes on until the Bunny answers, or its
+    own status shows the move over (`platform_moving` false: only its server since 82cc822 says so); then it fails
+    with the height unknown. The same holds for a housing swing (its status's `busy` no longer the swing's verb);
   - the counter read every COUNTER_POLL_S differs from ours with no move of ours (another client of the
     Bunny's server moved it, or the server restarted and counts from 0 again) → "unknown";
   - the Bunny offline (bunny_node says so, or its status stops), its link to the STM32 firmware down → "unknown",
@@ -32,12 +37,18 @@ cannot measure its height; the adapter keeps the height tied to the Bunny server
     starts at "unknown", so an outage makes EVERY value unknown — the told pan_loaded and powder_id too.
   NOT SEEN: a jog on the Bunny's OWN SCREEN (its PLATE LEVEL buttons send `stpup` / `stpstop` straight to the
   STM32 and never touch the server's counter) — today nothing the bridge can read shows it. See THIN below.
-  The Bunny cannot interrupt a platform move nor a housing swing (its `abort` stops dosing and the pump only):
-  a `stop` during one waits for the Bunny's answer, so the zone is held until the motion really ended.
+  A Bunny server older than 82cc822 cannot interrupt a platform move nor a housing swing (its `abort` stops dosing
+  and the pump only): a `stop` during one waits for the Bunny's answer, so the zone is held until the motion really
+  ended. Its `stop` (82cc822) ends them in place: the move's call then answers an error, the height is unknown.
 
-STOP: a `stop` request sends the Bunny's abort whoever doses; the automatic safe state (no harness beat, close)
-sends it only while an action of THIS node runs — started beside the old gateway, this node never aborts the old
-path's dose by itself.
+STOP: the Bunny's own `stop` verb (its server since 82cc822: a dose, the pump, a platform move, a housing swing; it
+never latches the dose flag — `abort` does, and a `tare` after it silently does nothing until the next weigh_to
+clears it), through bunny_node's /bunny/stop. Where it is missing (bunny_node or the server too old) the Bunny's
+`abort` + liquid stop stands in — ONLY where nothing else can stop what must stop: a dose of ours (weigh_to,
+dispense_volume), or a `stop` request of scope "device". Going safe BY ITSELF (no harness beat, close, a latched
+fault, the gateway's own stop of scope "own") touches only an action of THIS node and sends nothing at all when none
+runs — started beside the old gateway, this node never stops nor aborts the old path's dose by itself. A `stop`
+request of scope "device" (the twin's) stops the Bunny whoever doses.
 
 WHAT WOULD MAKE THIS ADAPTER THIN (for whoever changes the Bunny next): `platform_to {z_mm}` / a `platform_mm`
 in `status`, the steps per mm and the travel in the Bunny; a jog on its own screen counted, or reported
@@ -76,12 +87,15 @@ HOUSING_FRESH_S = 1.5      # "the status already reports the target" only from a
 COUNTER_POLL_S = 1.0       # the platform counter is read this often (moves that are not ours)
 WATCH_S = 0.25             # the watch thread's tick
 AWAIT_SLICE_S = 0.05
-STOP_GRACE_S = 10.0        # after a stop (abort sent), a dose has this long to answer
+STOP_GRACE_S = 10.0        # after a stop (the Bunny's stop / abort sent), a dose has this long to answer
 READ_S = 6.0               # a counter read (bunny_node gives the Bunny 5 s)
 HOUSING_S = 90.0           # the old gateway's budget (bunny_node gives the Bunny 60 s)
 TARE_S = 70.0              # bunny_node: 60 s
 WEIGH_S = 1830.0           # bunny_node: 1800 s
 DISPENSE_S = 630.0         # bunny_node: 600 s
+ABORTABLE = ("weigh_to", "dispense_volume")   # what an older Bunny's abort stops (dosing, the pump): the only actions
+                                              # an abort stands in for when the Bunny has no `stop`
+HOUSING_BUSY = ("housing_open", "housing_close", "housing_half")   # the Bunny's status `busy` during a swing
 
 NO_REPLY = "NO_REPLY"              # fault: a call that never came back — what the Bunny did is not known
 HOUSING_FAILED = "HOUSING_FAILED"  # fault: a housing swing the Bunny reports failed, or not where it should be
@@ -141,7 +155,7 @@ class Pending:
 
 class BunnyLink:
     """What the adapter needs from today's bunny_node. Every call returns a Pending at once (the adapter decides
-    how long to wait); abort() returns at once too. A fake replaces this in tools/module_check_bunny.py."""
+    how long to wait); stop() returns at once too. A fake replaces this in tools/module_check_bunny.py."""
 
     def on_status(self, callback) -> None:
         """callback(dict) on every /bunny/status message (the Bunny's status + bunny_node's "online")."""
@@ -167,9 +181,11 @@ class BunnyLink:
         """→ {"success", "steps", "steps_planned", "actual_ml", "message"}."""
         raise NotImplementedError
 
-    def abort(self) -> None:
-        """The Bunny's abort, then its liquid stop — sent AT ONCE from a thread of the link's own, so it gets
-        through while another call waits."""
+    def stop(self, abort_if_missing: bool) -> None:
+        """The Bunny's own `stop` (its server since 82cc822: ends a dose, the pump, a platform move, a housing swing;
+        never latches the dose flag) — sent AT ONCE from a thread of the link's own, so it gets through while another
+        call waits. Where bunny_node or the Bunny has no `stop`: abort_if_missing → the Bunny's abort, then its liquid
+        stop (the only stop an older Bunny has; it latches the dose flag), else nothing."""
         raise NotImplementedError
 
 
@@ -212,6 +228,7 @@ class BunnyModule(Module):
         self._said_ready = False
         self._down_reason = "no /bunny/status yet"
         self._counter = None         # the Bunny server's platform counter as last confirmed by us
+        self._lost = 0               # bumped by every _lose(): a move that saw it change ends with the height unknown
         self._moving = False         # a platform_to of ours is in flight
         self._gen = 0                # bumped when a move starts / ends: a read straddling it is not trusted
         self._polled_at = 0.0
@@ -237,17 +254,20 @@ class BunnyModule(Module):
         super().close()
 
     def safe_state(self):
-        """The Bunny's abort + liquid stop, at once (never waits: stop must always get through) — only while an
-        action of THIS node runs: the automatic safe state (no harness beat, close) must not abort a dose that
-        another client of the Bunny's server (the old gateway) started."""
-        if self.running() is not None:
-            self.link.abort()
+        """The Bunny's stop, at once (never waits: stop must always get through) — ONLY while an action of THIS node
+        runs, nothing at all otherwise: the automatic safe state (no harness beat, close, a fault, the gateway's own
+        stop) must not stop a dose that another client of the Bunny's server (the old gateway) started. Without the
+        Bunny's `stop`, its abort stands in for a dose of ours only (an abort cannot stop a swing, a move or a tare,
+        and it would leave the dose flag set)."""
+        action = self.running()
+        if action is not None:
+            self.link.stop(abort_if_missing=action in ABORTABLE)
 
     def on_stop_request(self):
-        """A `stop` request aborts the Bunny whoever doses (as the old gateway's stop does). While an action of
-        this node runs, safe_state has sent the abort already."""
-        if self.running() is None:
-            self.link.abort()
+        """A `stop` request of scope "device" stops the Bunny whoever doses (as the old gateway's stop does): its
+        stop, else its abort. A dose of this node's has had that from safe_state already."""
+        if self.running() not in ABORTABLE:
+            self.link.stop(abort_if_missing=True)
 
     # ------------------------------------------------------------------ what the Bunny says by itself
     def _on_status(self, status: dict) -> None:
@@ -296,6 +316,7 @@ class BunnyModule(Module):
         at "unknown" — every value it holds is lost) or its firmware link dropped (the platform and the housing)."""
         with self._mine:
             self._counter = None
+            self._lost += 1          # before the values below go unknown: a move ending meanwhile sees it
             if restart:
                 self._online = self._firmware = False
                 self._scan_primed = False
@@ -365,15 +386,18 @@ class BunnyModule(Module):
             return   # a target, not a motion: already there = done, nothing moves
         try:
             fields = self._call(self.link.housing(HOUSING_VERBS[target]), run, HOUSING_S, "housing_to",
-                                interruptible=False)
+                                interruptible=False, settled=self._housing_over)
         except BunnyError as words:
             self.unknown("housing")   # the status says where it really is within half a second
+            if run.stopped:           # the Bunny's own stop ended the swing in place: asked for, not a fault
+                run.stop_reason = f"{run.stop_reason}; the Bunny stopped the swing where it was ({words})"
+                return
             raise Fault(HOUSING_FAILED, str(words))
         word = fields.get("housing") if isinstance(fields, dict) else None
         if word in HOUSING_WORDS:
             self.sensed("housing", word)
         if run.stopped:
-            run.stop_reason = f"{run.stop_reason}; the Bunny cannot interrupt a housing swing: it ended {word}"
+            run.stop_reason = f"{run.stop_reason}; the swing was not interrupted: it ended {word}"
         elif word != target:
             raise Fault(HOUSING_FAILED, f"the Bunny answered the swing done, but its housing reads {word!r}")
 
@@ -392,31 +416,46 @@ class BunnyModule(Module):
         if steps == 0:
             return   # already there, within half a step
         with self._mine:
-            counter = self._counter
+            counter, lost = self._counter, self._lost
             self._moving, self._gen = True, self._gen + 1
-        position = None
+        position, error, answered, good = None, None, False, False
         try:
             if counter is None:
                 raise Failed("the Bunny's platform counter was lost before the move started")
             position = int(self._call(self.link.platform(steps), run, platform_budget_s(steps), "platform_to",
-                                      interruptible=False))
-        except (Failed, Fault, LinkError) as error:
-            self.unknown("platform_mm")
-            if isinstance(error, BunnyError):
-                raise Failed(f"platform move: the Bunny says {error}; the height is unknown now")
-            raise
+                                      interruptible=False, settled=self._platform_over))
+            answered = True
+        except (Failed, Fault, LinkError) as caught:
+            error = caught
         finally:
             with self._mine:   # in ONE step with the end of the move: a read right after it compares with this
                 self._moving, self._gen = False, self._gen + 1
-                self._counter = position   # None after a failure: the next read anchors afresh
-        expected = counter + steps
-        if position != expected:
-            self.unknown("platform_mm")
-            raise Failed(f"the Bunny's platform counter reads {position} after the move, {expected} was expected "
-                         "(someone else moved it too): the height is unknown")
+                dropped = self._lost != lost   # offline / the STM32 link down while it ran: the steps may be lost
+                # the counter as the Bunny answered it, only for a move it answered with nothing lost meanwhile —
+                # never over the None a _lose() set (else the next read anchors afresh)
+                self._counter = position if answered and not dropped else None
+                good = answered and not dropped and position == counter + steps
+            if not good:
+                self.unknown("platform_mm")   # failed, stopped part way, answered late, link lost: UNKNOWN
+        if error is not None:
+            if isinstance(error, BunnyError):
+                if run.stopped:   # the Bunny's own stop (its server since 82cc822) ended the move part way
+                    run.stop_reason = f"{run.stop_reason}; the platform stopped part way ({error}): its height is unknown"
+                    return
+                raise Failed(f"platform move: the Bunny says {error}; the height is unknown now")
+            raise error
+        if dropped:
+            raise Failed("the Bunny went offline or its STM32 link dropped during the move: the height is unknown")
+        if not good:
+            raise Failed(f"the Bunny's platform counter reads {position} after the move, {counter + steps} was "
+                         "expected (someone else moved it too): the height is unknown")
         self.estimated("platform_mm", round(start + steps / PLATFORM_STEPS_PER_MM, 2))
+        with self._mine:
+            lost_since = self._lost != lost
+        if lost_since:   # lost between the move's end and the line above: _lose's "unknown" must win
+            self.unknown("platform_mm")
         if run.stopped:
-            run.stop_reason = f"{run.stop_reason}; the Bunny cannot interrupt a platform move: it ran to its end"
+            run.stop_reason = f"{run.stop_reason}; the platform move was not interrupted: it ran to its end"
 
     def do_tare(self, args, run):
         try:
@@ -524,28 +563,66 @@ class BunnyModule(Module):
         with self._mine:
             return self._online and self._status_at is not None and time.monotonic() - self._status_at <= seconds
 
-    def _call(self, pending: Pending, run, budget_s: float, what: str, interruptible: bool):
+    def _call(self, pending: Pending, run, budget_s: float, what: str, interruptible: bool, settled=None):
         """Wait for one call: its result, or the adapter's Failed / Fault; a BunnyError is left to the action.
 
-        interruptible=False (a housing swing, a platform move, a tare: the Bunny cannot stop them) = a stop does
-        not end the wait — the zone stays held until the Bunny says the motion is over."""
-        deadline, grace = time.monotonic() + budget_s, None
+        interruptible=False (a housing swing, a platform move, a tare: an older Bunny cannot stop them) = a stop does
+        not end the wait — the zone stays held until the Bunny says the motion is over.
+        settled (a motion that holds a zone): NO ANSWER WITHIN THE BUDGET IS NOT A FAILURE — nobody knows whether the
+        Bunny still moves. A fault NO_REPLY is latched at once (the state says so; the safe state sends the Bunny's
+        stop where it has one), but the wait — the action, its zone — goes on until the Bunny answers, or settled(t)
+        (its own status, received after t) shows the motion over; either way the action then fails."""
+        deadline, grace, late = time.monotonic() + budget_s, None, False
         while not pending.wait(AWAIT_SLICE_S):
             now = time.monotonic()
             if interruptible and run.stopped and grace is None:
                 grace = now + STOP_GRACE_S
+            if settled is not None:
+                if now > deadline and not late:
+                    late = True
+                    self.latch_fault(NO_REPLY, f"{what}: no answer from the Bunny within {budget_s:.0f} s: what it did "
+                                               "is not known; the action (and its zone) waits for its answer or for "
+                                               "its status to show the motion over")
+                if late and settled(deadline):
+                    raise Failed(f"{what}: no answer within {budget_s:.0f} s; the Bunny's status now shows the motion "
+                                 "over: what it did is not known")
+                continue
             if now > deadline or (grace is not None and now > grace):
                 self.safe_state()   # nobody knows what the Bunny does now: make it safe
                 within = f"{STOP_GRACE_S:.0f} s of the stop" if grace is not None and now > grace else f"{budget_s:.0f} s"
-                raise Fault(NO_REPLY, f"{what}: no answer from the Bunny within {within} (an abort was sent); "
+                raise Fault(NO_REPLY, f"{what}: no answer from the Bunny within {within} (a stop was sent); "
                                       "what it did is not known")
+        if late:   # whatever it says now (done, an error): the motion's end is not known for certain
+            try:
+                pending.result()
+                said = "it says done"
+            except LinkError as words:
+                said = f"it says: {words}"
+            raise Failed(f"{what}: the Bunny answered only after the {budget_s:.0f} s budget ({said}): what it did "
+                         "is not known")
         try:
             return pending.result()
         except NoService as absent:
             raise Failed(f"{what}: {absent}")
         except Unanswered as lost:
             self.safe_state()
-            raise Fault(NO_REPLY, f"{what}: {lost} (an abort was sent)")
+            raise Fault(NO_REPLY, f"{what}: {lost} (a stop was sent)")
+
+    def _status_after(self, since: float):
+        """The newest /bunny/status if the Bunny was online in it and it arrived after `since`, else None."""
+        with self._mine:
+            status, at, online = self._status, self._status_at, self._online
+        return status if online and at is not None and at > since and isinstance(status, dict) else None
+
+    def _platform_over(self, since: float) -> bool:
+        """The Bunny's own word that no platform move runs (only its server since 82cc822 says it)."""
+        status = self._status_after(since)
+        return status is not None and status.get("platform_moving") is False
+
+    def _housing_over(self, since: float) -> bool:
+        """The Bunny's own word that no housing swing runs (its `busy` is the swing's verb while one runs)."""
+        status = self._status_after(since)
+        return status is not None and "busy" in status and status.get("busy") not in HOUSING_BUSY
 
 
 def _plain(message) -> str:
@@ -580,10 +657,11 @@ class RosBunnyLink(BunnyLink):
         self._group = ReentrantCallbackGroup()
         self._clients = {}
         self._clients_lock = threading.Lock()
-        self._aborts = []        # abort threads still on their way (close() waits for them)
+        self._stops = []         # stop threads still on their way (close() waits for them)
         self._listener = None
         self._kept = [node.create_subscription(String, f"{self.ns}/status", self._heard, 10,
                                                callback_group=self._group)]
+        self._client(Trigger, "stop")   # made now: by the first stop, discovery says whether bunny_node offers it
 
     def on_status(self, callback):
         self._listener = callback
@@ -661,18 +739,42 @@ class RosBunnyLink(BunnyLink):
                                       "steps_planned": int(r.steps_planned), "actual_ml": float(r.actual_ml),
                                       "message": r.message})
 
-    def abort(self):
-        thread = threading.Thread(target=self._abort_now, name="bunny-abort", daemon=True)
+    def stop(self, abort_if_missing):
+        thread = threading.Thread(target=self._stop_now, args=(bool(abort_if_missing),), name="bunny-stop",
+                                  daemon=True)
         with self._clients_lock:
-            self._aborts = [t for t in self._aborts if t.is_alive()] + [thread]
+            self._stops = [t for t in self._stops if t.is_alive()] + [thread]
         thread.start()
 
-    def close(self, timeout_s: float = 2 * ABORT_S + SERVICE_WAIT_S):
-        """Wait for an abort still on its way (the module's close sends one) before ROS goes down."""
+    def close(self, timeout_s: float = 3 * ABORT_S + SERVICE_WAIT_S):
+        """Wait for a stop still on its way (the module's close sends one while an action of its runs) before ROS
+        goes down."""
         with self._clients_lock:
-            pending = list(self._aborts)
+            pending = list(self._stops)
         for thread in pending:
             thread.join(timeout_s)
+
+    def _stop_now(self, abort_if_missing):
+        """The Bunny's `stop` through /bunny/stop. Missing — bunny_node does not offer it, the Bunny's server does not
+        know the verb (older than 82cc822: "unknown cmd stop"), or no answer —: the abort when it must stand in."""
+        missing = None
+        if not self._client(self.Trigger, "stop").service_is_ready():
+            missing = f"{self.ns}/stop is not offered (a bunny_node without the Bunny's stop)"
+        else:
+            pending = self._trigger("stop")
+            if not pending.wait(ABORT_S):
+                missing = f"{self.ns}/stop: no answer within {ABORT_S:.0f} s"
+            else:
+                try:
+                    pending.result()
+                    return
+                except LinkError as error:
+                    missing = f"{self.ns}/stop: {error}"
+        if abort_if_missing:
+            self.log(f"{missing}: the Bunny's abort instead (it latches the dose flag until the next weigh_to)")
+            self._abort_now()
+        else:
+            self.log(f"{missing}: nothing sent (an abort cannot stop this, and would latch the dose flag)")
 
     def _abort_now(self):
         for name in ("abort", "liquid_stop"):
@@ -691,7 +793,8 @@ PARAMETERS = {"instance": "bunny_1", "device_ns": "/bunny", "serial": ""}   # de
 
 def main(args=None):
     """One node `<instance>_module` for the link and the bus (the arm adapter's way). rclpy's own signal handling is
-    off, so on Ctrl-C / SIGTERM the module's close still reaches the Bunny (its abort) while ROS runs."""
+    off, so on Ctrl-C / SIGTERM the module's close still reaches the Bunny (its stop, if an action of ours runs) while
+    ROS runs."""
     import signal
 
     from railab_harness.ros_binding import RosBus, ros_environment
@@ -726,8 +829,8 @@ def main(args=None):
     while not leave.wait(0.5):
         pass
     try:
-        module.close()   # stops a running action and sends the Bunny's abort — while ROS still runs
-        link.close()     # wait for that abort to go out
+        module.close()   # stops a running action of ours (the Bunny's stop) — while ROS still runs; nothing if none
+        link.close()     # wait for that stop to go out
     finally:
         bus.close()
         executor.shutdown()

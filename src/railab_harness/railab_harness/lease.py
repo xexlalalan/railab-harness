@@ -1,7 +1,7 @@
 """The control lease: one client may command, any number may watch.
 
 `stop` needs no lease (the gateway lets it through from anyone). A holder that falls silent loses
-the lease — the gateway's watchdog asks `silent_for()` and stops every module first.
+the lease — the gateway's watchdog asks `silent_for()` and stops the actions its layer started.
 """
 
 import threading

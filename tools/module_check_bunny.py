@@ -59,6 +59,9 @@ class FakeBunny(B.BunnyLink):
         self.scan = None              # its last_scan
         self.sent = []                # every call that reached the Bunny (reads of the counter excluded)
         self.aborts = 0
+        self.stops = 0                # the Bunny's own `stop` verbs that reached it
+        self.has_stop = False         # its server knows `stop` (82cc822) and bunny_node offers /bunny/stop
+        self.move = None              # a Pending: the next platform move is answered only when the walk finishes it
         self.housing_fails = None     # words: the next housing swing fails with them
         self.cut_next_move = False    # the next platform move: the connection drops part way
         self.weigh = {"success": True, "outcome": "finished", "actual_g": 1.0, "message": '{"outcome": "finished"}'}
@@ -92,6 +95,9 @@ class FakeBunny(B.BunnyLink):
         if steps == 0:
             return B.Pending.now(self.counter)
         self.sent.append(("platform", steps))
+        if self.move is not None:                # held: the walk answers it (or never)
+            self.counter += steps
+            return self.move
         if self.cut_next_move:
             self.cut_next_move = False
             self.counter += steps // 2           # it went part of the way; the reply never says how far
@@ -125,6 +131,16 @@ class FakeBunny(B.BunnyLink):
         self.sent.append(("dispense_volume", volume_ml))
         return B.Pending.now({"success": True, "steps": 18000, "steps_planned": 18000, "actual_ml": volume_ml,
                               "message": "{}"})
+
+    def stop(self, abort_if_missing):
+        if self.has_stop:
+            self.stops += 1
+            if self.hold is not None:
+                self.hold.set()
+            if self.move is not None:            # the Bunny's stop ends a platform move part way: its verb errors
+                self.move.finish(error=B.BunnyError("platform move stopped"))
+        elif abort_if_missing:
+            self.abort()
 
     def abort(self):
         self.aborts += 1
@@ -385,6 +401,176 @@ def main():
           fake2.aborts >= 1 and gone.get("result") == "stopped" and "harness silent" in gone.get("reason", "")
           and refused(reply, M.NOT_READY), f"{gone} {reply}")
     lone.close()
+
+    # -- the platform height after a move that went wrong
+    fake.status()
+    bunny.watch_once()                             # anchors the counter
+    tell("bunny_1", platform_mm=30.0)
+    fake.move, sent = B.Pending(), len(fake.sent)
+    rid, reply = do("bunny_1", "platform_to", z_mm=40)
+    until(lambda: len(fake.sent) > sent)           # the move has reached the Bunny
+    fake.status(stm32=False)                       # the Bunny's link to its STM32 drops while the move runs …
+    fake.move.finish(fake.counter)                 # … and the move is answered as done, the counter as expected
+    fake.move = None
+    done = last(bunny, rid)
+    lost_value = value("platform_mm")
+    fake.status()
+    bunny.watch_once()
+    check("the STM32 link drops during a move answered 'done' → failed, platform_mm stays unknown (never estimated "
+          "over the loss)", reply.get("accepted") and done.get("result") == "failed" and "STM32" in done.get("reason", "")
+          and lost_value == (M.UNKNOWN, M.UNKNOWN) and value("platform_mm") == (M.UNKNOWN, M.UNKNOWN),
+          f"{done} {lost_value}")
+
+    tell("bunny_1", platform_mm=30.0)
+    budget = B.platform_budget_s
+    B.platform_budget_s = lambda steps: 0.3        # the move's budget, shortened for the walk
+    fake.move = B.Pending()
+    rid, reply = do("bunny_1", "platform_to", z_mm=40)
+    until(lambda: bunny.state()["mode"] == "fault", 3.0)
+    late = bunny.state()
+    fake.status(platform_moving=True)              # the Bunny's own word: it still moves
+    time.sleep(0.2)
+    still = bunny.state()
+    held = gateway.zones.held()
+    fake.status(platform_moving=False)             # … and now the move is over
+    done = last(bunny, rid)
+    B.platform_budget_s = budget
+    fake.move = None
+    check("no answer within the budget → fault NO_REPLY at once, but the action and its zone stay while the Bunny says "
+          "it moves; its status says the move is over → failed, platform_mm unknown",
+          reply.get("accepted") and (late["fault"] or {}).get("code") == B.NO_REPLY
+          and (late["current"] or {}).get("id") == rid and (still["current"] or {}).get("id") == rid
+          and "bunny_1/platform_travel" in held and done.get("result") == "failed"
+          and value("platform_mm") == (M.UNKNOWN, M.UNKNOWN), f"{late['fault']} {still['current']} {held} {done}")
+    do("bunny_1", "clear_fault")
+
+    bunny.watch_once()
+    tell("bunny_1", platform_mm=30.0)
+    budget = B.platform_budget_s
+    B.platform_budget_s = lambda steps: 0.3
+    fake.move = B.Pending()
+    rid, _ = do("bunny_1", "platform_to", z_mm=40)
+    until(lambda: bunny.state()["mode"] == "fault", 3.0)
+    fake.move.finish(fake.counter)                 # answered as done — but only after the budget
+    done = last(bunny, rid)
+    B.platform_budget_s = budget
+    fake.move = None
+    check("a move answered only after its budget → failed ('answered only after'), platform_mm unknown",
+          done.get("result") == "failed" and "only after" in done.get("reason", "")
+          and value("platform_mm") == (M.UNKNOWN, M.UNKNOWN), str(done))
+    do("bunny_1", "clear_fault")
+
+    bunny.watch_once()
+    tell("bunny_1", platform_mm=30.0)
+    fake.has_stop, aborts, stops = True, fake.aborts, fake.stops
+    fake.move, sent = B.Pending(), len(fake.sent)
+    rid, _ = do("bunny_1", "platform_to", z_mm=40)
+    until(lambda: len(fake.sent) > sent)           # the move has reached the Bunny
+    _, reply = do("bunny_1", "stop")
+    done = last(bunny, rid)
+    fake.move, fake.has_stop = None, False
+    check("a Bunny with its own stop (82cc822): stop ends a platform move part way → stopped, platform_mm unknown, "
+          "no abort", reply.get("accepted") and done.get("result") == "stopped" and "part way" in done.get("reason", "")
+          and value("platform_mm") == (M.UNKNOWN, M.UNKNOWN) and fake.stops > stops and fake.aborts == aborts,
+          f"{done} stops {fake.stops - stops} aborts {fake.aborts - aborts}")
+
+    # -- the gateway going safe by itself touches only what THIS layer started
+    t2 = DEFAULT.scaled(0.2)                       # beat 0.2 s, a client silent 0.6 s
+    gbus, gfake = LocalBus(), FakeBunny()
+    gbunny = B.BunnyModule("bunny_1", gbus, gfake, timing=t2, watch_s=None).start()
+    gfake.status()
+    gw = Gateway(gbus, t2).start()
+    gid = itertools.count(100)
+    until(lambda: gw.registry.online("bunny_1"))
+
+    def dose(**extra):
+        gw.take_control("twin")
+        gw.handle("twin", {"module": "bunny_1", "id": next(gid), "set": {"pan_loaded": True, "powder_id": POWDER}})
+        gfake.hold = threading.Event()
+        rid = next(gid)
+        return rid, gw.handle("twin", {"module": "bunny_1", "id": rid, "do": "weigh_to", "args": {"target_g": 1.0}})
+
+    def ends(rid, timeout=3.0):
+        until(lambda: (gbunny.state()["last"] or {}).get("id") == rid, timeout)
+        gw.join_stops(2.0)
+        return gbunny.state()["last"] or {}
+
+    gw.take_control("twin")
+    dropped = until(lambda: gw.lease.holder is None, 3.0)
+    gw.join_stops(2.0)
+    check("the controlling client falls silent while nothing of this layer runs → lease dropped, NOTHING sent to the "
+          "Bunny (an old-path dose is not touched, no abort latches its flag)",
+          dropped and gfake.aborts == 0 and gfake.stops == 0 and gbunny.state()["last"] is None,
+          f"aborts {gfake.aborts} stops {gfake.stops} last {gbunny.state()['last']}")
+
+    gfake.has_stop = True
+    rid, reply = dose()
+    gone = ends(rid)
+    check("our weigh_to runs, the client falls silent → stopped ('client twin silent') by ONE Bunny stop, no abort",
+          reply.get("accepted") and gone.get("result") == "stopped" and "client twin silent" in gone.get("reason", "")
+          and gfake.stops == 1 and gfake.aborts == 0, f"{gone} stops {gfake.stops} aborts {gfake.aborts}")
+
+    gfake.has_stop = False
+    rid, reply = dose()
+    gw.release_control("twin")                     # gives control up, then says nothing more
+    gone = ends(rid)
+    check("control given up while our dose runs → still watched: the releaser's silence stops it (an older Bunny: "
+          "its abort, the only thing that stops a dose)",
+          reply.get("accepted") and gone.get("result") == "stopped" and "given control up" in gone.get("reason", "")
+          and gfake.aborts == 1, f"{gone} aborts {gfake.aborts}")
+
+    rid, reply = dose()
+    gw.release_control("twin")
+    gw.client_gone("twin", "the client closed the connection")
+    gone = ends(rid, 1.0)
+    check("control given up while our dose runs, then the link ends → stopped at once ('disconnected')",
+          reply.get("accepted") and gone.get("result") == "stopped" and "disconnected" in gone.get("reason", ""),
+          str(gone))
+
+    before = (gfake.aborts, gfake.stops, gbunny.state()["last"])
+    gw.take_control("twin")
+    gw.release_control("twin")
+    time.sleep(3 * t2.client_silent_s)
+    gw.join_stops(2.0)
+    check("control given up while nothing runs → no watch, nothing sent",
+          (gfake.aborts, gfake.stops, gbunny.state()["last"]) == before)
+
+    heard, beats, asked = [], [], []
+    unsubscribe = gw.subscribe(lambda item: 1 / 0)  # a listener with a bug
+    gw.subscribe(heard.append)
+    gbus.publish_state({"module": "broken_1", "describe": ["not", "a", "describe"], "current": None, "last": None})
+    gbus.publish_state({"module": "broken_2", "describe": {"actions": {"go": {"args": []}}, "fields": {}, "zones": []}})
+    gw.take_control("twin")
+    reply = gw.handle("twin", {"module": "bunny_1", "id": next(gid), "set": {"pan_loaded": False}})
+    gfake.status()
+    check("a state with a malformed describe is dropped (never raised into the bus's thread); a listener's bug does "
+          "not starve the others; requests to the other modules go on",
+          "broken_1" not in gw.states() and "broken_2" not in gw.states() and reply.get("accepted")
+          and any(item["module"] == "bunny_1" for item in heard), f"{sorted(gw.states())} {reply}")
+    unsubscribe()
+    until(lambda: gw.lease.holder is None, 3.0)
+    gw.join_stops(2.0)
+    quiet = (gfake.aborts, gfake.stops)
+
+    def slow(request):                             # a module that answers a stop only after 2 s
+        asked.append(request)
+        time.sleep(2.0)
+        return M.accept(request["id"])
+    gbus.serve("slow_1", slow, lambda: beats.append(time.monotonic()))
+    gbus.publish_state({"time": time.time(), "module": "slow_1", "mode": "busy", "fault": None, "last": None,
+                        "current": {"id": 7, "do": "spin", "progress": 0.0}, "values": {}, "sources": {},
+                        "describe": {"identity": {}, "actions": dict(M.COMMON_ACTIONS), "fields": {}, "zones": []}})
+    gw.take_control("twin")
+    until(lambda: bool(asked), 3.0)
+    t0 = time.monotonic()
+    time.sleep(1.5)
+    gaps = [b - a for a, b in zip(beats, beats[1:]) if b > t0]
+    check("a stop to a module that takes 2 s to answer does not hold up the beat; it is a stop of scope 'own'; the idle "
+          "Bunny gets nothing",
+          asked and asked[0]["args"].get("scope") == M.STOP_OWN and gaps and max(gaps) < 3 * t2.beat_s
+          and (gfake.aborts, gfake.stops) == quiet, f"asked {asked[:1]} largest beat gap {max(gaps) if gaps else None}")
+    gw.close()
+    gbunny.close()
 
     # -- the camera
     state = camera.state()

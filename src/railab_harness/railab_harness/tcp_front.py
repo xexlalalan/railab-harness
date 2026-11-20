@@ -12,6 +12,7 @@ Client → door (every line has "op"):
   {"op": "ping"}                                       any line counts as alive: the controlling
                                                        client sends one at least every
                                                        timing.client_silent_s, else stop_all
+                                                       (this layer's running actions only)
   {"op": "subscribe"}   {"op": "unsubscribe"}          the merged state stream, pushed
   {"op": "request", "module": "bunny_1", "id": 21, "do": "platform_to", "args": {"z_mm": 120},
    "claims": ["…"]}                                    the contract's envelope + "op"
@@ -35,8 +36,11 @@ states arrive, only the NEWEST pending state of each module is still sent (a sta
 not an event; an action's result stays in `last` until the next action of that module ends).
 
 The CONTROLLING client's connection ending — closed, broken, or a line too long — is a silent
-client at once: the lease is dropped and every module is stopped (Gateway.stop_all). A viewer's
-ending changes nothing. `release_control` stops nothing (as on today's 7803).
+client at once: the lease is dropped and the actions THIS layer started are stopped (Gateway.stop_all:
+nothing of the old path on 7803, nothing at all when none runs). A viewer's ending changes nothing.
+`release_control` (or a hello without the key) stops nothing (as on today's 7803) — but while an
+action of this layer runs, the connection that gave control up stays watched: its silence or its
+end still stops that action (Gateway.release_control / client_gone).
 
 Per connection the logic is `Connection` on any connected stream socket, so it is checked on a
 `socket.socketpair()` without listening; `TcpFront.listen` / `serve_forever` only accept.
@@ -197,7 +201,7 @@ class Connection:
             return self._ended
 
     def _end(self, why: str, flush_s: float = 0.0) -> None:
-        """Once: no more pushes; the controller's ending stops every module; the socket is shut."""
+        """Once: no more pushes; the controller's ending stops this layer's running actions; the socket is shut."""
         with self._wake:
             if self._ending:
                 return
@@ -209,10 +213,10 @@ class Connection:
             self._wake.notify_all()
         if unsubscribe is not None:
             unsubscribe()
-        if self.gateway.release_control(self.name):
-            # the holder's end = a silent client at once (contract: client silence → stop ALL modules,
-            # drop the lease); a viewer's end stops nothing
-            self.gateway.stop_all(f"client {self.name} disconnected: {why}")
+        # the holder's end (or the end of one that gave control up while an action of this layer runs) =
+        # a silent client at once: the lease dropped, this layer's running actions stopped; a viewer's
+        # end stops nothing
+        self.gateway.client_gone(self.name, why)
         try:
             self.sock.shutdown(socket.SHUT_RDWR)   # wakes the reader; it closes the socket last
         except OSError:
@@ -280,7 +284,8 @@ class Connection:
         key, given = self.front.read_key(), message.get("key")
         self.access = "control" if key_matches(given, key) else "view"
         if self.access == "view":
-            self.gateway.release_control(self.name)   # a hello without the key gives control up (stops nothing)
+            self.gateway.release_control(self.name)   # a hello without the key gives control up (stops nothing;
+                                                      # a running action keeps this connection as its watchdog)
         answer = {"op": "hello", "ok": True, "client": self.name, "access": self.access,
                   **self.gateway.hello(self.name)}
         if given and self.access == "view":

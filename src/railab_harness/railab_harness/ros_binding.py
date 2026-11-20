@@ -95,8 +95,8 @@ class RosBus(Bus):
         def answer(request, response):
             try:
                 asked = request_from_msg(request)
-            except ValueError as error:
-                return reply_to_msg(response, M.refuse(request.id, M.BAD_ARGS, str(error)))
+            except (ValueError, RecursionError) as error:   # RecursionError: JSON nested too deep
+                return reply_to_msg(response, M.refuse(request.id, M.BAD_ARGS, str(error) or "args nested too deep"))
             try:
                 reply = on_command(asked)
             except Exception as error:   # noqa: BLE001  an exception here would end the executor's thread
@@ -182,7 +182,14 @@ class RosBus(Bus):
         return client
 
     def _find_modules(self):
-        """Subscribe to every .../state topic of the ModuleState type not yet heard; warm its command client."""
+        """Subscribe to every .../state topic of the ModuleState type not yet heard; warm its command client.
+        Never raises: it runs on the executor's thread (the discovery timer)."""
+        try:
+            self._find_modules_now()
+        except Exception as error:   # noqa: BLE001  an exception here would end the executor's thread
+            self.node.get_logger().warning(f"looking for modules: {type(error).__name__}: {error}")
+
+    def _find_modules_now(self):
         for topic, types in self.node.get_topic_names_and_types():
             module = module_of(topic)
             if module is None or STATE_TYPE not in types:
@@ -195,15 +202,24 @@ class RosBus(Bus):
             self._client(module)
 
     def _heard(self, message):
+        """One .../state message, on the executor's thread: NEVER raises. WHY: an exception here ends the
+        executor's spin thread — the gateway would hear nothing more while its tick kept beating, so every
+        module would believe in a harness that no longer listens (nor answers a stop)."""
         try:
             state = state_from_msg(message)
-        except ValueError as error:   # a module sending broken JSON: dropped (its states stop counting as fresh)
-            self.node.get_logger().warning(f"a state on {state_topic(message.instance)} is not readable: {error}")
+        except Exception as error:   # noqa: BLE001  broken JSON (or nested too deep): dropped, its states stop
+            self.node.get_logger().warning(   # counting as fresh
+                f"a state on {state_topic(str(getattr(message, 'instance', '?')))} is not readable: "
+                f"{type(error).__name__}: {error}")
             return
         with self._lock:
             listeners = list(self._listeners)
         for listener in listeners:
-            listener(state)
+            try:
+                listener(state)
+            except Exception as error:   # noqa: BLE001  one listener's bug: said, the others still hear
+                self.node.get_logger().warning(f"a state listener raised on {state_topic(str(state.get('module')))}: "
+                                               f"{type(error).__name__}: {error}")
 
     # ------------------------------------------------------------ life
     def close(self):

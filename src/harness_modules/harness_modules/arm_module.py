@@ -11,15 +11,19 @@ gateway (TCP 7803), which stays as it is.
                                                joints 1-6 limp, the gripper keeps holding). No other disable /
                                                power-off path exists here, and none may be added.
         calibrate_handeye, calibrate_absolute  declared, refused NOT_READY: not ported yet (NOT_PORTED says why)
-        stop, clear_fault                      the base's. A `stop` REQUEST stops the arm whoever moves it
-                                               (on_stop_request): every goal on the arm node's actions cancelled (it
-                                               freezes the arm where it is, enabled; the old gateway's stop does the
-                                               same) and a released arm held - stop never leaves it limp. The automatic
-                                               safe state (no harness beat, closing, a latched fault: safe_state only)
-                                               touches only what THIS node started: its own goal, its own grip, an arm
-                                               it released itself - so running this node beside the old gateway never
-                                               cancels the old path's motions by itself. clear_fault is refused while
-                                               the arm node still has the cause (check_clear_fault).
+        stop, clear_fault                      the base's. A `stop` REQUEST (scope "device", the default) stops the
+                                               arm whoever moves it (on_stop_request): every goal on the arm node's
+                                               actions cancelled (it freezes the arm where it is, enabled; the old
+                                               gateway's stop does the same) and a released arm held - that stop never
+                                               leaves it limp. Going safe BY ITSELF (no harness beat, closing, a latched
+                                               fault, the gateway's own stop of scope "own" when its client fell silent
+                                               or hung up: safe_state only) touches only an action of THIS node: its own
+                                               goal (follow_path), its own grip (grip_to) - nothing at all when none
+                                               runs, and it never holds a released arm (a drag-teach release, by this
+                                               node or by the old gateway, stays released: someone may be guiding the
+                                               arm by hand). So running this node beside the old gateway never cancels
+                                               the old path's motions nor re-holds its release by itself. clear_fault
+                                               is refused while the arm node still has the cause (check_clear_fault).
   read  joints_deg (model degrees), gap_mm, held, handeye_error_mm, absolute_error_mm - sensed, "unknown" while no
         fresh status (the two calibration errors stay "unknown": nothing here calibrates yet)
   zones none of its own: the zones a path passes are the twin's `claims`
@@ -316,7 +320,6 @@ class Arm(Module):
         self._heard = False        # an /arm/status has arrived at least once
         self._is_ready = None
         self._grip_force = 0.0
-        self._released_here = False   # THIS node's release made the arm limp (and nothing has held it since)
         self._watch_end = threading.Event()
         self._watcher = threading.Thread(target=self._watch, name=f"{name}-watch", daemon=True)
 
@@ -333,19 +336,21 @@ class Arm(Module):
         super().close()
 
     def safe_state(self):
-        """Stop NOW what THIS node started, and never leave it limp: its goal cancelled (the arm node freezes the arm
-        where it is, enabled), its grip in progress re-targeted where the jaws are, an arm it released itself held where
-        it is (HARNESS_PORT.md: stop holds the arm). Fire-and-forget: the command door never waits. The rest of an
-        explicit stop request is on_stop_request."""
-        self.link.halt()
-        if self.running() == "grip_to":
+        """Stop NOW the action THIS node runs, and only that: its goal cancelled (the arm node freezes the arm where it
+        is, enabled), its grip in progress re-targeted where the jaws are. Nothing at all when none runs (the goal this
+        link sent last may be the old path's turn now: never cancelled by itself), and never a hold: a released arm
+        stays released (the operator may be guiding it by hand). Fire-and-forget: the command door never waits. The rest
+        of an explicit stop request (every goal, a released arm held) is on_stop_request."""
+        action = self.running()
+        if action == "follow_path":
+            self.link.halt()
+        elif action == "grip_to":
             self.link.grip_here(self._grip_force)
-        if self._released_here and self._is_ready and self.value("held") is False:
-            self.link.hold_soon()
 
     def on_stop_request(self):
-        """A `stop` request stops the arm whoever moves it (after safe_state: this node's action ends "stopped"):
-        every goal on the arm node's actions cancelled, and a released arm held, whoever released it."""
+        """A `stop` request of scope "device" (the twin's stop) stops the arm whoever moves it (after safe_state: this
+        node's action ends "stopped"): every goal on the arm node's actions cancelled, and a released arm held, whoever
+        released it. Never on the automatic safe state."""
         self.link.halt_all()
         if self._is_ready and self.value("held") is False:
             self.link.hold_soon()
@@ -400,8 +405,6 @@ class Arm(Module):
         elif st["fault"] and st["fault"] != self._acked_fault:
             self.latch_fault(FAULT_ARM, "arm node: " + st["fault"])
         held = bool(st["all_enabled"] and not st["teach_mode"])
-        if held and self.running() != "release":
-            self._released_here = False   # held again (by this node or any other client)
         self.sensed("held", held)
         joints = snap.get("joints")
         if joints is not None and joints["age_s"] <= FRESH_S:
@@ -530,7 +533,6 @@ class Arm(Module):
     def do_hold(self, args, run):
         self._trigger(self.link.hold, run,
                       lambda st: st["all_enabled"] and not st["teach_mode"] and not st["fault"], "the arm held")
-        self._released_here = False
         self.sensed("held", True)
 
     def check_release(self, args):
@@ -539,7 +541,6 @@ class Arm(Module):
     def do_release(self, args, run):
         """The drag-teach release, as the old gateway's arm.release: /arm/disable (joints 1-6 limp, the gripper keeps
         holding). The one way to make the arm limp, on purpose; never called by anything but this action."""
-        self._released_here = True
         self._trigger(self.link.release, run, lambda st: not st["all_enabled"], "the arm released")
         self.sensed("held", False)
 

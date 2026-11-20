@@ -293,7 +293,8 @@ def c_good_path(c):
     need(all(p <= cap * 1.001 for p, cap in zip(peak, CAP_RAD_S)), f"joint speeds {peak} over {CAP_RAD_S}")
     seen = [p for p in c.progress[rid] if 0.0 < p < 1.0]
     need(seen, "no progress between 0 and 1 in the states")
-    need(max(abs(a - b) for a, b in zip(here(c.arm), w2)) < 0.01, "joints_deg not at the last waypoint")
+    need(wait_for(lambda: max(abs(a - b) for a, b in zip(here(c.arm), w2)) < 0.01, 1.0),   # sensed at 10 Hz
+         "joints_deg not at the last waypoint")
     return (f"done; {len(traj.t)} samples over {traj.duration:.2f} s, sample 1 = the arm's posture exactly (waypoint 1 "
             f"was 0.3 deg off), the last = waypoint 3; peak joint speeds {np.round(peak, 3).tolist()} rad/s within "
             f"the caps; progress seen {len(seen)} times")
@@ -442,6 +443,55 @@ def c_beat(c):
             f"follow_path -> NOT_READY ({why}); beat back -> a path done")
 
 
+def settled(c):
+    """joints_deg as the fake arm stands now (the state copies it at 10 Hz)."""
+    need(wait_for(lambda: max(abs(a - b) for a, b in zip(here(c.arm), c.model.to_model_deg(c.fake.q))) < 0.01, 2.0),
+         "joints_deg does not settle on the arm's posture")
+    return here(c.arm)
+
+
+def c_own_stop_path(c):
+    """The gateway's own stop (scope "own": its client fell silent or hung up) during a path of this node."""
+    c.fake.rate = 1.0
+    start = settled(c)
+    rid, reply = ask(c.arm, "follow_path", {"waypoints_deg": [start, moved(start, [30, 0, 0, 0, 0, 0])],
+                                            "speeds": [0.25]})
+    accepted(reply)
+    need(wait_for(lambda: any(p > 0.02 for p in c.progress[rid]), 5.0), "no progress")
+    n = len(c.fake.calls)
+    accepted(ask(c.arm, "stop", {"reason": "client twin silent", "scope": M.STOP_OWN})[1])
+    last = ended(c.arm, rid, 5.0)
+    calls = c.fake.calls[n:]
+    c.fake.rate = 10.0
+    need(last["result"] == "stopped" and "client twin silent" in last["reason"], f"last {last}")
+    need(calls == ["halt"], f"calls {calls}")
+    return f"the path stopped ('{last['reason']}'); only its own goal cancelled ({', '.join(calls)}), no halt_all"
+
+
+def c_auto_stop_released(c):
+    """Going safe by itself never touches what is not this node's running action: no goal cancelled, no hold."""
+    rid, reply = ask(c.arm, "release")
+    accepted(reply)
+    ended(c.arm, rid)
+    last = c.arm.state()["last"]
+    n = len(c.fake.calls)
+    accepted(ask(c.arm, "stop", {"reason": "client twin silent", "scope": M.STOP_OWN})[1])   # idle: nothing at all
+    c.beat.on.clear()                                           # the harness falls silent while idle and released
+    time.sleep(3 * TIMING.module_silent_s)
+    c.beat.on.set()
+    time.sleep(3 * TIMING.beat_s)
+    calls = c.fake.calls[n:]
+    still = c.arm.state()
+    need(calls == [], f"calls {calls}")
+    need(still["values"]["held"] is False, "the released arm was held")
+    need(still["last"] == last, f"last changed: {still['last']}")
+    hid, reply = ask(c.arm, "hold")                             # back as the next checks want it
+    accepted(reply)
+    need(ended(c.arm, hid)["result"] == "done", "hold did not end done")
+    return ("released by this node, then a stop of scope 'own' and a lost beat while idle: no call to the arm node "
+            "(no halt, no halt_all, no hold), the arm stays released, `last` untouched")
+
+
 def c_calibrations(c):
     a = refused(ask(c.arm, "calibrate_handeye")[1], M.NOT_READY, "not ported yet")
     refused(ask(c.arm, "calibrate_absolute")[1], M.NOT_READY, "not ported yet")
@@ -512,6 +562,8 @@ CHECKS = [
     ("a fault latches and clears", c_fault),
     ("the arm node falls silent", c_silent_node),
     ("the beat stops -> safe state", c_beat),
+    ("the gateway's own stop mid-path", c_own_stop_path),
+    ("going safe by itself leaves a released arm alone", c_auto_stop_released),
     ("the two calibrations", c_calibrations),
     ("grip_to", c_grip),
     ("ros_binding mapping", c_mapping),

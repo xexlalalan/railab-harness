@@ -357,7 +357,7 @@ class Walk:
         self.expect(back and sorted(self.gateway.hello(TWIN)["modules"]) == [ARM, BUNNY],
                     f"a NEW gateway knows both modules again after {time.monotonic() - started:.2f} s — from their states alone")
 
-        self.scene(11, "the controlling client goes silent: the gateway stops every module and drops the lease")
+        self.scene(11, "the controlling client goes silent: the gateway drops the lease and stops the actions it started")
         self.gateway.take_control(TWIN)
         moving, a = self.ask(TWIN, ARM, do("follow_path", waypoints_deg=self.long_path()))
         weigh, b = self.ask(TWIN, BUNNY, do("weigh_to", target_g=50.0))
@@ -373,7 +373,9 @@ class Walk:
         self.expect(a["accepted"] and b["accepted"] and stopped and all(
             l["result"] == "stopped" and "client twin silent" in l.get("reason", "") for l in lasts),
             "both actions ended stopped (two modules were busy at once: no global job slot); the lease is free")
-        self.expect(self.last_log()["client"] == "harness", "the harness's own stops are in the command log too")
+        self.gateway.join_stops(2)   # each stop goes out from a thread of its own (the beat never waits for one)
+        self.expect(self.last_log()["client"] == "harness" and self.last_log()["request"]["args"].get("scope") == "own",
+                    "the harness's own stops (scope \"own\": only what this layer started) are in the command log too")
 
         # ------------------------------------------------------------ the twin's door: TCP (tcp_front.py)
         self.scene(12, "the twin's door over TCP (here a socketpair): the key decides who may take control")
@@ -429,7 +431,7 @@ class Walk:
         self.expect(busy and ended, f"it saw request #{rid} busy and then its result, pushed")
         self.expect(tried.get("code") == "NO_LEASE", "its own request is refused NO_LEASE")
 
-        self.scene(15, "the controlling client's connection drops: the door stops every module at once and frees the lease")
+        self.scene(15, "the controlling client's connection drops: the door stops this layer's actions at once and frees the lease")
         moving, a = self.tcp_request("twin", twin, ARM, do("follow_path", waypoints_deg=self.long_path()))
         weigh, b = self.tcp_request("twin", twin, BUNNY, do("weigh_to", target_g=90.0))
         self.until(lambda: self.state(ARM)["mode"] == "busy" and self.state(BUNNY)["mode"] == "busy", ping=False)
@@ -456,6 +458,7 @@ class Walk:
             "both actions ended stopped, reason \"…disconnected…\", before any silence limit; the lease is free")
         pushed = self.until(lambda: all(viewer.saw(lambda p, m=m, i=i: p["module"] == m and (p["state"]["last"] or {}).get("id") == i)
                                         for m, i in ((ARM, moving), (BUNNY, weigh))), timeout=2, ping=False)
+        self.gateway.join_stops(2)
         self.expect(pushed and door.ended and self.last_log()["client"] == "harness",
                     "the viewer was pushed both results; the stops are in the command log as the harness's")
 

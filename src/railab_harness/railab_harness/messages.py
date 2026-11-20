@@ -43,8 +43,15 @@ SENSED, TOLD, ESTIMATED, UNKNOWN = "sensed", "told", "estimated", "unknown"
 
 # the two actions every module has
 STOP, CLEAR_FAULT = "stop", "clear_fault"
+# what a `stop` reaches (its optional arg "scope"):
+#   "device" (the default) = the device, whoever moves it: the twin's stop (the old path's motion too);
+#   "own"                  = only an action THIS module node runs, nothing at all when it runs none: the harness going
+#                            safe by itself (its client silent or gone) — a module runs BESIDE the old path to the same
+#                            device, which an automatic stop must never touch (a cancelled goal, a re-held arm, an abort)
+STOP_DEVICE, STOP_OWN = "device", "own"
 COMMON_ACTIONS = {
-    STOP: {"args": {"reason": {"unit": "text", "optional": True}}, "uses": []},
+    STOP: {"args": {"reason": {"unit": "text", "optional": True},
+                    "scope": {"values": [STOP_DEVICE, STOP_OWN], "optional": True}}, "uses": []},
     CLEAR_FAULT: {"args": {}, "uses": []},
 }
 
