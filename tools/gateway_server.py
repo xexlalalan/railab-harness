@@ -829,7 +829,10 @@ class Gateway:
                         # planners keep inside these (2026-10-24)
                         "limits_model_deg": [[round(math.degrees(lo + o), 2), round(math.degrees(hi + o), 2)]
                                              for (lo, hi), o in zip(self.limits, self.kin.offsets)]},
-                "bunny": {"housing": ["open", "half", "close"], "platform": "steps"}}
+                # housing = the bunny.housing targets; housing_states = the words state.bunny.housing may report
+                # (2026-11-19: read from the motor, never "unknown"; an older Bunny still says unknown)
+                "bunny": {"housing": ["open", "half", "close"], "platform": "steps",
+                          "housing_states": ["closed", "open", "half", "between", "moving", "no_feedback", "untaught"]}}
 
     def state(self):
         a, g, q = self.fresh("arm", 1.0), self.fresh("grip", 1.0), self.joints_rad()
@@ -855,6 +858,9 @@ class Gateway:
         bunny = {"online": bool(b and b.get("online"))}
         if b:
             bunny.update({k: b.get(k) for k in ("unit", "housing", "weight_g", "dispensing", "busy", "load_open")})
+            # the housing as read from the motor (2026-11-19, the Bunny's new status fields): forwarded only when the
+            # Bunny sends them — an older Bunny's reply has none of them, and none is added
+            bunny.update({k: b[k] for k in ("housing_pos", "housing_powered", "housing_enabled", "housing_frac", "housing_age_s", "housing_error") if k in b})
         calib = {"busy": JOB["busy"], "kind": JOB["kind"], "lines": JOB["lines"][-8:], "result": JOB["result"]}
         nv = self.nodes_view()
         return {"arm": arm, "bunny": bunny, "camera": self.camera(), "calib": calib, "nodes": nv["nodes"],
