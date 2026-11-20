@@ -209,6 +209,23 @@ segment and their range); it has no joint limits and no timed trajectory.
 - A boot id in the status (an outage told from a restart).
 - One kept connection that pushes status, instead of a 2 Hz poll and a connection per call.
 
+**The Bunny's side exists since 2026-11-20** (Super Bunny repo, branch dev, commits 82cc822 + b27b5e9; pushed, NOT
+deployed to the Pi, not tried on hardware). Its server on 7801 now also takes `platform_set {mm}`,
+`platform_to {mm}`, `stop`, `set_powder {powder_id}`, `set_pan_loaded {loaded}` and `subscribe {period_s}`, and its
+status carries `boot_id`, `started`, `version`, `platform_mm`, `platform_source` (unknown / told / estimated),
+`platform_why`, `platform_moving`, `platform_steps_per_mm`, `platform_travel_mm`, `pan_loaded`. Every old verb is
+unchanged, so the old path works as before.
+
+- The height is unknown at every start, after a jog on the screen, a stopped move, a serial reconnect, or an estimate
+  that leaves the travel. A jog is reported as unknown, not counted (counting needs firmware).
+- `stop` ends a dose, the pump, a platform move, and a housing swing in place with the motor still holding.
+- The steps per mm (50) and the travel (0 … 109 mm) in the Bunny's `config.py` are INTERIM: the lab has not
+  confirmed them.
+
+**Still to do here:** `bunny_module.py` reaches the Bunny through the existing `bunny_node`, which knows none of the
+new verbs. Using them means a thin adapter that talks to 7801 itself (kept connection + `subscribe`), or new
+services on `bunny_node`. Until then the notes under "The Bunny, as found" stay true for this branch.
+
 ## ROS names that differ from the JSON
 
 | JSON (the contract, the TCP door) | ROS (`harness_module_msgs`) | why |
