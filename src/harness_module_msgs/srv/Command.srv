@@ -1,0 +1,14 @@
+# /<instance>/command - the ONE way to ask a module something (module interface, 2026-11-20).
+# Answered at once: taken or refused. Whether an action then succeeds is told by /<instance>/state.
+# Either a "do" (action + args) or a "set" (told facts), never both.
+# The JSON form of the contract names the action "do"; here it is "action" ("do" is a C++ keyword).
+
+int64 id        # the asker's number for this request; it comes back in the state's current / last
+string action   # the "do", e.g. "platform_to"; "" for a set
+string args     # JSON object of the action's arguments; "" = {}
+string set      # JSON object {field: value}; "" for a do
+---
+bool accepted
+string code     # "" when accepted; else UNKNOWN_ACTION BAD_ARGS OUT_OF_RANGE BUSY FAULT NOT_READY
+                # UNKNOWN_VALUE READ_ONLY UNKNOWN_FIELD (a module's), INTERLOCK NO_LEASE OFFLINE (the gateway's)
+string reason   # in words, for a person

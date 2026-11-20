@@ -1,0 +1,292 @@
+# Module interface — the generic middle layer, side by side with today's gateway
+
+Added 2026-11-20 on branch `module-interface`. Not deployed. Nothing new starts by itself: no entry in
+`tools/harness` NODES, and today's gateway (`tools/gateway_server.py`, TCP 7803) is untouched.
+
+## What and why
+
+THE SOURCE is the contract in the workflow repo (RAILab Individual Units & Workflow Project):
+`module_interface/README.md` — message shapes, the four modes, zones, the error codes, and the decisions at
+its end. When this page and the contract disagree, the contract wins. The code here is a port of the same
+repo's `harness_skeleton/` (its `railab_harness/` core, `examples/`, `demo.py`).
+
+Today every module is wired into the gateway by hand (about 45 commands in one if-chain, a typed `hello.modules`,
+one global job, four names for stop). In the new path every module INSTANCE (`arm_1`, `bunny_1`, `camera_1`, …)
+exposes exactly two things — `/<instance>/command` (a request, answered at once: accepted or refused with a code)
+and `/<instance>/state` (pushed on change and every second) — and ONE generic gateway forwards the twin's requests
+verbatim after four checks (lease, module online, the module's own `describe`, zones). A new module on the bus is
+visible to the twin with no gateway change.
+
+## The pieces and their files
+
+| Piece | File | What it is |
+|---|---|---|
+| the adapter base | `src/railab_harness/railab_harness/module.py` | what every module node is: modes, fault latch, one action at a time, `stop`, values with their sources, the state stream, going safe without the harness's beat (its API: below) |
+| the generic door | `…/gateway.py` | lease → online → `describe` check → zones, then forward verbatim; the beat; client silence → `stop_all` |
+| the words | `…/messages.py` | codes, modes, results, sources; `check_request` (the one check, run by gateway and module alike) |
+| the picture of the modules | `…/registry.py` | built only from the states the modules push |
+| interlocks | `…/zones.py` | zone occupancy, no geometry: a module's `uses` + the twin's `claims` |
+| control | `…/lease.py` | one controller, any number of viewers |
+| command log | `…/audit.py` | every request and its reply, one JSON line each |
+| periods | `…/timing.py` | the beat (1 s, decided), the timeouts (suggested) |
+| the transport seam | `…/bus.py` | `Bus` + `LocalBus` (in-process) |
+| the bus on ROS 2 | `…/ros_binding.py` | `RosBus`, against `harness_module_msgs` |
+| **the twin's door** | `…/tcp_front.py` | JSON lines over TCP on top of `Gateway` (below) |
+| the process | `tools/module_gateway.py` | ROS bus + Gateway + the TCP door on port **7804** |
+| the messages | `src/harness_module_msgs/` | `srv/Command.srv`, `msg/ModuleState.msg`, `msg/Heartbeat.msg` |
+| the adapter nodes | `src/harness_modules/` | `arm_module`, `bunny_module`, `camera_module` (each a `Module` subclass over today's node of that device) |
+| the walk-through | `tools/module_demo.py` + `tools/module_sim/` | 15 scenes in one process, two simulated modules, no ROS, no socket listening |
+
+`src/railab_harness/` is an ament_python package (`package.xml`, `setup.py`, `setup.cfg`, `resource/`). The core
+imports no ROS at import time; only `ros_binding.py` does, inside `RosBus`. `tools/module_gateway.py` takes the core
+from `src/` (as `gateway_server.py` takes `harness_calibration` / `harness_planner`), so a core change needs no
+rebuild; the message package needs `colcon build`.
+
+## The adapter base's API
+
+An adapter is a `Module` subclass and uses ONLY these (no reach into the base's private state). Declared
+on the class: `TYPE`, `VERSION`, `ACTIONS`, `FIELDS`, `ZONES`.
+
+| Hook (the adapter writes it) | When |
+|---|---|
+| `do_<action>(args, run)` | the action's body, in its own thread; returning = done; `raise Failed(words)` = failed; `raise Fault(code, reason)` = failed + latched |
+| `check_<action>(args)` | optional; before accepting, under the module's lock: `raise Refused(code, reason)` |
+| `set_<field>(value)` | optional; before a told value is stored: `raise Refused(…)` |
+| `safe_state()` | on EVERY stop (a `stop` request, no harness beat, close, a latched fault); quick; touches only what THIS node started |
+| `on_stop_request()` | optional; after `safe_state()`, ONLY for a `stop` request: what stops the device whoever moves it |
+| `check_clear_fault(args)` | optional; only while a fault is latched, under the lock, just before it is cleared: `raise Refused(…)` while the cause persists |
+
+| Call (from the adapter's own threads) | Does |
+|---|---|
+| `sensed(f, v)` · `told(f, v)` · `estimated(f, v)` · `unknown(f)` | one field and its source; publishes when it changed |
+| `sensed_many({f: v, …}, ready=None)` | several sensed fields (a value `"unknown"` gets source unknown) and, unless None, the readiness: ONE state, always published |
+| `set_ready(bool)` | the device is there and may take actions |
+| `latch_fault(code, reason) -> bool` | a fault seen outside any action: latched, the running action stopped, `safe_state()`; False when one was latched already |
+| `value(f)` · `need(f)` · `running()` | read a value; the value or `Refused(UNKNOWN_VALUE)`; the running action's name or None |
+| `run.stopped` · `run.sleep(s)` · `run.progress(x)` · `run.ask_stop(reason)` | inside `do_*` |
+
+WHY the stop is split: an adapter runs BESIDE today's path to the same device (the old gateway on 7803).
+Going safe by itself (the new gateway not running yet, the adapter closed) must not cancel the old path's
+motion; a `stop` the twin asks for must stop the device whoever moves it. So: the arm's `safe_state` cancels
+only its own goal / grip / release, its `on_stop_request` cancels every goal on the arm node and holds a
+released arm; the Bunny's `safe_state` aborts only while an action of its own runs, its `on_stop_request`
+aborts whoever doses.
+
+## First steps on the harness PC
+
+Written, NOT run (there is no ROS on the machine this was written on). The branch adds files only: every
+existing file — the nodes, `gateway_server.py`, `harness_msgs`, `tools/harness` — is unchanged, and none of
+the new processes is in `harness nodes`.
+
+1. Bring the branch onto the harness PC (the lead's way of deploying) and build the three new packages ON
+   THEIR OWN — nothing of today's path is rebuilt:
+   ```bash
+   cd ~/bunny-harness-dev
+   source /opt/ros/lyrical/setup.bash
+   colcon build --packages-select harness_module_msgs railab_harness harness_modules
+   source rosenv.sh                                   # ROS + install/setup.bash + ROS_DOMAIN_ID 36
+   ros2 interface show harness_module_msgs/srv/Command
+   harness nodes status                               # today's nodes: as before
+   ```
+2. ONE adapter beside the old path, the camera first (read-only, nothing to move), and look at its state:
+   ```bash
+   ros2 run harness_modules camera_module --ros-args -p instance:=camera_1
+   ros2 topic echo --once /camera_1/state             # mode ready while tag_node sends frames; values.tags
+   ros2 topic hz /camera_1/state                      # ~2 Hz, whatever the frame rate
+   ```
+3. The Bunny's adapter, then the arm's (one at a time, each looked at before the next):
+   ```bash
+   ros2 run harness_modules bunny_module --ros-args -p instance:=bunny_1
+   ros2 topic echo --once /bunny_1/state              # ready; housing, weight_g sensed; platform_mm unknown
+   ros2 run harness_modules arm_module --ros-args -p instance:=arm_1 -p harness_root:=$HOME/bunny-harness-dev
+   ros2 topic echo --once /arm_1/state                # joints_deg = the old gateway's joints_model_deg; held
+   ```
+   With no new gateway nobody beats: 3 s after start each adapter refuses every action `NOT_READY` ("no
+   harness heartbeat") — by design. Going safe sends nothing to the device while no action of its own runs
+   (the old path's dose / motion is not touched); Ctrl-C (close) is the same.
+4. The new gateway on 127.0.0.1:7804 (7803 keeps running), and in a second terminal a viewer (no key:
+   nothing can move):
+   ```bash
+   python3 tools/module_gateway.py
+   python3 -c 'import json,socket; s=socket.create_connection(("127.0.0.1",7804)); f=s.makefile("rw")
+   [f.write(json.dumps(m)+"\n") for m in ({"op":"hello","client":"probe"},{"op":"subscribe"})]; f.flush()
+   [print(f.readline()[:160]) for _ in range(6)]'
+   ```
+5. The first command with the key: the operator decides when. Suggested order: nothing that moves (Bunny
+   `set powder_id`, `tare`; `housing_to` the state it already reports = done, nothing sent), then one motion
+   with the old path idle.
+
+Other ways to start it: `python3 tools/module_gateway.py --bind 0.0.0.0` (the twin on the workstation),
+`--sim` (no ROS, the two simulated modules); `pkill -f tools/module_gateway.py` (SIGTERM: the controller's
+link ends → every module stopped). The walk-through runs anywhere: `python3 tools/module_demo.py` (~4 s).
+
+- **Port 7804**, `--bind` default **127.0.0.1**: an untested door to hardware is not open to the network by
+  itself (reach it on the harness PC or through `ssh -L 7804:127.0.0.1:7804`); `--bind 0.0.0.0` as 7803 binds.
+- **The key** is today's gateway key, `~/.config/railab-harness/gateway.key` (`harness gateway key` creates it),
+  read at every `hello`, compared in constant time, never printed, logged or answered back. No key file = every
+  connection is a viewer (as on 7803).
+- **The command log** defaults to `/tmp/module_gateway_commands.jsonl`, beside the process logs `harness nodes
+  start` writes to `/tmp/<name>.log`; cleared at a reboot. `--audit PATH` keeps it elsewhere, `--audit ''` = none.
+- `FASTDDS_BUILTIN_TRANSPORTS=UDPv4` is set before rclpy loads, for the reason `gateway_server.py` gives
+  (2026-11-19, the orphaned shared-memory port).
+
+## The twin's door: messages (`tcp_front.py`)
+
+Newline-delimited JSON, one object per line, both ways. Every client line has `"op"`. Lines are handled in the
+order they arrive (a `set` sent before a `do` reaches the module first); answers leave in that order and carry the
+op they answer. One connection may hold control at a time; any number may watch.
+
+| op | example (client ⇒) | answer (⇐) |
+|---|---|---|
+| `hello` | `{"op": "hello", "client": "railab-wf", "key": "…"}` | `{"op": "hello", "ok": true, "client": "railab-wf@192.168.7.1:51234#3", "access": "control", "harness": "0.1.0", "you": "view", "control": null, "modules": {"bunny_1": {"online": true, "describe": {…}}}}` — `access` = may take control (the key); `you` = holds it now. A wrong key: `access` view + `"warning": "wrong key"`. The client name is fixed by the first hello. |
+| `take_control` | `{"op": "take_control"}` | `{"op": "take_control", "ok": true}` · `{"op": "take_control", "ok": false, "code": "NO_LEASE", "reason": "needs the gateway key (hello with the key)"}` |
+| `release_control` | `{"op": "release_control"}` | `{"op": "release_control", "ok": true}` (stops nothing, as on 7803) |
+| `ping` | `{"op": "ping"}` | `{"op": "ping", "ok": true, "t": 1763633703.12}` |
+| `subscribe` | `{"op": "subscribe"}` | `{"op": "subscribe", "ok": true}`, then a state of every module known so far, then every change |
+| `unsubscribe` | `{"op": "unsubscribe"}` | `{"op": "unsubscribe", "ok": true}` |
+| `request` | `{"op": "request", "module": "bunny_1", "id": 21, "do": "platform_to", "args": {"z_mm": 120}, "claims": []}` — the contract's envelope + `op`; a `set`: `{"op": "request", "module": "bunny_1", "id": 22, "set": {"platform_mm": 87.3}}` | `{"op": "request", "module": "bunny_1", "id": 21, "accepted": true}` · `{"op": "request", "module": "bunny_1", "id": 23, "accepted": false, "code": "OUT_OF_RANGE", "reason": "z_mm = 300 is outside 0 … 109 mm"}` |
+| (pushed) | — | `{"op": "state", "module": "bunny_1", "online": true, "state": {"time": …, "mode": "busy", "current": {"id": 21, "do": "platform_to", "progress": 0.4}, …}}` |
+| (a bad line) | `this is not JSON` | `{"op": "error", "code": "BAD_ARGS", "reason": "a line must be one JSON object"}` — the link stays |
+
+Rules of the door:
+
+- **Any line counts as alive.** The controlling client sends something (a `ping`) at least every 3 s
+  (`timing.CLIENT_SILENT_S`; today's dead-man is 10 s), else the gateway stops every module and drops the lease.
+- **The controlling client's connection ending** (closed, broken, a line > 1 MiB) = a silent client AT ONCE: the
+  lease is dropped and every module stopped; the modules' `last.reason` says `client … disconnected`. A viewer's
+  ending changes nothing (`Lease.release` says whether the connection held the lease, in one step).
+- **`stop` from anyone**: a request `{"do": "stop"}` is taken from any connection, with or without the key. A request
+  waits for the one before it on the same connection (at most `reply_s` 1 s when a module does not answer): a client
+  that wants a stop never queued may keep a second connection for it.
+- **The envelope has exactly** `module, id, do | set, args, claims`; another key, or `claims` that is not a list of
+  zone names, is refused `BAD_ARGS` at the door and logged with the stray keys' names only. The gateway refuses
+  such `claims` `BAD_ARGS` by itself too (for any other front).
+- **A gateway exception** on a request answers `accepted: false, code INTERNAL` (and goes to stderr) instead of
+  cutting the link — cutting the controller's link would stop everything.
+- **Pushes never hold up a module.** A client that reads slower than states arrive gets only the newest pending
+  state of each module (results stay in `last` until that module's next action ends).
+- At most 32 connections; the 33rd gets `{"op": "error", "code": "BUSY", …}` and is closed.
+
+## Execute or refuse: what the old gateway changed silently
+
+Today's gateway (`gateway_server.py`, `arm.follow_joints` / `arm.gripper`) changes some commands without a
+word; the arm's adapter refuses them instead, with the joint, the value and the limit:
+
+| Sent | Old gateway (7803) | Arm adapter |
+|---|---|---|
+| a path starting away from the arm | bridged up to 0.35 rad (20°): the first waypoint replaced by the arm's posture | `OUT_OF_RANGE` beyond `START_TOL_DEG` 1°; within it the path starts exactly where the arm is |
+| a waypoint past a joint limit | clamped inside, up to 10° | `OUT_OF_RANGE` outside the controller's range less the arm node's 0.01 rad margin |
+| the arm held past a limit | a move back inside prepended, up to 20° | nothing prepended (the path starts where the arm is; every later waypoint must be inside) |
+| `speed` / `speeds` | clamped to 0.25 … 2 | `OUT_OF_RANGE`; `speeds` = one per SEGMENT (K − 1 for K waypoints) |
+| `corner_deg` | clamped 5 … 45 | not offered: every path is the smooth path |
+| a gripper gap above the widest | the arm node clamps it | `OUT_OF_RANGE` (the widest = its gripper calibration now) |
+| force 0 | read as the default | the range starts at 0.001 N; leave `force_n` out for the default |
+
+The simulated arm (`tools/module_sim/arm_sim.py`) takes `follow_path` the same way (start gap, speeds per
+segment and their range); it has no joint limits and no timed trajectory.
+
+## The Bunny, as found
+
+- **A jog on the Bunny's own screen cannot be seen**: its buttons go straight to the STM32 and the status
+  carries no position. The adapter notices only a change of the server's step counter (another client, a
+  server restart).
+- **The Bunny cannot stop a platform move or a housing swing** (its abort covers dosing and the pump): `stop`
+  waits for them to end, and the zone stays held until then.
+- **An EMPTY `WeighTo.powder_id` does not make today's Bunny measure the powder fresh**: it keeps the powder it
+  last selected, although `WeighTo.srv`'s comment says otherwise (this affects the old path too). So
+  `weigh_to` is refused `UNKNOWN_VALUE` when `powder_id` is unknown while the Bunny reports a current powder.
+- **`powder_id` must be digits**: bunny_node treats any other text as a powder NAME.
+- **An outage cannot be told from a restart**: it makes every value unknown, the told ones included.
+- **`pan_loaded` is kept in the adapter**: the Bunny's `load_begin` / `load_end` handshake is a "do not dose
+  now" window, not what stands on the pan.
+
+## What the Bunny's own server needs for the adapter to become thin
+
+- `platform_to {z_mm}` and `platform_mm` in its status — the steps per mm and the travel living in the Bunny.
+- A jog on its screen counted, or reported as unknown.
+- A platform stop (the firmware has `stpstop`) and a housing stop.
+- "Set current powder" (refuses an unknown id, can clear it) and `pan_loaded` as its own fields.
+- A boot id in the status (an outage told from a restart).
+- One kept connection that pushes status, instead of a 2 Hz poll and a connection per call.
+
+## ROS names that differ from the JSON
+
+| JSON (the contract, the TCP door) | ROS (`harness_module_msgs`) | why |
+|---|---|---|
+| request `do` | `Command.srv` `action` | `do` is a C++ keyword |
+| state `module` | `ModuleState.msg` `instance` | `module` is an OMG IDL keyword |
+
+Example: `ros2 service call /bunny_1/command harness_module_msgs/srv/Command "{id: 1, set: '{\"powder_id\": \"9618329212\"}'}"`
+(`args` and `set` are JSON text; `""` = empty).
+
+## Not ported yet
+
+- **The twin's own link** (the workflow app's `harness_link.py`) still speaks 7803; nothing on the twin side uses 7804.
+- **dtv and pipette** adapters; the **camera**'s ChArUco stream and the cross-module routines today's gateway
+  runs itself (`teach.fine`, `teach.plan_views`, the start-posture precheck); the tag measurement is open ("to be
+  confirmed" in the contract).
+- **The calibrations.** `calibrate_handeye` / `calibrate_absolute` are declared on the arm and refused
+  `NOT_READY`. Hand-eye today = the old gateway's `handeye_job` (a subprocess, a target choice tag | board, a
+  precheck, installed at rms ≤ 3 mm), and the old gateway keeps the result IN MEMORY — installing it from the
+  adapter would leave the old gateway on the old calibration. Absolute = a session of up to five hand-placed
+  board positions, then an install and an arm-node restart — not one action. A port needs: `handeye_job` and the
+  precheck moved into the arm node, a target argument on the action, the old gateway re-reading `handeye.yaml`
+  when it changes.
+- **Today's gateway-only commands** with no module behind them: `arm.check_j` (dry run), `arm.jog_pose` /
+  `arm.jog_gripper` (live sliders), `arm.gripper_cal`, `nodes.status` / `nodes.restart`, `state` at a chosen rate
+  (`subscribe {rate_hz}`; the new door pushes on change and at each module's 1 s beat).
+- **Several controlling clients**, a takeover of a stale holder (7803's `HOLDER_STALE_S`): out of scope — a silent
+  holder loses the lease after 3 s anyway.
+- **The timeouts** are the contract's suggestions (3 s / 4 s / 3 s), not decided.
+
+## Open
+
+- **An action the DEVICE started on its own** (a housing swing from the Bunny's screen, or one sent through the
+  old gateway) is not shown as `current`, so it holds no zone: the gateway may grant an arm path through a
+  housing that is swinging. The zone logic is ready for it (a module's own `current` occupies its zones); the
+  adapters cannot see such motions yet (the Bunny's status has no "busy with what", the arm adapter reads the
+  arm node's `busy` only to refuse).
+- **A lossy transport** (a dropped state) can leave a zone held — the safe side, but it needs a way out
+  (from the contract).
+
+## Not tested
+
+Checked only by `py_compile` (and a Python 3.10 grammar parse on 3.13) and by direct calls without ROS:
+`tools/module_demo.py` (15 scenes), `tools/module_check_arm.py` (13 checks: the adapter on a fake arm node, the
+real planner on a synthetic arm model), `tools/module_check_bunny.py` (24 checks: fake bunny_node, fake
+tag_node), the door's edge paths on socketpairs. NOT tested:
+
+- **anything ROS**: `ros_binding.py` (`RosBus`), `RosArmLink`, `RosBunnyLink`, `RosCameraLink` and the three
+  `main()`s, their parameters and executors, SIGINT / SIGTERM with rclpy's own handling off; the
+  `harness_module_msgs` build; `colcon build` of `railab_harness` / `harness_modules` (`package.xml`, `setup.py`,
+  the console scripts never built); `module_gateway.py` on the ROS bus; `FASTDDS_BUILTIN_TRANSPORTS=UDPv4`. The
+  JSON ↔ message mapping only with stand-in objects.
+- **a real listening socket**: `TcpFront.listen` / `serve_forever`, the 32-connection limit, IPv6 `--bind`, a peer
+  on another machine, a half-open link (no FIN: only the 3 s silence catches it).
+- **the real devices**: the PiPER through the arm node (goals, cancel, hold, the drag-teach release, the gripper,
+  the real `calib/kinematics.yaml`), the Bunny through bunny_node and its server (the step counter's meaning was
+  read from the code), tag_node's frames at their real rate.
+- **Python 3.10 and 3.14** (run on 3.13 only); the key file and the `/tmp` command log on the harness PC.
+
+## Old piece → new piece
+
+For whoever retires the old gateway.
+
+| today (7803) | new path |
+|---|---|
+| `tools/gateway_server.py`: ~45 commands in one if-chain | `gateway.py`: no command names; a command exists because a module's `describe` lists it |
+| `{"id", "cmd", "args"}` → `{"id", "ok", "result" \| "error"}` | `{"op": "request", "module", "id", "do" \| "set", "args", "claims"}` → `{"op": "request", "module", "id", "accepted", "code"?, "reason"?}`; progress and result in the pushed state (`current`, `last`) |
+| `hello` {key, client} → `access`, typed `modules` | `hello` {key, client} → `access`, `modules` from each module's own `describe` |
+| `KEY_FILE` `~/.config/railab-harness/gateway.key`, `read_key()` | the same file, the same reading (`tcp_front.read_key`) |
+| `take_control` / `release_control` (`ctl["conn"]`) | the same ops; `Lease` |
+| `subscribe {rate_hz}` → `{"event": "state", …}` at a rate | `subscribe` → `{"op": "state", "module", "online", "state"}` per module, on change |
+| `stop` (cancel arm goals, `/bunny/abort`) | `{"do": "stop"}` to a module, or `Gateway.stop_all` — every module has `stop`, never refused |
+| the dead-man: the controller silent `DEADMAN_S` 10 s while a motion / job runs → cancel arm goals only | the controller silent 3 s, or its link closed → `stop_all` (every module), lease dropped; plus each module goes safe by itself 3 s after the harness's beat stops |
+| one global `JOB` | one action per module (`current`), no global slot |
+| `HOLDER_STALE_S` takeover | none: a silent holder loses the lease (and every module is stopped) |
+| `hello.modules`, a dict typed in the gateway | each module's `describe`, carried in its state |
+| `/bunny/platform` {steps} | `platform_to {z_mm}` + the writable field `platform_mm` (`"unknown"` until told) |
+| the gateway's time planning / clamping / start-gap recovery for `arm.follow_joints` | inside the arm node behind `follow_path`; out of range is refused, never clamped |
+| `node_watchdog.py`'s per-name health; camera health from a log file | `Registry.online` from the age of a module's state (restarting processes stays the watchdog's job) |
+| no command log (stdout has only calibration lines) | `audit.py`: every request, its reply, forwarded or not, one JSON line |
+| `tools/workflow_server.py` (7802), `workflows/*.sh` | to retire: one door |

@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>railab_harness</name>
+  <version>0.1.0</version>
+  <description>The generic middle layer (module interface, 2026-11-20): the Module adapter base every module node is, the generic Gateway (lease, zones, registry, command log) and its TCP front for the twin. Imports no ROS at import time; ros_binding.py is the bus on ROS 2.</description>
+  <maintainer email="xexlalalan@gmail.com">bunny-harness</maintainer>
+  <license>Proprietary</license>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>harness_module_msgs</exec_depend>
+  <export><build_type>ament_python</build_type></export>
+</package>
