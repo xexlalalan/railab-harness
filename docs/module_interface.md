@@ -1,7 +1,9 @@
 # Module interface — the generic middle layer, side by side with today's gateway
 
-Added 2026-11-20 on branch `module-interface`. Not deployed. Nothing new starts by itself: no entry in
-`tools/harness` NODES, and today's gateway (`tools/gateway_server.py`, TCP 7803) is untouched.
+Added 2026-11-20 on branch `module-interface`; deployed beside the old path on 2026-11-20: the new gateway and
+`camera_1` run on the harness PC, the Bunny's and the arm's adapters are being started. Nothing new starts by
+itself: no entry in `tools/harness` NODES. The branch adds files only: today's gateway (`tools/gateway_server.py`,
+TCP 7803), the nodes, `harness_msgs` and `tools/harness` are untouched.
 
 ## What and why
 
@@ -22,7 +24,7 @@ visible to the twin with no gateway change.
 | Piece | File | What it is |
 |---|---|---|
 | the adapter base | `src/railab_harness/railab_harness/module.py` | what every module node is: modes, fault latch, one action at a time, `stop`, values with their sources, the state stream, going safe without the harness's beat (its API: below) |
-| the generic door | `…/gateway.py` | lease → online → `describe` check → zones, then forward verbatim; the beat; client silence → `stop_all` |
+| the generic door | `…/gateway.py` | lease → online → `describe` check → zones, then forward verbatim; the beat; client silence → `stop_all` (a `stop` of scope "own" to the modules running an action of this layer only) |
 | the words | `…/messages.py` | codes, modes, results, sources; `check_request` (the one check, run by gateway and module alike) |
 | the picture of the modules | `…/registry.py` | built only from the states the modules push |
 | interlocks | `…/zones.py` | zone occupancy, no geometry: a module's `uses` + the twin's `claims` |
@@ -52,8 +54,8 @@ on the class: `TYPE`, `VERSION`, `ACTIONS`, `FIELDS`, `ZONES`.
 | `do_<action>(args, run)` | the action's body, in its own thread; returning = done; `raise Failed(words)` = failed; `raise Fault(code, reason)` = failed + latched |
 | `check_<action>(args)` | optional; before accepting, under the module's lock: `raise Refused(code, reason)` |
 | `set_<field>(value)` | optional; before a told value is stored: `raise Refused(…)` |
-| `safe_state()` | on EVERY stop (a `stop` request, no harness beat, close, a latched fault); quick; touches only what THIS node started |
-| `on_stop_request()` | optional; after `safe_state()`, ONLY for a `stop` request: what stops the device whoever moves it |
+| `safe_state()` | quick; touches only what THIS node started, nothing when none runs; called on any stop while an action of this node runs, and on a `stop` request of scope "device", close and a latched fault even when none runs |
+| `on_stop_request()` | optional; after `safe_state()`, ONLY for a `stop` request of scope "device": what stops the device whoever moves it |
 | `check_clear_fault(args)` | optional; only while a fault is latched, under the lock, just before it is cleared: `raise Refused(…)` while the cause persists |
 
 | Call (from the adapter's own threads) | Does |
@@ -66,17 +68,21 @@ on the class: `TYPE`, `VERSION`, `ACTIONS`, `FIELDS`, `ZONES`.
 | `run.stopped` · `run.sleep(s)` · `run.progress(x)` · `run.ask_stop(reason)` | inside `do_*` |
 
 WHY the stop is split: an adapter runs BESIDE today's path to the same device (the old gateway on 7803).
-Going safe by itself (the new gateway not running yet, the adapter closed) must not cancel the old path's
-motion; a `stop` the twin asks for must stop the device whoever moves it. So: the arm's `safe_state` cancels
-only its own goal / grip / release, its `on_stop_request` cancels every goal on the arm node and holds a
-released arm; the Bunny's `safe_state` aborts only while an action of its own runs, its `on_stop_request`
-aborts whoever doses.
+Going safe by itself (no harness beat, the adapter closed, the gateway's own stop of scope "own") must not touch
+the old path; a `stop` the twin asks for (scope "device", the default) must stop the device whoever moves it.
+`stop {reason?, scope?}`: scope "device" (default) or "own" (only an action this node runs; nothing when none runs —
+a module with no action of its own also does nothing when the harness's beat stops). So: the arm's `safe_state`
+cancels only its own `follow_path` goal / `grip_to` grip and never holds a released arm (someone may be guiding it
+by hand); its `on_stop_request` cancels every goal on the arm node and holds a released arm. The Bunny's
+`safe_state` sends the Bunny's own `stop` (bunny_node's `/bunny/stop`) only while an action of its own runs; its
+`on_stop_request` stops the Bunny whoever doses. The Bunny's `abort` stands in only where it has no `stop`: for its
+own `weigh_to` / `dispense_volume`, or a stop of scope "device". (SUPERSEDED 2026-11-20 by 6fa8164: the arm's
+automatic safe state re-holding an arm it had released itself, and the Bunny's abort as its stop.)
 
 ## First steps on the harness PC
 
-Written, NOT run (there is no ROS on the machine this was written on). The branch adds files only: every
-existing file — the nodes, `gateway_server.py`, `harness_msgs`, `tools/harness` — is unchanged, and none of
-the new processes is in `harness nodes`.
+Written without ROS (none on the machine this was written on); see "Not tested". The branch adds files only (the
+top of this page).
 
 1. Bring the branch onto the harness PC (the lead's way of deploying) and build the three new packages ON
    THEIR OWN — nothing of today's path is rebuilt:
@@ -118,7 +124,7 @@ the new processes is in `harness nodes`.
 
 Other ways to start it: `python3 tools/module_gateway.py --bind 0.0.0.0` (the twin on the workstation),
 `--sim` (no ROS, the two simulated modules); `pkill -f tools/module_gateway.py` (SIGTERM: the controller's
-link ends → every module stopped). The walk-through runs anywhere: `python3 tools/module_demo.py` (~4 s).
+link ends → the actions this layer started are stopped; nothing else). The walk-through runs anywhere: `python3 tools/module_demo.py` (~4 s).
 
 - **Port 7804**, `--bind` default **127.0.0.1**: an untested door to hardware is not open to the network by
   itself (reach it on the harness PC or through `ssh -L 7804:127.0.0.1:7804`); `--bind 0.0.0.0` as 7803 binds.
@@ -151,26 +157,39 @@ op they answer. One connection may hold control at a time; any number may watch.
 Rules of the door:
 
 - **Any line counts as alive.** The controlling client sends something (a `ping`) at least every 3 s
-  (`timing.CLIENT_SILENT_S`; today's dead-man is 10 s), else the gateway stops every module and drops the lease.
+  (`timing.CLIENT_SILENT_S`; today's dead-man is 10 s), else the gateway drops the lease and `stop_all` sends a
+  `stop` of scope "own" to each module running an action THIS layer started (each from its own thread) — and to
+  no other: with none running nothing is sent, so an idle dead-man is harmless. This supersedes the old dead-man
+  for the new path (operator 2026-11-20: the newer change wins; PROJECT_SPEC.md "Dead-man" marks it); 7803 keeps
+  10 s until it retires. (SUPERSEDED 2026-11-20 by 6fa8164: "stops every module".)
+- **The watch follows the action.** A client that gives control up (`release_control`, a hello without the key)
+  while an action of this layer runs stays watched until none runs: its silence or its link's end still stops
+  them. Taking control hands the watch to the new holder.
 - **The controlling client's connection ending** (closed, broken, a line > 1 MiB) = a silent client AT ONCE: the
-  lease is dropped and every module stopped; the modules' `last.reason` says `client … disconnected`. A viewer's
-  ending changes nothing (`Lease.release` says whether the connection held the lease, in one step).
-- **`stop` from anyone**: a request `{"do": "stop"}` is taken from any connection, with or without the key. A request
+  lease is dropped and this layer's running actions stopped; their modules' `last.reason` says `client …
+  disconnected`. A viewer's ending changes nothing (`Lease.release` says whether the connection held the lease, in
+  one step), nor does a released holder's once no action of this layer runs.
+- **`stop` from anyone**: a request `{"do": "stop"}` (scope "device", the default) is taken from any connection,
+  with or without the key; `"args": {"scope": "own"}` stops only an action that module node runs. A request
   waits for the one before it on the same connection (at most `reply_s` 1 s when a module does not answer): a client
   that wants a stop never queued may keep a second connection for it.
 - **The envelope has exactly** `module, id, do | set, args, claims`; another key, or `claims` that is not a list of
   zone names, is refused `BAD_ARGS` at the door and logged with the stray keys' names only. The gateway refuses
   such `claims` `BAD_ARGS` by itself too (for any other front).
 - **A gateway exception** on a request answers `accepted: false, code INTERNAL` (and goes to stderr) instead of
-  cutting the link — cutting the controller's link would stop everything.
+  cutting the link — cutting the controller's link would stop this layer's running actions.
 - **Pushes never hold up a module.** A client that reads slower than states arrive gets only the newest pending
   state of each module (results stay in `last` until that module's next action ends).
 - At most 32 connections; the 33rd gets `{"op": "error", "code": "BUSY", …}` and is closed.
+- **Nothing holds up the beat or the bus thread**: a state listener that raises, a malformed `describe` (dropped)
+  or a failing beat duty is said once on stderr and the rest goes on.
 
 ## Execute or refuse: what the old gateway changed silently
 
 Today's gateway (`gateway_server.py`, `arm.follow_joints` / `arm.gripper`) changes some commands without a
-word; the arm's adapter refuses them instead, with the joint, the value and the limit:
+word; the arm's adapter refuses them instead, with the joint, the value and the limit. For the new path these
+refusals supersede the old gateway's rules (operator 2026-11-20: the newer change wins; PROJECT_SPEC.md marks the
+older ones); 7803 keeps them until it retires:
 
 | Sent | Old gateway (7803) | Arm adapter |
 |---|---|---|
@@ -187,11 +206,21 @@ segment and their range); it has no joint limits and no timed trajectory.
 
 ## The Bunny, as found
 
-- **A jog on the Bunny's own screen cannot be seen**: its buttons go straight to the STM32 and the status
-  carries no position. The adapter notices only a change of the server's step counter (another client, a
+Through `bunny_node`, the path this branch's adapter uses. The Bunny's own server has had `platform_mm` and `stop`
+since 2026-11-20 (below); `bunny_node` passes its `stop` (`/bunny/stop`, 6fa8164), not `platform_mm`.
+
+- **A jog on the Bunny's own screen cannot be seen**: its buttons go straight to the STM32 and `bunny_node`'s
+  status carries no position. The adapter notices only a change of the server's step counter (another client, a
   server restart).
-- **The Bunny cannot stop a platform move or a housing swing** (its abort covers dosing and the pump): `stop`
-  waits for them to end, and the zone stays held until then.
+- **A platform move or a housing swing stops only with the Bunny's own `stop`** (`/bunny/stop`; a server older
+  than 82cc822 answers "unknown cmd stop", and its abort covers dosing and the pump only): then `stop` waits for
+  them to end, and the zone stays held until then. The abort stands in only for this node's own `weigh_to` /
+  `dispense_volume` or a stop of scope "device" (it latches the Bunny's dose flag; `stop` does not).
+  (SUPERSEDED 2026-11-20 by 6fa8164: the abort as the adapter's stop.)
+- **The platform height stays unknown after a failed, stopped or late move**, or one during which the Bunny's link
+  was lost. No answer within the budget is not a failure: NO_REPLY is latched at once, but the action and its zone
+  `platform_travel` stay held until the Bunny answers or its status shows the move over (`platform_moving`, a
+  server since 82cc822; a swing: its `busy` word).
 - **An EMPTY `WeighTo.powder_id` does not make today's Bunny measure the powder fresh**: it keeps the powder it
   last selected, although `WeighTo.srv`'s comment says otherwise (this affects the old path too). So
   `weigh_to` is refused `UNKNOWN_VALUE` when `powder_id` is unknown while the Bunny reports a current powder.
@@ -202,7 +231,7 @@ segment and their range); it has no joint limits and no timed trajectory.
 
 ## What the Bunny's own server needs for the adapter to become thin
 
-- `platform_to {z_mm}` and `platform_mm` in its status — the steps per mm and the travel living in the Bunny.
+- `platform_to {mm}` and `platform_mm` in its status — the steps per mm and the travel living in the Bunny.
 - A jog on its screen counted, or reported as unknown.
 - A platform stop (the firmware has `stpstop`) and a housing stop.
 - "Set current powder" (refuses an unknown id, can clear it) and `pan_loaded` as its own fields.
@@ -216,14 +245,15 @@ status carries `boot_id`, `started`, `version`, `platform_mm`, `platform_source`
 `platform_why`, `platform_moving`, `platform_steps_per_mm`, `platform_travel_mm`, `pan_loaded`. Every old verb is
 unchanged, so the old path works as before.
 
-- The height is unknown at every start, after a jog on the screen, a stopped move, a serial reconnect, or an estimate
-  that leaves the travel. A jog is reported as unknown, not counted (counting needs firmware).
+- The height is unknown at every start, after a jog on the screen, a stopped move, a commanded move during which the
+  serial link dropped or reconnected (a reconnect with no move running keeps the height), or an estimate that leaves
+  the travel. A jog is reported as unknown, not counted (counting needs firmware).
 - `stop` ends a dose, the pump, a platform move, and a housing swing in place with the motor still holding.
 - The steps per mm (50) and the travel (0 … 109 mm) in the Bunny's `config.py` are INTERIM: the lab has not
   confirmed them.
 
-**Still to do here:** `bunny_module.py` reaches the Bunny through the existing `bunny_node`, which knows none of the
-new verbs. Using them means a thin adapter that talks to 7801 itself (kept connection + `subscribe`), or new
+**Still to do here:** `bunny_module.py` reaches the Bunny through the existing `bunny_node`, which knows only `stop`
+of the new verbs (`/bunny/stop`, 6fa8164). Using them means a thin adapter that talks to 7801 itself (kept connection + `subscribe`), or new
 services on `bunny_node`. Until then the notes under "The Bunny, as found" stay true for this branch.
 
 ## ROS names that differ from the JSON
@@ -240,8 +270,11 @@ Example: `ros2 service call /bunny_1/command harness_module_msgs/srv/Command "{i
 
 - **The twin's own link** (the workflow app's `harness_link.py`) still speaks 7803; nothing on the twin side uses 7804.
 - **dtv and pipette** adapters; the **camera**'s ChArUco stream and the cross-module routines today's gateway
-  runs itself (`teach.fine`, `teach.plan_views`, the start-posture precheck); the tag measurement is open ("to be
-  confirmed" in the contract).
+  runs in its own process (`teach.fine`, `teach.plan_views` on a client's command; the start-posture precheck,
+  computed, no motion); the tag measurement is open ("to be confirmed" in the contract). As the code stands nothing
+  on the harness, old path or new, moves the arm by itself to look at tag 3: the twin drives the arm there through
+  7803, measures the tag and derives the platform height; `bunny_1`'s `platform_mm` is only told (PROJECT_SPEC.md
+  "2026-11-20 — Who looks at the platform's tag 3").
 - **The calibrations.** `calibrate_handeye` / `calibrate_absolute` are declared on the arm and refused
   `NOT_READY`. Hand-eye today = the old gateway's `handeye_job` (a subprocess, a target choice tag | board, a
   precheck, installed at rms ≤ 3 mm), and the old gateway keeps the result IN MEMORY — installing it from the
@@ -253,25 +286,28 @@ Example: `ros2 service call /bunny_1/command harness_module_msgs/srv/Command "{i
   `arm.jog_gripper` (live sliders), `arm.gripper_cal`, `nodes.status` / `nodes.restart`, `state` at a chosen rate
   (`subscribe {rate_hz}`; the new door pushes on change and at each module's 1 s beat).
 - **Several controlling clients**, a takeover of a stale holder (7803's `HOLDER_STALE_S`): out of scope — a silent
-  holder loses the lease after 3 s anyway.
+  holder loses the lease after 3 s anyway (and this layer's running actions are stopped).
 - **The timeouts** are the contract's suggestions (3 s / 4 s / 3 s), not decided.
 
 ## Open
 
 - **An action the DEVICE started on its own** (a housing swing from the Bunny's screen, or one sent through the
   old gateway) is not shown as `current`, so it holds no zone: the gateway may grant an arm path through a
-  housing that is swinging. The zone logic is ready for it (a module's own `current` occupies its zones); the
-  adapters cannot see such motions yet (the Bunny's status has no "busy with what", the arm adapter reads the
-  arm node's `busy` only to refuse).
+  housing that is swinging. The zone logic is ready for it (a module's own `current` occupies its zones). Since
+  2026-11-19 the Bunny's status reports `housing: moving` for any swing by its own process, the GUI's included
+  (passed through as the `housing` value), but it has no `busy` flag for it and the adapter does not yet turn it
+  into a held zone; the arm adapter reads the arm node's `busy` only to refuse.
 - **A lossy transport** (a dropped state) can leave a zone held — the safe side, but it needs a way out
   (from the contract).
 
 ## Not tested
 
-Checked only by `py_compile` (and a Python 3.10 grammar parse on 3.13) and by direct calls without ROS:
-`tools/module_demo.py` (15 scenes), `tools/module_check_arm.py` (13 checks: the adapter on a fake arm node, the
-real planner on a synthetic arm model), `tools/module_check_bunny.py` (24 checks: fake bunny_node, fake
-tag_node), the door's edge paths on socketpairs. NOT tested:
+Checked by `py_compile` (and a Python 3.10 grammar parse on 3.13) and by direct calls without ROS:
+`tools/module_demo.py` (15 / 15 scenes), `tools/module_check_arm.py` (15 / 15 checks: the adapter on a fake arm
+node, the real planner on a synthetic arm model), `tools/module_check_bunny.py` (35 / 35 checks: fake bunny_node,
+fake tag_node), the door's edge paths on socketpairs. Since 2026-11-20 the new gateway and `camera_1` run on the
+harness PC (the Bunny's and the arm's adapters are being started); no result from there is recorded here yet.
+NOT tested before that:
 
 - **anything ROS**: `ros_binding.py` (`RosBus`), `RosArmLink`, `RosBunnyLink`, `RosCameraLink` and the three
   `main()`s, their parameters and executors, SIGINT / SIGTERM with rclpy's own handling off; the
@@ -297,12 +333,12 @@ For whoever retires the old gateway.
 | `KEY_FILE` `~/.config/railab-harness/gateway.key`, `read_key()` | the same file, the same reading (`tcp_front.read_key`) |
 | `take_control` / `release_control` (`ctl["conn"]`) | the same ops; `Lease` |
 | `subscribe {rate_hz}` → `{"event": "state", …}` at a rate | `subscribe` → `{"op": "state", "module", "online", "state"}` per module, on change |
-| `stop` (cancel arm goals, `/bunny/abort`) | `{"do": "stop"}` to a module, or `Gateway.stop_all` — every module has `stop`, never refused |
-| the dead-man: the controller silent `DEADMAN_S` 10 s while a motion / job runs → cancel arm goals only | the controller silent 3 s, or its link closed → `stop_all` (every module), lease dropped; plus each module goes safe by itself 3 s after the harness's beat stops |
+| `stop` (cancel arm goals, `/bunny/abort`) | `{"do": "stop", "args": {"scope": "device" (default) \| "own"}}` to a module, never refused; `Gateway.stop_all` = scope "own" to the modules running an action of this layer only |
+| the dead-man: the controller silent `DEADMAN_S` 10 s while a motion / job runs → cancel arm goals only | the controller silent 3 s, or its link closed → lease dropped, `stop_all` (nothing when no action of this layer runs); the watch follows a running action after `release_control`; a module goes safe by itself 3 s after the harness's beat stops only while an action of its own runs |
 | one global `JOB` | one action per module (`current`), no global slot |
-| `HOLDER_STALE_S` takeover | none: a silent holder loses the lease (and every module is stopped) |
+| `HOLDER_STALE_S` takeover | none: a silent holder loses the lease (and this layer's running actions are stopped) |
 | `hello.modules`, a dict typed in the gateway | each module's `describe`, carried in its state |
-| `/bunny/platform` {steps} | `platform_to {z_mm}` + the writable field `platform_mm` (`"unknown"` until told) |
+| `/bunny/platform` {steps} | `bunny_1`'s `platform_to {z_mm}` (the Bunny's own server: `{mm}`) + the writable field `platform_mm` (`"unknown"` until told) |
 | the gateway's time planning / clamping / start-gap recovery for `arm.follow_joints` | inside the arm node behind `follow_path`; out of range is refused, never clamped |
 | `node_watchdog.py`'s per-name health; camera health from a log file | `Registry.online` from the age of a module's state (restarting processes stays the watchdog's job) |
 | no command log (stdout has only calibration lines) | `audit.py`: every request, its reply, forwarded or not, one JSON line |
