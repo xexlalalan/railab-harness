@@ -51,6 +51,7 @@ UNTESTED ON ROS (written without ROS, 2026-11-20): Arm + ArmModel were checked o
 real planner on a synthetic arm model (tools/module_check_arm.py); RosArmLink and main() never ran.
 """
 
+import functools
 import math
 import os
 import re
@@ -68,6 +69,7 @@ FRESH_S = 1.0             # a status / joints / gripper reading older than this 
                           # 100 Hz; the old gateway's fresh(..., 1.0))
 SILENT_FAULT_S = 2.0      # no /arm/status this long, after one was heard: a latched fault (the arm node is gone)
 SENSE_PERIOD_S = 0.1      # joints / gap / held copied into the state at most this often (10 Hz, the twin's rate)
+FEED_DEPTH = 10           # the feed subscriptions' queue (as before)
 START_TOL_DEG = 1.0       # follow_path's first waypoint: at most this far (per joint) from where the arm is; the path
                           # then starts exactly there. Above the arm node's settle tolerance (joint_tol_rad 0.01 rad =
                           # 0.57 deg), so a path chained from the end of the last one is taken.
@@ -653,7 +655,8 @@ class _RosGoal:
 class RosArmLink(ArmLink):
     """The arm node's EXISTING interface as a ROS client; nothing new on the node's side.
 
-      heard    /arm/status (ArmStatus), /arm/gripper_status (GripperStatus), /joint_states (JointState)
+      heard    /arm/status (ArmStatus), /arm/gripper_status (GripperStatus), /joint_states (JointState) - on the
+               feed node <node>_feed (EventsExecutor, raw bytes, decoded when read: see __init__)
       action   /arm/follow_trajectory (FollowTrajectory)
       services /arm/hold, /arm/disable (std_srvs/Trigger; /arm/disable = the drag-teach release), /arm/gripper
                (SetGripper), <action>/_action/cancel_goal (action_msgs/CancelGoal) for halt
@@ -663,6 +666,7 @@ class RosArmLink(ArmLink):
     JOINT_NAMES = ("joint1", "joint2", "joint3", "joint4", "joint5", "joint6")
 
     def __init__(self, node):
+        import rclpy
         from action_msgs.srv import CancelGoal
         from rclpy.action import ActionClient
         from rclpy.callback_groups import ReentrantCallbackGroup
@@ -677,11 +681,29 @@ class RosArmLink(ArmLink):
                                                                                  CancelGoal)
         self._guard = threading.Lock()
         self._last = {}    # "status" | "joints" | "gripper" -> (plain dict, time.monotonic() received)
+        self._raw = {}     # the same keys -> (the newest message's serialized bytes, time.monotonic() received)
         self._handle = None   # the goal this link sent last (halt cancels it)
+        # THE FEED (2026-11-20): the arm node publishes these three at 100 Hz each (piper.yaml rate_hz). Dispatched as
+        # messages by this node's MultiThreadedExecutor they took ~45 % of a core on the harness PC and cut tag_node's
+        # frame rate by ~14 %. So they are heard on a node of their own, spun by rclpy's EventsExecutor, as RAW bytes
+        # kept with their arrival time, and decoded only when read (snapshot(): the watch's 10 Hz) - ~4 % of a core at
+        # 300 msg/s there. What snapshot() returns is unchanged. Everything else stays on `node` and its executor.
+        self._decode = {"status": (ArmStatus, self._status_of), "gripper": (GripperStatus, self._gripper_of),
+                        "joints": (JointState, self._joints_of)}
+        self._feed_node = rclpy.create_node(f"{node.get_name()}_feed", context=node.context)
+        for key, kind, topic in (("status", ArmStatus, "/arm/status"), ("gripper", GripperStatus, "/arm/gripper_status"),
+                                 ("joints", JointState, "/joint_states")):
+            self._feed_node.create_subscription(kind, topic, functools.partial(self._heard, key), FEED_DEPTH, raw=True)
+        try:
+            from rclpy.experimental import EventsExecutor
+            self._feed = EventsExecutor(context=node.context)
+        except ImportError:   # an rclpy without it: the plain one (~20 % of a core at 300 msg/s)
+            from rclpy.executors import SingleThreadedExecutor
+            node.get_logger().warning("rclpy has no EventsExecutor: the arm's feed on a SingleThreadedExecutor")
+            self._feed = SingleThreadedExecutor(context=node.context)
+        self._feed.add_node(self._feed_node)
+        threading.Thread(target=self._feed.spin, name="arm-feed-spin", daemon=True).start()
         group = ReentrantCallbackGroup()
-        node.create_subscription(ArmStatus, "/arm/status", self._on_status, 10, callback_group=group)
-        node.create_subscription(GripperStatus, "/arm/gripper_status", self._on_gripper, 10, callback_group=group)
-        node.create_subscription(JointState, "/joint_states", self._on_joints, 10, callback_group=group)
         self._follow = ActionClient(node, FollowTrajectory, "/arm/follow_trajectory", callback_group=group)
         self._hold = node.create_client(Trigger, "/arm/hold", callback_group=group)
         self._disable = node.create_client(Trigger, "/arm/disable", callback_group=group)
@@ -690,26 +712,53 @@ class RosArmLink(ArmLink):
                         for a in self.ARM_ACTIONS]
 
     # ---- heard
-    def _keep(self, key, value):
+    def _heard(self, key, raw):
+        """A feed message, as bytes (the feed's thread): only kept with its arrival time; decoded when read."""
         with self._guard:
-            self._last[key] = (value, time.monotonic())
+            self._raw[key] = (raw, time.monotonic())
 
-    def _on_status(self, m):
-        self._keep("status", {"connected": bool(m.connected), "all_enabled": bool(m.all_enabled),
-                              "teach_mode": bool(m.teach_mode), "errors": [str(e) for e in m.errors],
-                              "fault": str(m.fault), "busy": bool(m.busy)})
+    @staticmethod
+    def _status_of(m):
+        return {"connected": bool(m.connected), "all_enabled": bool(m.all_enabled),
+                "teach_mode": bool(m.teach_mode), "errors": [str(e) for e in m.errors],
+                "fault": str(m.fault), "busy": bool(m.busy)}
 
-    def _on_joints(self, m):
+    def _joints_of(self, m):
+        """None for a JointState without the six arm joints: the last full one stays (as before)."""
         names = list(m.name)
         if all(j in names for j in self.JOINT_NAMES):
-            self._keep("joints", {"q": [float(m.position[names.index(j)]) for j in self.JOINT_NAMES]})
+            return {"q": [float(m.position[names.index(j)]) for j in self.JOINT_NAMES]}
+        return None
 
-    def _on_gripper(self, m):
-        self._keep("gripper", {"present": bool(m.present), "width_m": float(m.width_m)})
+    @staticmethod
+    def _gripper_of(m):
+        return {"present": bool(m.present), "width_m": float(m.width_m)}
+
+    def _fold_raw(self):
+        """The newest raw message per key decoded into _last (caller holds _guard); a message that decodes to nothing
+        (or not at all) leaves the last value and its time, as a callback that kept nothing did."""
+        from rclpy.serialization import deserialize_message
+        for key, (raw, at) in self._raw.items():
+            kind, plain = self._decode[key]
+            try:
+                value = plain(deserialize_message(raw, kind))
+            except Exception:   # noqa: BLE001  an unreadable message is not news
+                value = None
+            if value is not None:
+                self._last[key] = (value, at)
+        self._raw.clear()
+
+    def close(self):
+        """The feed's executor and node ended (main() closes this link before it shuts ROS down)."""
+        try:
+            self._feed.shutdown()
+        finally:
+            self._feed_node.destroy_node()
 
     def snapshot(self):
         now = time.monotonic()
         with self._guard:
+            self._fold_raw()
             last = dict(self._last)
         out = {}
         for key in ("status", "joints", "gripper"):
