@@ -42,6 +42,26 @@ kill_node() { pkill -f "$2" && echo "$1: stopped" || echo "$1: was not running";
 each_node() { while IFS='|' read -r n p c; do "$1" "$n" "$p" "$c"; done <<<"$NODES"; }
 # The Bunny app (GUI, or `main.py harness` headless) serves port 7801 itself; it is started on the Bunny, not from here.
 bunny_check() { timeout 3 bash -c "</dev/tcp/${BUNNY_HOST:-192.168.7.2}/7801" 2>/dev/null && echo "bunny server: reachable" || echo "bunny server: NOT reachable (start the Bunny app)"; }
+# An ORPHANED Fast DDS port (2026-11-21; rosenv.sh's comment): the process still listens on a shared-memory port another
+# process deleted and re-created, so nothing started later reaches it. Its OWN ports = the fastdds_port<N>_el locks it
+# holds open; orphaned = one of them mapped "(deleted)" (a deleted port it only WRITES to is a dead peer's: not this).
+# Every node runs on UDPv4 since then, so this should stay silent; node_watchdog.py says the same in its `why`.
+dds_orphaned() {
+  local n
+  for n in $(ls -l "/proc/$1/fd" 2>/dev/null | grep -o 'fastdds_port[0-9]*_el' | grep -o '[0-9][0-9]*' | sort -u); do
+    grep -q "/dev/shm/fastdds_port$n (deleted)" "/proc/$1/maps" 2>/dev/null && return 0
+  done
+  return 1
+}
+dds_check() {
+  local n p c pid
+  while IFS='|' read -r n p c; do
+    for pid in $(pgrep -f "$p"); do dds_orphaned "$pid" && { echo "DDS port orphaned — restart $n"; break; }; done
+  done <<<"$NODES"
+  for pid in $(pgrep -f "harness_cmd.py --serv[e]"); do dds_orphaned "$pid" && echo "CLI daemon DDS port orphaned — run harness daemon-stop"; done
+  for pid in $(pgrep -f "ros2cli.daemo[n]"); do dds_orphaned "$pid" && echo "ros2 daemon DDS port orphaned — run ros2 daemon stop"; done
+  return 0
+}
 nodes() {
   [ "$1" = list ] && { echo "$NODES"; return 0; }    # name|pattern|command per line (the watchdog reads it)
   source rosenv.sh 2>/dev/null
@@ -52,7 +72,7 @@ nodes() {
              echo "(arm, camera nodes and the Bunny app left running)" ;;
     restart) line=$(grep "^$2|" <<<"$NODES") || { echo "usage: harness nodes restart piper|camera|dtv|bunny|pipette|workflows|gateway|watchdog"; exit 2; }
              IFS='|' read -r n p c <<<"$line"; kill_node "$n" "$p"; sleep 2; start_bg "$n" "$p" "$c" ;;
-    status)  timeout 10 ros2 node list 2>/dev/null; bunny_check ;;
+    status)  timeout 10 ros2 node list 2>/dev/null; bunny_check; dds_check ;;
     *)       echo "usage: harness nodes start|stop|status|list|restart piper|camera|dtv|bunny|pipette|workflows|gateway|watchdog"; exit 2 ;;
   esac
 }

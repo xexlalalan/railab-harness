@@ -11,6 +11,8 @@ pattern killed, the node started detached in the workspace's environment, rosenv
             :7803 accepts · bunny: the Bunny server BUNNY_HOST:7801 accepts (restarting the node cannot fix it: the
             node opens one connection per call, so an unreachable server is reported, never restarted for) · the
             others: running. A node younger than STARTUP_GRACE_S is not judged yet (healthy null, "starting").
+            Any node listening on an ORPHANED Fast DDS port (dds_orphaned, 2026-11-21) = unhealthy, "DDS port orphaned —
+            restart <name>": reported, never restarted for.
   restart   down for DOWN_GRACE_S (or unhealthy that long), at most once per MIN_RESTART_S per node, given up after
             GIVE_UP restarts in a row that did not make it healthy (said in its `why`; the station's restart button
             or the node turning healthy re-arms it)
@@ -103,6 +105,31 @@ def proc_age(pid):
             return float(f.read().split()[0]) - start
     except (OSError, ValueError, IndexError):
         return None
+
+
+DDS_LOCK_RE = re.compile(r"fastdds_port(\d+)_el(?: \(deleted\))?$")
+
+
+def dds_orphaned(pid, proc="/proc"):
+    """True when process pid still listens on a Fast DDS shared-memory port that was deleted (and re-created by another
+    process's zombie check): nothing started later reaches it (2026-11-21, the arm node; rosenv.sh's comment). Its OWN
+    ports = the fastdds_port<N>_el locks it holds open; a deleted port it only writes to is a dead peer's, not this.
+    Every node runs on UDPv4 since then, so this should stay False (tools/harness `nodes status` checks the same)."""
+    try:
+        own = set()
+        for fd in os.listdir(f"{proc}/{pid}/fd"):
+            try:
+                m = DDS_LOCK_RE.search(os.readlink(f"{proc}/{pid}/fd/{fd}"))
+            except OSError:
+                continue
+            if m:
+                own.add(m.group(1))
+        if not own:
+            return False
+        with open(f"{proc}/{pid}/maps") as f:
+            return any(f"/dev/shm/fastdds_port{n} (deleted)" in line for line in f for n in own)
+    except OSError:
+        return False
 
 
 def tcp_ok(host, port, timeout=1.5):
@@ -227,6 +254,11 @@ class Watchdog:
         if not ps:
             st["healthy"] = False
             st["why"] = "not running" + ("; " + st["why"] if st["why"] else "")
+            return st
+        if any(dds_orphaned(p) for p in ps):
+            # reported, never restarted for: a restart mid-run (the arm: it must be supported) is the user's call
+            st.update(healthy=False, restart_unhealthy=False)
+            st["why"] = f"DDS port orphaned — restart {n.name}" + ("; " + st["why"] if st["why"] else "")
             return st
         if age is not None and age < self.startup_grace and n.name in ("camera", "gateway"):
             st["why"] = st["why"] or f"starting ({age:.0f} s)"
