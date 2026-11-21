@@ -5,8 +5,12 @@ Services (std_srvs/Trigger unless noted): housing_open, housing_close, housing_h
 stop (the Bunny's own stop, its server since 82cc822: never latches the dose flag as abort does; an older server answers
 "unknown cmd stop"), load_begin, load_end, liquid_suck, liquid_stop, gantry_park; weigh_to (WeighTo), liquid_push
 (LiquidPush), liquid_run (LiquidRun, continuous, caller re-calls every <1 s), dispense_volume (DispenseVolume: liquid by volume,
-open-loop: the Bunny converts it to pump steps with its liquid profile, no scale), barcode_read (Barcode), gantry_jog (GantryJog), locate (Trigger).
-Topics: /bunny/status (String, JSON, 2 Hz), /bunny/weight (Float64).
+open-loop: the Bunny converts it to pump steps with its liquid profile, no scale), barcode_read (Barcode), gantry_jog (GantryJog), locate (Trigger);
+platform (LiquidPush borrowed: steps); platform_set (MoveZ borrowed, 2026-11-20: req.mm = the platform height the station measured
+(tag 3), in the Bunny's own mm (0 = the travel's bottom, + up); the Bunny checks the range and refuses while its platform moves;
+res.z = its platform_mm after, res.message = its reply as JSON, or its error — an older server answers "unknown cmd platform_set").
+Topics: /bunny/status (String, JSON, 2 Hz: the Bunny's status reply as it is + online — since its 82cc822 that includes
+platform_mm / platform_source / platform_why / platform_moving / boot_id), /bunny/weight (Float64).
 Long operations block their service call; the node is multi-threaded so status and abort keep working.
 """
 import json, socket, threading
@@ -16,7 +20,7 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup
 from std_srvs.srv import Trigger
 from std_msgs.msg import String, Float64
-from harness_msgs.srv import WeighTo, LiquidPush, LiquidRun, Barcode, GantryJog, DispenseVolume
+from harness_msgs.srv import WeighTo, LiquidPush, LiquidRun, Barcode, GantryJog, DispenseVolume, MoveZ
 
 
 class BunnyLink:
@@ -58,6 +62,7 @@ class BunnyNode(Node):
         self.create_service(LiquidPush, "/bunny/liquid_push", self.liquid_push, callback_group=cb)
         self.create_service(DispenseVolume, "/bunny/dispense_volume", self.dispense_volume, callback_group=cb)
         self.create_service(LiquidPush, "/bunny/platform", self.platform, callback_group=cb)
+        self.create_service(MoveZ, "/bunny/platform_set", self.platform_set, callback_group=cb)
         self.create_service(LiquidRun, "/bunny/liquid_run", self.liquid_run, callback_group=cb)
         self.create_service(Barcode, "/bunny/barcode_read", self.barcode, callback_group=cb)
         self.create_service(GantryJog, "/bunny/gantry_jog", self.gantry_jog, callback_group=cb)
@@ -123,6 +128,17 @@ class BunnyNode(Node):
             res.success = True; res.steps_done = int(r.get("pos", 0)); res.message = "ok"
         except Exception as e:
             res.success = False; res.message = str(e)
+        return res
+
+    def platform_set(self, req, res):
+        """Tell the Bunny its platform height (req.mm, its own mm; req.absolute is ignored: always absolute). No motion:
+        the Bunny only records the value (source "told"), so a short timeout. res.z = its platform_mm after (NaN if null)."""
+        try:
+            r = self.link.call("platform_set", {"mm": float(req.mm)}, timeout=5)
+            mm = r.get("platform_mm")
+            res.success = True; res.z = float("nan") if mm is None else float(mm); res.message = json.dumps(r)
+        except Exception as e:
+            res.success = False; res.z = float("nan"); res.message = str(e)
         return res
 
     def liquid_run(self, req, res):

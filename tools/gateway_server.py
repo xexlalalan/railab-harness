@@ -42,6 +42,12 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   v6 (2026-10-25, the twin's "Run workflow"): {"cmd": "bunny.tare"} / {"cmd": "bunny.weigh_to", "args": {"target_g": 0.02,
   "material": "powder", "powder": "<name or barcode id, '' = measure fresh>"}} / {"cmd": "bunny.dispense_volume",
   "args": {"volume_ml": 10}} — jobs; `stop` aborts a dose (/bunny/abort)
+  2026-11-20 (the Bunny's platform height, its server 82cc822): {"cmd": "bunny.platform_set", "args": {"mm": 53.4}}
+  (controller) -> /bunny/platform_set: tells the Bunny its platform height in ITS mm (0 = the travel's bottom, + up), as
+  the station measured it (tag 3); the Bunny checks the range and refuses while its platform moves -> {platform_mm}; an
+  older Bunny server answers its own error ("unknown cmd platform_set"). state.bunny then carries, from a fresh status
+  that has them, platform_mm (null = unknown), platform_known, platform_source (the Bunny's word: unknown | told |
+  estimated), platform_why (why unknown, else null) and boot_id — absent when the Bunny does not send them
   v5 (2026-10-24, spec "Emergency stop button"): state.arm.estop — true while the e-stop button is pressed (the arm
   node holds the arm where it is and refuses every command; out again, the arm is ready at once, still holding)
   2026-11-16 (spec "the ChArUco board"): state.camera.charuco {seen, corners, corners_total, distance_m, reproj_err_px,
@@ -152,6 +158,31 @@ def make_key():
     with os.fdopen(fd, "w") as f:
         f.write(k + "\n")
     return k
+
+
+BUNNY_KEYS = ("unit", "housing", "weight_g", "dispensing", "busy", "load_open")
+# the housing as read from the motor (2026-11-19, the Bunny's new status fields)
+BUNNY_HOUSING_KEYS = ("housing_pos", "housing_powered", "housing_enabled", "housing_frac", "housing_age_s", "housing_error")
+
+
+def bunny_view(b):
+    """state.bunny from the Bunny's fresh /bunny/status (None = not fresh). The housing and platform fields are
+    forwarded only when the Bunny sends them: an older Bunny's reply has none of them, and none is added.
+    THE PLATFORM HEIGHT (2026-11-20, the Bunny's server 82cc822 — zstage.py): its platform_mm (+ up, null = unknown),
+    platform_source (unknown | told | estimated) and platform_why (why unknown, else null) as they are, platform_known =
+    a height it knows (source not unknown and a number), and its boot_id (new at every start of its server)."""
+    bunny = {"online": bool(b and b.get("online"))}
+    if not b:
+        return bunny
+    bunny.update({k: b.get(k) for k in BUNNY_KEYS})
+    bunny.update({k: b[k] for k in BUNNY_HOUSING_KEYS if k in b})
+    if "platform_source" in b or "platform_mm" in b:
+        mm, src = b.get("platform_mm"), b.get("platform_source")
+        bunny.update(platform_mm=mm, platform_source=src, platform_why=b.get("platform_why"),
+                     platform_known=bool(mm is not None and src != "unknown"))
+    if "boot_id" in b:
+        bunny["boot_id"] = b["boot_id"]
+    return bunny
 
 
 class Gateway:
@@ -831,7 +862,8 @@ class Gateway:
                                              for (lo, hi), o in zip(self.limits, self.kin.offsets)]},
                 # housing = the bunny.housing targets; housing_states = the words state.bunny.housing may report
                 # (2026-11-19: read from the motor, never "unknown"; an older Bunny still says unknown)
-                "bunny": {"housing": ["open", "half", "close"], "platform": "steps",
+                # platform_set = bunny.platform_set's argument (2026-11-20: the Bunny's own mm, its range check)
+                "bunny": {"housing": ["open", "half", "close"], "platform": "steps", "platform_set": "mm",
                           "housing_states": ["closed", "open", "half", "between", "moving", "no_feedback", "untaught"]}}
 
     def state(self):
@@ -854,13 +886,7 @@ class Gateway:
         if g is not None:
             arm["gripper"] = {"gap_mm": round(g.width_m * 1000, 2), "force_n": round(g.force_n, 2), "powered": g.enabled}
         arm["gripper_calib"] = self.gripper_calib()
-        b = self.fresh("bunny", 3.0)
-        bunny = {"online": bool(b and b.get("online"))}
-        if b:
-            bunny.update({k: b.get(k) for k in ("unit", "housing", "weight_g", "dispensing", "busy", "load_open")})
-            # the housing as read from the motor (2026-11-19, the Bunny's new status fields): forwarded only when the
-            # Bunny sends them — an older Bunny's reply has none of them, and none is added
-            bunny.update({k: b[k] for k in ("housing_pos", "housing_powered", "housing_enabled", "housing_frac", "housing_age_s", "housing_error") if k in b})
+        bunny = bunny_view(self.fresh("bunny", 3.0))
         calib = {"busy": JOB["busy"], "kind": JOB["kind"], "lines": JOB["lines"][-8:], "result": JOB["result"]}
         nv = self.nodes_view()
         return {"arm": arm, "bunny": bunny, "camera": self.camera(), "calib": calib, "nodes": nv["nodes"],
@@ -1514,6 +1540,24 @@ class Conn(socketserver.StreamRequestHandler):
             if not r.success:
                 raise RuntimeError(r.message)
             return {"position_steps": r.steps_done}
+        if cmd == "bunny.platform_set":
+            # 2026-11-20: tell the Bunny its platform height (the station measured tag 3), in the Bunny's mm; the Bunny's
+            # own range check, its errors passed through (an older server: "unknown cmd platform_set")
+            self.need("control")
+            from harness_msgs.srv import MoveZ               # borrowed, as bunny.platform borrows LiquidPush
+            mm = a.get("mm")
+            if isinstance(mm, bool) or not isinstance(mm, (int, float)) or not math.isfinite(mm):
+                raise ValueError("mm must be a finite number (the Bunny's platform height, its mm; got %r)" % (mm,))
+            try:
+                r = gw.call(MoveZ, "/bunny/platform_set", MoveZ.Request(mm=float(mm), absolute=True), 10)
+            except RuntimeError as e:
+                if "not answering" in str(e) and gw.fresh("bunny", 3.0) is not None:
+                    raise RuntimeError("/bunny/platform_set is not offered: bunny_node is older than the gateway "
+                                       "(harness nodes restart bunny)")
+                raise
+            if not r.success:
+                raise RuntimeError(r.message)
+            return {"platform_mm": round(r.z, 4) if math.isfinite(r.z) else None}
         # v6 (2026-10-25, the twin's "Run workflow"): the Bunny's dosing, each THE job (one at a time, the dead-man
         # watch on this connection; `stop` aborts a dose through /bunny/abort)
         if cmd == "bunny.tare":
