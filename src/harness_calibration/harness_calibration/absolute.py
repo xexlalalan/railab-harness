@@ -187,7 +187,7 @@ def solve(positions, kin_doc, X0, model="piper", log=print):
     res = {"ok": False, "at": dt.datetime.now().isoformat(timespec="seconds"), "n_samples": sum(len(p["samples"]) for p in use),
            "positions": [p["position"] for p in use], "improved": False}
     if len(use) < MIN_POSITIONS:
-        res["why"] = (f"{len(use)} position(s) with >= {MIN_SAMPLES} samples: at least {MIN_POSITIONS} needed (5 asked)")
+        res["why"] = f"{len(use)} position(s) with >= {MIN_SAMPLES} samples, {MIN_POSITIONS} needed"   # <= 10 words
         return res
     data = Data(use)
     log(f"{res['n_samples']} samples over positions {data.positions}")
@@ -233,8 +233,9 @@ def solve(positions, kin_doc, X0, model="piper", log=print):
                board_base=[{"position": p, "matrix": B[j].tolist()} for j, p in enumerate(data.positions)],
                tested=tested, improved=improved)
     if not improved:
-        res["why"] = (f"the left-out error does not drop enough ({mb:.2f} -> {ml:.2f} mm; needs >= {IMPROVE_REL:.0%} and "
-                      f">= {IMPROVE_ABS_MM} mm): nothing to install")
+        # <= 10 words with the gateway's "not installed: " (2026-11-21); the needs go to the log
+        res["why"] = f"left-out error {mb:.2f} -> {ml:.2f} mm: not enough"
+        log(f"not installed: the left-out error must drop >= {IMPROVE_REL:.0%} and >= {IMPROVE_ABS_MM} mm")
     log(f"fit {'+'.join(params)} + hand-eye: rms {rms(rb):.2f} -> {rms(ra):.2f} mm; left-out {mb:.2f} -> {ml:.2f} mm; "
         f"improved {improved}")
     return res
@@ -281,11 +282,12 @@ def collect(a):
     c.wait_ready()
     st = c.status
     if not (st.ok and st.all_enabled):
-        print(f"refused: the arm must be holding (press Hold; ok={st.ok} enabled={st.all_enabled} fault='{st.fault}')")
+        print(f"arm status: ok={st.ok} enabled={st.all_enabled} fault='{st.fault}'")
+        print("refused: the arm must be holding: press Hold")       # <= 10 words: the gateway's job message
         sys.exit(2)
     m = c.board(max_age=1.0)
     if m is None or m.corners < MIN_CORNERS:
-        print(f"refused: the ChArUco board is not in view with >= {MIN_CORNERS} corners ({m.corners if m else 0})")
+        print(f"refused: ChArUco board not in view: {m.corners if m else 0} corners, needs {MIN_CORNERS}")
         sys.exit(2)
     # the start-posture check + the re-pose (2026-11-17 / 18): before any motion; the arm fixes a bad posture itself
     from harness_calibration import precheck as PC

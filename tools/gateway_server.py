@@ -104,6 +104,20 @@ def tag_words(tid, family=None):
     """'3 (36h11)' / '0 (52h13)' when the family is known, else '3'."""
     m = re.search(r"\d+h\d+$", str(family or ""))
     return "%d (%s)" % (int(tid), m.group(0) if m else family) if family else "%d" % int(tid)
+
+
+def said(err, detail=""):
+    """An error a person reads says at most 10 words (operator 2026-11-21: "所有报错信息不能超过10个单词。捡重要的信息说");
+    its long words ride along as err.detail: the reply's / the job result's `detail` and the gateway log, never shown by
+    default. Returns err, to raise."""
+    err.detail = detail
+    return err
+
+
+def clip(text, n=10):
+    """At most n words (2026-11-21): a routine's raw output line cut, "…" where it was (the lines stay in state.calib)."""
+    w = str(text).split()
+    return " ".join(w[:n - 1]) + " …" if len(w) > n else str(text)
 HANDEYE_ACCEPT_RMS_MM = 3.0      # calib.handeye installs a new calibration only at or below this rms
 CLI = os.path.join(ROOT, "tools", "harness")
 RESTART_LOG = "/tmp/nodes_restart.log"     # nodes.restart's detached shell
@@ -404,7 +418,7 @@ class Gateway:
         elif st is None or not st.all_enabled:
             pc = {"ok": False, "reachable": None, "of": len(VIEW_SET), "joints": PC.joint_margins(self.kin, q), "unreachable": [],
                   "why": "the arm is not holding", "fixable": False, "needs_repose": False,
-                  "words": "hold the arm where the camera sees the board, then press Hold"}
+                  "words": "aim the camera at the board, then press Hold"}
         else:
             last = getattr(self, "_pc_last", None)
             if (not force and last is not None and now - last[0] < PRECHECK_MAX_AGE_S
@@ -524,22 +538,25 @@ class Gateway:
                 qs = centre if centre is not None else qs
             else:
                 qs, pe, ae = self.kin.ik(T, q_c, margin=margin)
-            why = None
+            why = detail = None
             if name == "centre" and centre is None:
-                why = ("out of reach inside the joint limits (best %.1f mm / %.2f deg)" % (pe * 1000, math.degrees(ae))
-                       + ("; " + held if held else "") + ("; the nearest reachable view loses the tag" if tag_base_mm is not None else ""))
+                why = "out of reach (best %.1f mm / %.2f deg)" % (pe * 1000, math.degrees(ae))
+                detail = ("out of reach inside the joint limits (best %.1f mm / %.2f deg)" % (pe * 1000, math.degrees(ae))
+                          + ("; " + held if held else "") + ("; the nearest reachable view loses the tag" if tag_base_mm is not None else ""))
             elif name != "centre" and (pe > 1e-3 or ae > 5e-3):
-                why = "out of reach inside the joint limits (best %.1f mm / %.2f deg)" % (pe * 1000, math.degrees(ae))
+                why = "out of reach (best %.1f mm / %.2f deg)" % (pe * 1000, math.degrees(ae))
             else:
                 Tq, _, clear = self.tip_and_clearance(list(qs))
                 if self.P.get("floor_enabled", False) and clear < fl_margin:
-                    why = "the fingertip would be %.0f mm above the floor (margin %.0f mm)" % (clear * 1000, fl_margin * 1000)
+                    why = "fingertip %.0f mm above the floor (margin %.0f mm)" % (clear * 1000, fl_margin * 1000)
                 elif wlo and whi and not all(wlo[i] <= Tq[i, 3] <= whi[i] for i in range(3)):
-                    why = "the gripper base would leave the workspace box"
+                    why = "gripper base would leave the workspace box"
                 elif q_c is not None and float(np.abs(qs - q_c).max()) > float(self.P.get("max_joint_delta_rad", 1.2)):
                     why = "a joint would jump %.0f deg (another wrist branch)" % math.degrees(float(np.abs(qs - q_c).max()))
             out.append({"view": name, "ok": why is None, "reason": why,
                         "joints_model_deg": [round(math.degrees(float(v + o)), 4) for v, o in zip(qs, off)]})
+            if detail:
+                out[-1]["detail"] = detail
             if why:
                 reasons.append("%s: %s" % (name, why))
                 if name == "centre":
@@ -554,8 +571,10 @@ class Gateway:
         tag 3, and the silence read as "tag 3 is not in view from here")."""
         if self.fresh("tags", 1.0) is None:
             last = self.last.get("tags")
-            raise RuntimeError("the gripper camera sends no frames%s: check its USB cable (the camera node reconnects by itself)"
-                               % (" (none for %.0f s)" % (time.time() - last[1]) if last else " since the gateway started"))
+            raise said(RuntimeError("gripper camera sends no frames%s: check USB"
+                                    % (" for %.0f s" % (time.time() - last[1]) if last else "")),
+                       "the gripper camera sends no frames%s: check its USB cable (the camera node reconnects by itself)"
+                       % (" (none for %.0f s)" % (time.time() - last[1]) if last else " since the gateway started"))
 
     def fine(self, tid, black_mm, abort, tilt_deg=3.0, views_model_deg=None, family=None):
         """teach.fine: the five-view cross on tag tid from where the camera looks now (harness_calibration.fine);
@@ -649,11 +668,13 @@ class Gateway:
         out = np.abs(qa - qin)
         if out.max() > FOLLOW_RECOVER_RAD:
             j = int(np.argmax(out))
-            raise RuntimeError("refused: joint %d is held %.1f deg past its limit (more than %.0f): Release the arm and move it back by hand"
-                               % (j + 1, math.degrees(out[j]), math.degrees(FOLLOW_RECOVER_RAD)))
+            raise said(RuntimeError("refused: joint %d %.1f deg past limit: Release, move back" % (j + 1, math.degrees(out[j]))),
+                       "joint %d is held %.1f deg past its limit (more than %.0f): Release the arm and move it back by hand"
+                       % (j + 1, math.degrees(out[j]), math.degrees(FOLLOW_RECOVER_RAD)))
         d0 = float(np.abs(W[0] - qin).max())
         if d0 > FOLLOW_START_TOL_RAD:
-            raise RuntimeError("refused: the path starts %.1f deg from where the arm is; plan it from the current posture" % math.degrees(d0))
+            raise said(RuntimeError("refused: the path starts %.1f deg from the arm; re-plan" % math.degrees(d0)),
+                       "the path starts %.1f deg from where the arm is; plan it from the current posture" % math.degrees(d0))
         W[0] = qin
         seg_k = None
         if blend:                                        # each segment's factor, like `speed` (THE SMOOTH PATH)
@@ -680,7 +701,7 @@ class Gateway:
             else:
                 tr = plan_joint_path(self.kin, W, lim, from_outside=True, corner_deg=corner)
         except PlanError as e:
-            raise RuntimeError("refused: %s" % e)
+            raise said(RuntimeError("refused: %s" % e), getattr(e, "detail", ""))
         if not self.ac_t.wait_for_server(timeout_sec=3.0):
             raise RuntimeError("/arm/follow_trajectory not available")
         g = self.FollowTrajectory.Goal(trajectory=to_msg(tr), label=label or "twin path")
@@ -692,7 +713,7 @@ class Gateway:
             time.sleep(0.01)
         gh = gf.result()
         if not gh.accepted:
-            raise RuntimeError("rejected by the arm node (busy, fault, teach mode or not enabled)")
+            raise RuntimeError("rejected by the arm node (busy, fault, teach, disabled)")
         rf = gh.get_result_async()
         while not rf.done():
             if abort.is_set():
@@ -700,7 +721,7 @@ class Gateway:
                 raise RuntimeError(JOB.get("why") or "aborted - arm frozen")
             if time.time() - t0 > tr.duration + 60:
                 gh.cancel_goal_async()
-                raise RuntimeError("no result long after the path should have ended - arm frozen")
+                raise RuntimeError("no result after the path's end - arm frozen")
             time.sleep(0.05)
         r = rf.result().result
         if not r.success:
@@ -732,7 +753,8 @@ class Gateway:
         flange = self.flange_from_tip(tip_mm_deg)
         far = float(np.linalg.norm(np.array(flange[:3]) - self.kin.fk(q)[:3, 3]))
         if far > 1.0:                                     # (0.4 until 2026-11-19, relaxed)
-            raise RuntimeError("refused: the target is %.0f mm away (> 1000 mm): plan a free move there first" % (far * 1000))
+            raise said(RuntimeError("refused: target %.0f mm away (> 1000): free move first" % (far * 1000)),
+                       "the target is %.0f mm away (> 1000 mm): plan a free move there first" % (far * 1000))
         return self.move_pose_goal(flange, bool(linear), speed, abort)
 
     def move_pose_goal(self, pose, linear, speed, abort):
@@ -751,7 +773,7 @@ class Gateway:
             time.sleep(0.01)
         gh = gf.result()
         if not gh.accepted:
-            raise RuntimeError("rejected by the arm node (busy, fault, teach mode or not enabled)")
+            raise RuntimeError("rejected by the arm node (busy, fault, teach, disabled)")
         rf = gh.get_result_async()
         while not rf.done():
             if abort.is_set():
@@ -759,7 +781,7 @@ class Gateway:
                 raise RuntimeError(JOB.get("why") or "aborted - arm frozen")
             if time.time() - t0 > 90:
                 gh.cancel_goal_async()
-                raise RuntimeError("the straight move did not end in time - arm frozen")
+                raise RuntimeError("straight move timed out - arm frozen")
             time.sleep(0.05)
         r = rf.result().result
         if not r.success:
@@ -784,8 +806,8 @@ class Gateway:
             if rec and family and rec.get("family", "") != family and (rec.get("family") or family not in CV_FAMILIES):
                 rec = None                        # the id's last record is another family's tag
         if not rec:
-            raise RuntimeError("tag %s has not been located accurately yet (Find real positions of modules)"
-                               % tag_words(tid, family))
+            raise said(RuntimeError("tag %s not located accurately yet: calibrate first" % tag_words(tid, family)),
+                       "tag %s has not been located accurately yet (calibrate its module: teach.fine)" % tag_words(tid, family))
         T = rec["base_to_tag_matrix"]
         q = rec.get("joints_rad")
         return {"tag_id": int(tid), "base_mm": [round(float(T[i][3]) * 1000, 2) for i in range(3)],
@@ -810,7 +832,7 @@ class Gateway:
         reasons = []
         for i, (qi, (lo, hi)) in enumerate(zip(q, self.limits)):
             if qi < lo - 1e-3 or qi > hi + 1e-3:
-                reasons.append("joint %d at %.1f deg is outside its limits [%.1f, %.1f]" % (i + 1, math.degrees(qi), math.degrees(lo), math.degrees(hi)))
+                reasons.append("joint %d at %.1f deg is outside [%.1f, %.1f]" % (i + 1, math.degrees(qi), math.degrees(lo), math.degrees(hi)))
         now = self.joints_rad()
         jump = None
         if now is None:
@@ -820,7 +842,7 @@ class Gateway:
             k = max(range(6), key=lambda i: d[i])
             jump = {"joint": k + 1, "deg": round(math.degrees(d[k]), 2)}
             if d[k] > float(self.P.get("max_joint_delta_rad", 1.2)):
-                reasons.append("joint %d would jump %.1f deg (> %.1f deg per move): go in smaller steps"
+                reasons.append("joint %d jumps %.1f deg (> %.1f): smaller steps"
                                % (k + 1, math.degrees(d[k]), math.degrees(float(self.P.get("max_joint_delta_rad", 1.2)))))
         T, tip, clear = self.tip_and_clearance(q)
         path_clear = clear
@@ -830,7 +852,7 @@ class Gateway:
                 path_clear = min(path_clear, self.tip_and_clearance([a + (b - a) * f for a, b in zip(now, q)])[2])
         margin = float(self.P.get("floor_margin_m", 0.015))
         if self.P.get("floor_enabled", False) and path_clear < margin:
-            reasons.append("fingertip would come %.1f mm above the floor (margin %.0f mm)" % (path_clear * 1000, margin * 1000))
+            reasons.append("fingertip %.1f mm above the floor (margin %.0f mm)" % (path_clear * 1000, margin * 1000))
         lo, hi = self.P.get("workspace_min"), self.P.get("workspace_max")
         if lo and hi and not all(lo[i] <= T[i, 3] <= hi[i] for i in range(3)):
             reasons.append("gripper base outside the workspace box")
@@ -1100,7 +1122,7 @@ def nodes_restart(want):
     elif want in names:
         todo = [want]
     else:
-        raise ValueError("nodes.restart node: one of %s or \"all\"" % ", ".join(names))
+        raise said(ValueError("nodes.restart: unknown node %r" % want), "one of %s or \"all\"" % ", ".join(names))
     if set(todo) & {"piper", "camera", "gateway"}:
         jog["pose"] = jog["grip"] = None
         abort_job("nodes.restart %s" % want)
@@ -1116,11 +1138,22 @@ def nodes_restart(want):
 
 
 def last_error(lines):
-    """A routine's own words for why it stopped: its last "refused: ..." line, else its last two lines."""
+    """A routine's own words for why it stopped: its last "refused: ..." line, else its last line — at most 10 words
+    (2026-11-21; every line stays in state.calib.lines)."""
     ref = [ln for ln in lines if ln.startswith("refused:")]
     if ref:
-        return ref[-1][len("refused:"):].strip()
-    return " / ".join(lines[-2:]) if lines else "no output"
+        return clip(ref[-1][len("refused:"):].strip())
+    return clip(lines[-1]) if lines else "no output"
+
+
+def bunny_failed(what, message, outcome_words):
+    """A failed Bunny dose in at most 10 words (2026-11-21): the Bunny's own error when it raised one (bunny_node passes
+    it as it is), else (its reply, JSON) what it did; the reply itself goes to the detail."""
+    try:
+        json.loads(message)
+    except ValueError:
+        return "%s: %s" % (what, message)
+    return "%s %s" % (what, outcome_words)
 
 
 def precheck_worker():
@@ -1218,7 +1251,7 @@ def jog_worker():
                     time.sleep(0.01)
                 gh = gf.result()
                 if not gh.accepted:
-                    raise RuntimeError("rejected by the arm node (not enabled, busy, fault or teach mode)")
+                    raise RuntimeError("rejected by the arm node (busy, fault, teach, disabled)")
                 ctl["motion"] = {"conn": owner, "label": "jog"}
                 rf = gh.get_result_async()
                 while not rf.done():
@@ -1300,10 +1333,10 @@ class Conn(socketserver.StreamRequestHandler):
                 raise ValueError("position: 1..%d" % ABS_POSITIONS)
             st = gw.fresh("arm", 1.0)
             if st is None or not st.all_enabled:
-                raise RuntimeError("the arm is not holding: press Hold first (the routine moves it around where it is)")
+                raise said(RuntimeError("the arm is not holding: press Hold first"), "the routine moves it around where it is")
             b = gw.charuco_state()
             if not b["seen"] or b["corners"] < ABS_MIN_CORNERS:
-                raise RuntimeError("the ChArUco board is not in view with >= %d corners (%d now)" % (ABS_MIN_CORNERS, b["corners"]))
+                raise RuntimeError("ChArUco board not in view: %d corners, needs %d" % (b["corners"], ABS_MIN_CORNERS))
             pc = gw.precheck_cached()
             if pc is not None and not pc["ok"]:
                 raise RuntimeError(pc.get("words") or pc["why"])
@@ -1315,7 +1348,7 @@ class Conn(socketserver.StreamRequestHandler):
             return self.job("calib.absolute", lambda ev: absolute_job("solve", ev, d), background=True, extra={"action": "solve"})
         if act == "install":
             return absolute_install()
-        raise ValueError("calib.absolute action: begin | collect | solve | install | status")
+        raise ValueError("calib.absolute action: begin, collect, solve, install or status")
 
     def dispatch(self, req):
         rid, cmd, args = req.get("id"), req.get("cmd"), req.get("args") or {}
@@ -1323,7 +1356,11 @@ class Conn(socketserver.StreamRequestHandler):
             res = self.run(cmd, args, rid)
             self.send({"id": rid, "ok": True, "result": res})
         except Exception as e:     # noqa: BLE001  every failure goes back to the client
-            self.send({"id": rid, "ok": False, "error": str(e)})
+            rep = {"id": rid, "ok": False, "error": str(e)}
+            if getattr(e, "detail", ""):          # the long words (2026-11-21, said()): the reply's detail + the log
+                rep["detail"] = e.detail
+                print("%s: %s (%s)" % (cmd, e, e.detail), flush=True)
+            self.send(rep)
 
     def need(self, level):
         if level == "key" and self.access != "control":
@@ -1392,7 +1429,8 @@ class Conn(socketserver.StreamRequestHandler):
             self.need("control")
             chk = gw.check_j(a.get("joints_deg"))
             if not chk["ok"]:
-                raise RuntimeError("refused: " + "; ".join(chk["reasons"]))
+                raise said(RuntimeError("refused: " + chk["reasons"][0]),
+                           "; ".join(chk["reasons"]) if len(chk["reasons"]) > 1 else "")
             speed = int(a.get("speed_percent") or gw.P.get("default_speed_percent", 10))
             return self.motion(chk, [math.radians(float(x)) for x in a["joints_deg"]], speed, rid)
         if cmd == "arm.jog_pose":
@@ -1424,13 +1462,13 @@ class Conn(socketserver.StreamRequestHandler):
             self.need("control")
             st = gw.fresh("arm", 1.0)
             if st is None or not st.all_enabled:
-                raise RuntimeError("the arm is not holding: press Hold first (the routine moves it around where it is)")
+                raise said(RuntimeError("the arm is not holding: press Hold first"), "the routine moves it around where it is")
             if str(a.get("target") or "tag") == "charuco":
                 pc = gw.precheck_cached()
                 if pc is not None and not pc["ok"]:
                     raise RuntimeError(pc.get("words") or pc["why"])
                 if not gw.charuco_state()["seen"]:
-                    raise RuntimeError("the ChArUco board is not in view: point the camera at it 150-300 mm away")
+                    raise RuntimeError("ChArUco board not in view: aim camera 150-300 mm away")
                 return self.job("calib.handeye", lambda ev: handeye_job(None, ev, "charuco"), background=True,
                                 extra={"target": "charuco"})
             if str(a.get("target") or "tag") != "tag":
@@ -1442,7 +1480,8 @@ class Conn(socketserver.StreamRequestHandler):
             tid = a.get("tag_id")
             if tid is None:
                 if not seen:
-                    raise RuntimeError("no tag in view: point the camera at a fixed tag 150-300 mm away")
+                    raise said(RuntimeError("no tag in view: aim at a tag, 150-300 mm"),
+                               "point the camera at a FIXED tag 150-300 mm away")
                 tid = max(seen, key=lambda t: t["size_px"])["id"]
             elif not any(t["id"] == int(tid) for t in seen):
                 raise RuntimeError("tag %s is not in view" % tid)
@@ -1461,7 +1500,7 @@ class Conn(socketserver.StreamRequestHandler):
             self.need("control")
             d = [float(v) for v in a.get("delta_mm") or []]
             if len(d) != 3 or math.sqrt(sum(v * v for v in d)) > 1000.0:      # (300 until 2026-11-19, relaxed)
-                raise ValueError("delta_mm needs x y z (mm), at most 1000 mm long")
+                raise ValueError("delta_mm needs x y z, at most 1000 mm")
             speed = max(1, min(int(gw.P.get("max_speed_percent", 30)), int(a.get("speed_percent") or 10)))
             return self.job("arm.move_linear", lambda ev: gw.move_linear(d, speed, ev))
         if cmd == "teach.tag":
@@ -1547,13 +1586,13 @@ class Conn(socketserver.StreamRequestHandler):
             from harness_msgs.srv import MoveZ               # borrowed, as bunny.platform borrows LiquidPush
             mm = a.get("mm")
             if isinstance(mm, bool) or not isinstance(mm, (int, float)) or not math.isfinite(mm):
-                raise ValueError("mm must be a finite number (the Bunny's platform height, its mm; got %r)" % (mm,))
+                raise said(ValueError("mm must be a finite number (got %r)" % (mm,)), "mm = the Bunny's platform height, its mm")
             try:
                 r = gw.call(MoveZ, "/bunny/platform_set", MoveZ.Request(mm=float(mm), absolute=True), 10)
             except RuntimeError as e:
                 if "not answering" in str(e) and gw.fresh("bunny", 3.0) is not None:
-                    raise RuntimeError("/bunny/platform_set is not offered: bunny_node is older than the gateway "
-                                       "(harness nodes restart bunny)")
+                    raise said(RuntimeError("bunny_node too old: harness nodes restart bunny"),
+                               "/bunny/platform_set is not offered: bunny_node is older than the gateway")
                 raise
             if not r.success:
                 raise RuntimeError(r.message)
@@ -1568,12 +1607,13 @@ class Conn(socketserver.StreamRequestHandler):
             from harness_msgs.srv import WeighTo
             g, mat, powder = float(a.get("target_g") or 0.0), str(a.get("material") or "powder"), str(a.get("powder") or "")
             if not 0.0 < g <= 100.0 or mat not in ("powder", "liquid"):
-                raise ValueError("target_g must be in (0, 100] and material powder | liquid")
+                raise ValueError("target_g must be in (0, 100], material powder or liquid")
 
             def weigh(ev):
                 r = gw.call(WeighTo, "/bunny/weigh_to", WeighTo.Request(target_g=g, material=mat, powder_id=powder), 1800)
                 if not r.success:
-                    raise RuntimeError("weigh_to %s: %s" % (r.outcome, r.message))
+                    raise said(RuntimeError(bunny_failed("weigh_to", r.message, "%s at %.4f g" % (r.outcome, r.actual_g))),
+                               r.message)
                 return {"outcome": r.outcome, "actual_g": round(r.actual_g, 5)}
             return self.job("bunny.weigh_to", weigh)
         if cmd == "bunny.dispense_volume":
@@ -1587,7 +1627,8 @@ class Conn(socketserver.StreamRequestHandler):
                 r = gw.call(DispenseVolume, "/bunny/dispense_volume", DispenseVolume.Request(
                     volume_ml=ml, density_g_per_ml=float(a.get("density_g_per_ml") or 0.0), rate=0), 600)
                 if not r.success:
-                    raise RuntimeError("dispense_volume: %s" % r.message)
+                    raise said(RuntimeError(bunny_failed("dispense_volume", r.message, "stopped at %d of %d pump steps"
+                                                         % (r.steps, r.steps_planned))), r.message)
                 return {"actual_ml": round(r.actual_ml, 3), "steps": r.steps}
             return self.job("bunny.dispense_volume", dispense)
         raise ValueError("unknown cmd %r" % cmd)
@@ -1619,6 +1660,8 @@ class Conn(socketserver.StreamRequestHandler):
                 return r
             except Exception as e:     # noqa: BLE001  reported to the caller / in state.calib
                 JOB["result"] = {"ok": False, "kind": kind, "message": str(e)}
+                if getattr(e, "detail", ""):
+                    JOB["result"]["detail"] = e.detail
                 raise
             finally:
                 done.set()
@@ -1647,7 +1690,7 @@ class Conn(socketserver.StreamRequestHandler):
             time.sleep(0.01)
         gh = gf.result()
         if not gh.accepted:
-            raise RuntimeError("rejected by the arm node (busy, fault, teach mode or no feedback; see state)")
+            raise RuntimeError("rejected by the arm node (busy, fault, teach, no feedback)")
         ctl["motion"] = {"conn": self, "label": "move_j"}
         try:
             rf = gh.get_result_async()

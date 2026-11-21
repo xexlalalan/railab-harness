@@ -390,16 +390,17 @@ class BunnyModule(Module):
         except BunnyError as words:
             self.unknown("housing")   # the status says where it really is within half a second
             if run.stopped:           # the Bunny's own stop ended the swing in place: asked for, not a fault
-                run.stop_reason = f"{run.stop_reason}; the Bunny stopped the swing where it was ({words})"
+                self.log(f"{self.name}: the Bunny stopped the swing where it was ({words})")
+                run.note("swing stopped part way")
                 return
             raise Fault(HOUSING_FAILED, str(words))
         word = fields.get("housing") if isinstance(fields, dict) else None
         if word in HOUSING_WORDS:
             self.sensed("housing", word)
         if run.stopped:
-            run.stop_reason = f"{run.stop_reason}; the swing was not interrupted: it ended {word}"
+            run.note(f"swing ended {word}")
         elif word != target:
-            raise Fault(HOUSING_FAILED, f"the Bunny answered the swing done, but its housing reads {word!r}")
+            raise Fault(HOUSING_FAILED, f"swing done but the housing reads {word!r}")
 
     def check_platform_to(self, args):
         self.need("platform_mm")   # open loop and no limit switch: never move from an unknown height
@@ -440,28 +441,28 @@ class BunnyModule(Module):
         if error is not None:
             if isinstance(error, BunnyError):
                 if run.stopped:   # the Bunny's own stop (its server since 82cc822) ended the move part way
-                    run.stop_reason = f"{run.stop_reason}; the platform stopped part way ({error}): its height is unknown"
+                    self.log(f"{self.name}: the platform stopped part way ({error})")
+                    run.note("platform stopped part way: height unknown")
                     return
-                raise Failed(f"platform move: the Bunny says {error}; the height is unknown now")
+                raise Failed(M.join("platform move failed, height unknown", error))
             raise error
         if dropped:
-            raise Failed("the Bunny went offline or its STM32 link dropped during the move: the height is unknown")
-        if not good:
-            raise Failed(f"the Bunny's platform counter reads {position} after the move, {counter + steps} was "
-                         "expected (someone else moved it too): the height is unknown")
+            raise Failed("Bunny offline or STM32 link dropped: height unknown")
+        if not good:   # someone else moved it too
+            raise Failed(f"platform counter {position}, expected {counter + steps}: height unknown")
         self.estimated("platform_mm", round(start + steps / PLATFORM_STEPS_PER_MM, 2))
         with self._mine:
             lost_since = self._lost != lost
         if lost_since:   # lost between the move's end and the line above: _lose's "unknown" must win
             self.unknown("platform_mm")
         if run.stopped:
-            run.stop_reason = f"{run.stop_reason}; the platform move was not interrupted: it ran to its end"
+            run.note("platform move ran to its end")
 
     def do_tare(self, args, run):
         try:
             reply = self._call(self.link.tare(), run, TARE_S, "tare", interruptible=False)
         except BunnyError as words:
-            raise Failed(f"tare: {words}")
+            raise Failed(M.join("tare", words))
         grams = reply.get("g") if isinstance(reply, dict) else None
         if isinstance(grams, (int, float)) and not isinstance(grams, bool):
             self.sensed("weight_g", round(float(grams), 4))
@@ -470,15 +471,14 @@ class BunnyModule(Module):
         if args["target_g"] <= 0:
             raise Refused(M.OUT_OF_RANGE, "target_g must be more than 0 g")
         if self.need("pan_loaded") is not True:
-            raise Refused(M.NOT_READY, "nothing on the pan (set pan_loaded when a container stands there)")
+            raise Refused(M.NOT_READY, "nothing on the pan: set pan_loaded first")
         if self.value("powder_id") == M.UNKNOWN:
             with self._mine:
                 held = (self._status or {}).get("powder_id")
             if held:
                 # unknown should mean "the Bunny measures the powder fresh"; today's Bunny would instead dose with
                 # the powder it last selected (an empty WeighTo.powder_id does not clear it)
-                raise Refused(M.UNKNOWN_VALUE, f"powder_id is unknown, but the Bunny holds {held} as its current "
-                                               "powder and would dose with it instead of measuring fresh: set powder_id")
+                raise Refused(M.UNKNOWN_VALUE, f"powder_id unknown, the Bunny holds {held}: set powder_id")
 
     def do_weigh_to(self, args, run):
         target = float(args["target_g"])
@@ -489,7 +489,7 @@ class BunnyModule(Module):
         try:
             reply = self._call(self.link.weigh_to(target, powder), run, WEIGH_S, "weigh_to", interruptible=True)
         except BunnyError as words:
-            raise Failed(f"weigh_to: {words}")
+            raise Failed(M.join("weigh_to", words))
         finally:
             with self._mine:
                 self._dose = None
@@ -502,13 +502,13 @@ class BunnyModule(Module):
         said = f"the Bunny: {outcome or 'no outcome'}" + (f", {actual:g} g" if weighed else "")
         message = _plain(reply.get("message"))
         if run.stopped:
-            run.stop_reason = f"{run.stop_reason}; {said}"
+            run.note(said)
         elif outcome == "finished":
             return
         elif outcome == "stopped":
             run.ask_stop(f"stopped on the Bunny itself ({said})")   # ends "stopped": nobody here asked for it
         else:
-            raise Failed(said + (f": {message}" if message else ""))   # "bottle empty", "error", anything else
+            raise Failed(M.join(said, message) if message else said)   # "bottle empty", "error", anything else
 
     def check_dispense_volume(self, args):
         if args["volume_ml"] <= 0:
@@ -519,14 +519,14 @@ class BunnyModule(Module):
             reply = self._call(self.link.dispense_volume(float(args["volume_ml"])), run, DISPENSE_S,
                                "dispense_volume", interruptible=True)
         except BunnyError as words:
-            raise Failed(f"dispense_volume: {words}")
-        said = (f"the Bunny pushed {reply.get('steps', 0)} of {reply.get('steps_planned', 0)} pump steps "
+            raise Failed(M.join("dispense_volume", words))
+        said = (f"pushed {reply.get('steps', 0)} of {reply.get('steps_planned', 0)} pump steps "
                 f"≈ {reply.get('actual_ml', 0)} mL")
         if run.stopped:
-            run.stop_reason = f"{run.stop_reason}; {said}"
+            run.note(said)
         elif not reply.get("success"):
             message = _plain(reply.get("message"))
-            raise Failed(f"dispense_volume: {message or said}")
+            raise Failed(M.join("dispense_volume", message or said))
 
     # ------------------------------------------------------------------ told facts
     def set_platform_mm(self, value):
@@ -535,10 +535,9 @@ class BunnyModule(Module):
         with self._mine:
             up, counter = self._online and self._firmware, self._counter
         if not up:
-            raise Refused(M.NOT_READY, "the Bunny is offline or its firmware link is down: a height told now could "
-                                       "not be tied to its step counter")
-        if counter is None:
-            raise Refused(M.NOT_READY, "the Bunny's platform counter is not read yet (read every second): tell it again")
+            raise Refused(M.NOT_READY, "Bunny offline or firmware link down: tell the height later")
+        if counter is None:   # read every second
+            raise Refused(M.NOT_READY, "platform counter not read yet: tell it again")
 
     def set_pan_loaded(self, value):
         """TODAY'S BUNNY HAS NO pan_loaded: the fact is kept HERE. Its load_begin / load_end handshake is reachable
@@ -553,8 +552,7 @@ class BunnyModule(Module):
         weigh_to (WeighTo.powder_id); the Bunny looks it up then (an id not in its database fails the dose with
         its words). Goes away when the Bunny has the field itself."""
         if not isinstance(value, str) or not value.isdigit():
-            raise Refused(M.BAD_ARGS, "powder_id is the powder's barcode id, digits only "
-                                      "(bunny_node takes any other text as a powder NAME)")
+            raise Refused(M.BAD_ARGS, "powder_id must be the barcode id, digits only")   # other text = a NAME
         if self.running() == "weigh_to":
             raise Refused(M.BUSY, "the powder cannot change under a running dose")
 
@@ -580,26 +578,24 @@ class BunnyModule(Module):
             if settled is not None:
                 if now > deadline and not late:
                     late = True
-                    self.latch_fault(NO_REPLY, f"{what}: no answer from the Bunny within {budget_s:.0f} s: what it did "
-                                               "is not known; the action (and its zone) waits for its answer or for "
-                                               "its status to show the motion over")
+                    self.log(f"{self.name}: {what}: no answer within {budget_s:.0f} s; the action (and its zone) "
+                             "waits for its answer or for its status to show the motion over")
+                    self.latch_fault(NO_REPLY, f"{what}: no Bunny answer in {budget_s:.0f} s, outcome unknown")
                 if late and settled(deadline):
-                    raise Failed(f"{what}: no answer within {budget_s:.0f} s; the Bunny's status now shows the motion "
-                                 "over: what it did is not known")
+                    raise Failed(f"{what}: no answer in {budget_s:.0f} s, motion over, outcome unknown")
                 continue
             if now > deadline or (grace is not None and now > grace):
                 self.safe_state()   # nobody knows what the Bunny does now: make it safe
                 within = f"{STOP_GRACE_S:.0f} s of the stop" if grace is not None and now > grace else f"{budget_s:.0f} s"
-                raise Fault(NO_REPLY, f"{what}: no answer from the Bunny within {within} (a stop was sent); "
-                                      "what it did is not known")
+                raise Fault(NO_REPLY, f"{what}: no answer in {within}, stop sent")
         if late:   # whatever it says now (done, an error): the motion's end is not known for certain
             try:
                 pending.result()
                 said = "it says done"
             except LinkError as words:
                 said = f"it says: {words}"
-            raise Failed(f"{what}: the Bunny answered only after the {budget_s:.0f} s budget ({said}): what it did "
-                         "is not known")
+            self.log(f"{self.name}: {what}: the Bunny answered only after the {budget_s:.0f} s budget ({said})")
+            raise Failed(f"{what}: answered only after {budget_s:.0f} s, outcome unknown")
         try:
             return pending.result()
         except NoService as absent:

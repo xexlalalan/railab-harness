@@ -28,7 +28,12 @@ FORMAT = "railab-motion/1"
 
 
 class PlanError(RuntimeError):
-    """The motion cannot be planned / is refused; the message names the sample and the reason."""
+    """The motion cannot be planned / is refused; the message names the reason in at most ~9 words (operator 2026-11-21:
+    the gateway says "refused: " + it), `detail` the sample and the numbers behind it."""
+
+    def __init__(self, words="", detail=""):
+        super().__init__(words)
+        self.detail = detail
 
 
 # ---------------------------------------------------------------------------------- motion file
@@ -252,15 +257,17 @@ def plan_path_run(kin, path: CartesianPath, q_now, duration_s: float, lim: Limit
         if pe <= 2e-4 and ae <= 2e-3:
             sols.append(q)
     if not sols:
-        raise PlanError(f"the path's start ({np.round(P[0] * 1000, 1).tolist()} mm) is out of reach "
-                        "for the corrected arm model (no IK solution within the joint limits)")
+        raise PlanError("the path's start is out of reach",
+                        f"start {np.round(P[0] * 1000, 1).tolist()} mm: no IK solution of the corrected arm model "
+                        "within the joint limits")
     q = min(sols, key=lambda s: float(np.abs(s - q_now).max()))
     knots = [q]
     for k in range(1, len(tk)):
         q, pe, ae = kin.ik(flange_T(P[k], A[k], U[k], lim.tcp_offset_m), q, margin=lim.ik_margin_rad)
         if pe > 2e-4 or ae > 2e-3:
-            raise PlanError(f"path point at t = {tk[k]:.2f} s ({np.round(P[k] * 1000, 1).tolist()} mm) is out of reach "
-                            f"in the current arm branch (best {pe * 1000:.1f} mm / {math.degrees(ae):.2f} deg)")
+            raise PlanError(f"path point at {tk[k]:.2f} s out of reach",
+                            f"{np.round(P[k] * 1000, 1).tolist()} mm, in the current arm branch "
+                            f"(best {pe * 1000:.1f} mm / {math.degrees(ae):.2f} deg)")
         knots.append(q)
     knots = np.array(knots)
 
@@ -307,7 +314,7 @@ def plan_joint_path(kin, waypoints, lim: Limits, rate_hz: float = 100.0, t_min: 
     never go further out); the caller's path brings it back inside."""
     W = np.asarray(waypoints, float)
     if W.ndim != 2 or W.shape[1] != 6 or len(W) < 2:
-        raise PlanError("a joint path needs at least 2 waypoints of 6 joints")
+        raise PlanError("a joint path needs at least 2 waypoints", "of 6 joints")
     keep = [0] + [k for k in range(1, len(W)) if float(np.abs(W[k] - W[k - 1]).max()) >= 1e-6]
     idx, W = keep, W[keep]                        # zero-length segments dropped; idx = the caller's numbering
     ts, qs, segs, t_off = [], [], [], 0.0
@@ -353,7 +360,7 @@ def validate(kin, traj: Trajectory, lim: Limits, at=None, L=None, ramp=None, loo
     bad = np.argwhere((q < lo) | (q > hi))
     if len(bad):
         i, j = bad[0]
-        raise PlanError(f"joint {j + 1} at {math.degrees(q[i, j]):.1f} deg leaves its limits ({where(i)})")
+        raise PlanError(f"joint {j + 1} at {math.degrees(q[i, j]):.1f} deg leaves its limits", where(i))
     dt = np.diff(t)
     if (dt <= 0).any():
         raise PlanError("trajectory time does not increase")
@@ -369,35 +376,37 @@ def validate(kin, traj: Trajectory, lim: Limits, at=None, L=None, ramp=None, loo
             T_need = (duration_s - r) * abs(v[i, j]) / vlim[j]
             T_need = T_need + 2.0 if T_need >= 6.0 else T_need * 4.0 / 3.0
             need = f"; a loop of about {math.ceil(T_need * 1.05)} s or longer fits (--duration)"
-        raise PlanError(f"joint {j + 1} would turn at {math.degrees(abs(v[i, j])):.1f} deg/s > the "
+        raise PlanError(f"joint {j + 1} would turn at {math.degrees(abs(v[i, j])):.1f} > {math.degrees(vlim[j]):.1f} deg/s",
+                        f"joint {j + 1} would turn at {math.degrees(abs(v[i, j])):.1f} deg/s > the "
                         f"{math.degrees(vlim[j]):.1f} deg/s limit ({where(i)}){need}")
     acc = np.diff(v, axis=0) / dt[1:, None]
     amax = np.abs(acc).max(axis=0) if len(acc) else np.zeros(6)
     if len(acc):
         i, j = np.unravel_index((np.abs(acc) / alim).argmax(), acc.shape)
         if abs(acc[i, j]) > alim[j] * 1.001:
-            raise PlanError(f"joint {j + 1} would accelerate at {abs(acc[i, j]):.2f} rad/s^2 > the "
-                            f"{alim[j]:.2f} limit ({where(i + 1)}); slow it down (--duration)")
+            raise PlanError(f"joint {j + 1} would accelerate at {abs(acc[i, j]):.2f} > {alim[j]:.2f} rad/s^2",
+                            f"({where(i + 1)}); slow it down (--duration)")
     a, b, c = lim.floor_plane
     wmin, wmax = np.array(lim.workspace_min), np.array(lim.workspace_max)
     clear_min, dev_m, dev_r = 1e9, 0.0, 0.0
     for k in range(len(t)):
         T, tip = _tip(kin, q[k], lim.tcp_offset_m)
         if not ((wmin <= T[:3, 3]) & (T[:3, 3] <= wmax)).all():
-            raise PlanError(f"flange at {np.round(T[:3, 3] * 1000, 1).tolist()} mm leaves the workspace box ({where(k)})")
+            raise PlanError("flange leaves the workspace box",
+                            f"flange at {np.round(T[:3, 3] * 1000, 1).tolist()} mm ({where(k)})")
         if lim.floor_enabled:
             clear = tip[2] - (a * tip[0] + b * tip[1] + c)
             clear_min = min(clear_min, clear)
             if clear < lim.floor_margin_m:
-                raise PlanError(f"fingertip {clear * 1000:.1f} mm above the floor < margin "
-                                f"{lim.floor_margin_m * 1000:.0f} mm ({where(k)})")
+                raise PlanError(f"fingertip {clear * 1000:.1f} mm above the floor (margin "
+                                f"{lim.floor_margin_m * 1000:.0f} mm)", where(k))
         if at is not None and loop and loop[1] <= k < loop[2]:      # the streamed sample stays on the curve
             u = smooth_fraction(t[k] - t_loop0, duration_s, ramp)
             Pp, Aa, Uu = at(u * L)
             pe, ae = pose_error(T, flange_T(Pp[0], Aa[0], Uu[0], lim.tcp_offset_m))
             dev_m, dev_r = max(dev_m, pe), max(dev_r, ae)
             if pe > lim.max_dev_m or ae > lim.max_dev_rad:
-                raise PlanError(f"streamed sample {pe * 1000:.2f} mm / {math.degrees(ae):.2f} deg off the curve ({where(k)})")
+                raise PlanError(f"streamed sample {pe * 1000:.2f} mm / {math.degrees(ae):.2f} deg off the curve", where(k))
     return {"peak_joint_speed_deg_s": [round(math.degrees(x), 1) for x in vmax],
             "peak_joint_acc_rad_s2": [round(float(x), 2) for x in amax],
             "min_floor_clearance_mm": round(float(clear_min) * 1000, 1) if lim.floor_enabled else None,
@@ -573,8 +582,8 @@ def _smooth_sigmas(kin, W, cv, lim, dev_rad, dev_m, sigma_max):
         np.minimum.at(f, mm, np.maximum(0.3, 0.9 / ratio[bad][ii]))
         sig = np.maximum(sig * f, 1e-5)
         cv.sigma = sig
-    raise PlanError("the smooth path cannot keep within %.2f deg / %.1f mm of the waypoints"
-                    % (math.degrees(dev_rad), dev_m * 1000))
+    raise PlanError("smooth path cannot keep within %.2f deg / %.1f mm"
+                    % (math.degrees(dev_rad), dev_m * 1000), "of the waypoints")
 
 
 def _topp(dq, ddq, ds, vlim, alim, cap):
@@ -648,7 +657,7 @@ def plan_smooth_path(kin, waypoints, lim: Limits, seg_vel=None, seg_acc=None, ra
     t_start = _time.perf_counter()
     W = np.asarray(waypoints, float)
     if W.ndim != 2 or W.shape[1] != 6 or len(W) < 2:
-        raise PlanError("a joint path needs at least 2 waypoints of 6 joints")
+        raise PlanError("a joint path needs at least 2 waypoints", "of 6 joints")
     K = len(W)
 
     def per_seg(v, default):
@@ -658,7 +667,7 @@ def plan_smooth_path(kin, waypoints, lim: Limits, seg_vel=None, seg_acc=None, ra
         if a.ndim == 1 and len(a) == K - 1:
             a = np.repeat(a[:, None], 6, axis=1)
         if a.shape != (K - 1, 6) or not np.isfinite(a).all() or (a <= 0).any():
-            raise PlanError("the segment limits need %d positive rows (one per segment)" % (K - 1))
+            raise PlanError("the segment limits need %d positive rows" % (K - 1), "one per segment")
         return a
     sv_, sa_ = per_seg(seg_vel, lim.max_joint_vel_rad_s), per_seg(seg_acc, lim.max_joint_acc_rad_s2)
     keep = [0] + [k for k in range(1, K) if float(np.abs(W[k] - W[k - 1]).max()) >= 1e-6]
@@ -736,10 +745,10 @@ def plan_smooth_path(kin, waypoints, lim: Limits, seg_vel=None, seg_acc=None, ra
     i_v, i_a = int(rv.argmax()), int(ra.argmax())
     if rv[i_v] > 1.001:
         j = int(np.argmax(np.abs(v[i_v]) / _span_min(seg_v, j0[i_v:i_v + 1], jl[i_v + 1:i_v + 2])[0]))
-        raise PlanError("joint %d would turn at %.1f deg/s > its segment's limit (t = %.2f s)"
-                        % (j + 1, math.degrees(abs(v[i_v, j])), t[i_v]))
+        raise PlanError("joint %d would turn at %.1f deg/s, over its limit" % (j + 1, math.degrees(abs(v[i_v, j]))),
+                        "over its segment's limit (t = %.2f s)" % t[i_v])
     if ra[i_a] > 1.001:
-        raise PlanError("a joint would accelerate past its segment's limit (t = %.2f s)" % t[i_a + 1])
+        raise PlanError("a joint would accelerate past its segment's limit", "t = %.2f s" % t[i_a + 1])
 
     # ---- the streamed samples on the curve: within the bounds of the polyline (same parameter: an upper bound)
     _, qp = cv.polyline(su)
@@ -747,15 +756,15 @@ def plan_smooth_path(kin, waypoints, lim: Limits, seg_vel=None, seg_acc=None, ra
     dev_j = float(e.max())
     if dev_j > dev_rad:
         i = int(e.max(axis=1).argmax())
-        raise PlanError("streamed sample %.2f deg off the waypoints' path (t = %.2f s)" % (math.degrees(dev_j), t[i]))
+        raise PlanError("streamed sample %.2f deg off the waypoints' path" % math.degrees(dev_j), "t = %.2f s" % t[i])
     chk = np.nonzero(e.sum(axis=1) * SMOOTH_LEVER_M > 0.05 * dev_m)[0]
     dev_t = 0.0
     if len(chk):
         dm = np.linalg.norm(_tcp(kin, q[chk], lim.tcp_offset_m) - _tcp(kin, qp[chk], lim.tcp_offset_m), axis=1)
         dev_t = float(dm.max())
         if dev_t > dev_m:
-            raise PlanError("streamed sample %.2f mm off the waypoints' path at the TCP (t = %.2f s)"
-                            % (dev_t * 1000, t[chk[int(dm.argmax())]]))
+            raise PlanError("streamed sample %.2f mm off the path at the TCP" % (dev_t * 1000),
+                            "t = %.2f s" % t[chk[int(dm.argmax())]])
     traj = Trajectory(t, q, [("smooth path", 0, len(t))], {})
     env = Limits(**{f: getattr(lim, f) for f in lim.__dataclass_fields__})
     env.max_joint_vel_rad_s, env.max_joint_acc_rad_s2 = seg_v.max(axis=0), seg_a.max(axis=0)

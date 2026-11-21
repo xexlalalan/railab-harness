@@ -56,6 +56,7 @@ import math
 import os
 import re
 import signal
+import sys
 import threading
 import time
 
@@ -91,16 +92,15 @@ FAULT_SILENT = "ARM_NODE_SILENT"      # no status from the arm node
 FAULT_STOP = "STOP_UNCONFIRMED"       # a cancel the arm node did not confirm
 FAULT_INTERNAL = "INTERNAL"
 
+# Not ported yet: the hand-eye routine runs today as a job of the old gateway (tools/gateway_server.py handeye_job:
+# `ros2 run harness_calibration handeye`, its target a tag in view or the ChArUco board, gated by the gateway's
+# start-posture check, installed into calib/handeye.yaml only at rms <= 3 mm and then held in the gateway's memory);
+# the absolute calibration is a session, not one action (begin, collect at up to five board positions placed by hand,
+# solve, install into calib/kinematics.yaml + calib/handeye.yaml, then the arm node restarts). The words <= 10
+# (operator 2026-11-21).
 NOT_PORTED = {
-    "calibrate_handeye": (
-        "not ported yet: the hand-eye routine runs today as a job of the old gateway (tools/gateway_server.py "
-        "handeye_job: `ros2 run harness_calibration handeye`, its target a tag in view or the ChArUco board, gated by "
-        "the gateway's start-posture check, installed into calib/handeye.yaml only at rms <= 3 mm and then held in the "
-        "gateway's memory); use calib.handeye on TCP 7803 meanwhile"),
-    "calibrate_absolute": (
-        "not ported yet: the absolute calibration is a session, not one action (begin, collect at up to five board "
-        "positions placed by hand, solve, install into calib/kinematics.yaml + calib/handeye.yaml, then the arm node "
-        "restarts); use calib.absolute on TCP 7803 meanwhile"),
+    "calibrate_handeye": "not ported yet: use calib.handeye on TCP 7803",
+    "calibrate_absolute": "not ported yet: use calib.absolute on TCP 7803",
 }
 
 # ------------------------------------------------- the timed trajectory: COPIED from tools/gateway_server.py (7e2e7d5)
@@ -362,7 +362,7 @@ class Arm(Module):
         st = self._status()
         why = self._cause_persists(st)
         if why:
-            raise Refused(M.FAULT, f"{why}: the fault cannot be cleared yet")
+            raise Refused(M.FAULT, M.fit(f"{why}; cannot clear the fault yet", why))
         self._acked_fault = st["fault"]   # the node keeps these words until a hold: not latched again
 
     @staticmethod
@@ -370,10 +370,10 @@ class Arm(Module):
         if st is None:
             return "no fresh status from the arm node"
         if not st["connected"]:
-            return "the arm node has no CAN feedback (" + (st["fault"] or "feedback lost") + ")"
+            return M.join("arm node has no CAN feedback", st["fault"] or "feedback lost")
         bits = [e for e in st["errors"] if not JOINT_FAULT.match(e)]
         if bits:
-            return "the arm node still reports error bits: " + ",".join(bits)
+            return "the arm node still reports error bits: " + ",".join(bits)   # one word: the bits, no spaces
         return None
 
     # ------------------------------------------------------------ the watch: status -> readiness, faults, values
@@ -382,7 +382,7 @@ class Arm(Module):
             try:
                 self._sense()
             except Exception as error:   # noqa: BLE001  a bug here must not end the watch silently
-                self.latch_fault(FAULT_INTERNAL, f"the arm adapter's watch failed: {type(error).__name__}: {error}")
+                self.latch_fault(FAULT_INTERNAL, f"arm watch failed: {type(error).__name__}: {error}")
 
     def _sense(self):
         self.model.refresh()
@@ -396,16 +396,15 @@ class Arm(Module):
                 self.unknown(field)
             if self._heard and (st is None or st["age_s"] > SILENT_FAULT_S):
                 since = "" if st is None else f" for {st['age_s']:.1f} s"
-                self.latch_fault(FAULT_SILENT, f"no /arm/status from the arm node{since} (the node is not running or "
-                                               "not reachable)")
+                self.latch_fault(FAULT_SILENT, f"no /arm/status from the arm node{since}")   # not running / reachable
             return
         self._set_ready(True)
         if not st["fault"]:
             self._acked_fault = ""
         if not st["connected"]:
-            self.latch_fault(FAULT_ARM, "arm node: " + (st["fault"] or "feedback lost"))
+            self.latch_fault(FAULT_ARM, M.join("arm node", st["fault"] or "feedback lost"))
         elif st["fault"] and st["fault"] != self._acked_fault:
-            self.latch_fault(FAULT_ARM, "arm node: " + st["fault"])
+            self.latch_fault(FAULT_ARM, M.join("arm node", st["fault"]))
         held = bool(st["all_enabled"] and not st["teach_mode"])
         self.sensed("held", held)
         joints = snap.get("joints")
@@ -431,26 +430,26 @@ class Arm(Module):
     def _here_rad(self):
         joints = self.link.snapshot().get("joints")
         if joints is None or joints["age_s"] > FRESH_S:
-            raise Refused(M.UNKNOWN_VALUE, "joints_deg is unknown: no fresh joint feedback from the arm node")
+            raise Refused(M.UNKNOWN_VALUE, "joints_deg unknown: no fresh joint feedback")
         return [float(v) for v in joints["q"]]
 
     def _check_motion(self):
         """What every arm motion needs: the arm held, the arm node's fault cleared, the arm node idle."""
         held = self.value("held")
         if held is False:
-            raise Refused(M.NOT_READY, "the arm is released (drag teach) or the controller is in teach mode: send hold "
-                                       "first")
+            raise Refused(M.NOT_READY, "arm released or in teach mode: send hold first")
         if held is not True:
-            raise Refused(M.NOT_READY, "whether the arm holds is unknown (no fresh status from the arm node)")
+            raise Refused(M.NOT_READY, "whether the arm holds is unknown: no fresh status")
         st = self._status()
         if st is not None and st["fault"]:
-            raise Refused(M.NOT_READY, f"the arm node keeps its fault latched ({st['fault']}): send hold to clear it")
+            raise Refused(M.NOT_READY, M.fit(f"arm node fault ({st['fault']}): send hold to clear it",
+                                             "arm node fault latched: send hold to clear it"))
         self._check_node_idle(st)
 
     def _check_node_idle(self, st=None):
         st = st if st is not None else self._status()
         if st is not None and st["busy"]:
-            raise Refused(M.BUSY, "the arm node is running a motion another client gave it")
+            raise Refused(M.BUSY, "the arm node runs another client's motion")
 
     # ------------------------------------------------------------ follow_path
     def check_follow_path(self, args):
@@ -469,18 +468,18 @@ class Arm(Module):
             here = self._here_rad()
             _start_gap(waypoints[0], self.model.to_model_deg(here))   # the arm moved since the accept?
         except Refused as refusal:
-            raise Failed(f"not started: {refusal.reason}") from None
+            raise Failed(M.join("not started", refusal.reason)) from None
         path = [here] + [self.model.to_controller_rad(w) for w in waypoints[1:]]
         try:
             trajectory = self.model.plan(path, speeds)
         except PathRefused as error:
-            raise Failed(f"not started: the planner cannot time this path: {error}") from None
+            raise Failed(M.join("not started", error)) from None   # the planner cannot time this path
         if run.stopped:
             return
         try:
             goal = self.link.follow(trajectory, f"{self.name} follow_path #{run.id}")
         except LinkError as error:
-            raise Failed(f"not started: {error}") from None
+            raise Failed(M.join("not started", error)) from None
         deadline = time.monotonic() + float(trajectory.duration) + GOAL_SLACK_S
         while not goal.done():
             if run.stopped:
@@ -490,22 +489,21 @@ class Arm(Module):
             if time.monotonic() > deadline:
                 goal.cancel()
                 self._confirm_stop(goal)
-                raise Failed(f"no result {GOAL_SLACK_S:.0f} s after the path should have ended: cancelled")
+                raise Failed(f"no result {GOAL_SLACK_S:.0f} s after the path's end: cancelled")
             progress = goal.progress()
             if progress is not None:
                 run.progress(progress)
             run.sleep(POLL_S)
         ok, words = goal.result()
         if not ok and not run.stopped:
-            raise Failed(f"arm node: {words}")
+            raise Failed(M.join("arm node", words))
 
     def _confirm_stop(self, goal):
         end = time.monotonic() + STOP_CONFIRM_S
         while not goal.done() and time.monotonic() < end:
             time.sleep(POLL_S)
         if not goal.done():
-            raise Fault(FAULT_STOP, f"the arm node did not confirm the stop within {STOP_CONFIRM_S:.0f} s: the arm may "
-                                    "still be moving")
+            raise Fault(FAULT_STOP, f"stop not confirmed in {STOP_CONFIRM_S:.0f} s: arm may be moving")
 
     # ------------------------------------------------------------ grip_to
     def check_grip_to(self, args):
@@ -514,8 +512,7 @@ class Arm(Module):
             raise Refused(M.NOT_READY, "the arm node reports no gripper")
         widest = self.model.gripper_max_mm()
         if args["gap_mm"] > widest:
-            raise Refused(M.OUT_OF_RANGE, f"gap_mm = {args['gap_mm']} is beyond the gripper's widest gap "
-                                          f"{widest:.1f} mm (its calibration now)")
+            raise Refused(M.OUT_OF_RANGE, f"gap_mm {args['gap_mm']} beyond the widest gap {widest:.1f} mm")
 
     def do_grip_to(self, args, run):
         self._grip_force = float(args.get("force_n") or 0.0)   # 0 = the arm node's own default (SetGripper.srv)
@@ -526,7 +523,7 @@ class Arm(Module):
         if _number(reply.get("width_m")):
             self.sensed("gap_mm", round(reply["width_m"] * 1000.0, 2))
         if not reply.get("success") and not run.stopped:
-            raise Failed(f"arm node: {reply.get('message', '')}")
+            raise Failed(M.join("arm node", reply.get("message", "")))
 
     # ------------------------------------------------------------ hold / release
     def check_hold(self, args):
@@ -552,14 +549,16 @@ class Arm(Module):
         except LinkError as error:
             raise Failed(str(error)) from None
         if not ok:
-            raise Failed(f"arm node: {words}")
+            raise Failed(M.join("arm node", words))
         end = time.monotonic() + SETTLE_WAIT_S
         while True:
             st = self._status()
             if st is not None and shown(st):
                 return
             if time.monotonic() > end:
-                raise Failed(f"arm node said '{words}' but its status does not show {what} after {SETTLE_WAIT_S:.0f} s")
+                print(f"{self.name}: arm node said '{words}' but its status does not show {what}", file=sys.stderr,
+                      flush=True)
+                raise Failed(f"status does not show {what} after {SETTLE_WAIT_S:.0f} s")
             if not run.sleep(POLL_S):
                 return
 
@@ -580,7 +579,7 @@ class Arm(Module):
 # ------------------------------------------------------------ follow_path's checks (what a describe cannot say)
 def _postures(waypoints):
     if not isinstance(waypoints, list) or len(waypoints) < 2:
-        raise Refused(M.BAD_ARGS, "waypoints_deg needs at least 2 postures (the first = where the arm is)")
+        raise Refused(M.BAD_ARGS, "waypoints_deg needs at least 2 postures")   # the first = where the arm is
     out = []
     for k, w in enumerate(waypoints, 1):
         if not isinstance(w, list) or len(w) != 6 or not all(_number(x) for x in w):
@@ -596,17 +595,15 @@ def _speeds(speeds, n_waypoints):
         raise Refused(M.BAD_ARGS, f"speeds needs {n_waypoints - 1} numbers, one per segment")
     for k, s in enumerate(speeds, 1):
         if not SPEED_MIN <= s <= SPEED_MAX:
-            raise Refused(M.OUT_OF_RANGE, f"speeds: segment {k} (waypoint {k} to {k + 1}) = {s} is outside "
-                                          f"{SPEED_MIN} ... {SPEED_MAX} x the teach speed")
+            raise Refused(M.OUT_OF_RANGE, f"segment {k} speed {s} outside {SPEED_MIN}…{SPEED_MAX} x teach")
 
 
 def _start_gap(first, here):
     gaps = [abs(a - b) for a, b in zip(first, here)]
     j = max(range(6), key=gaps.__getitem__)
     if gaps[j] > START_TOL_DEG:
-        raise Refused(M.OUT_OF_RANGE, f"waypoint 1, joint {j + 1} = {first[j]:.2f} deg is {gaps[j]:.2f} deg from where "
-                                      f"the arm is ({here[j]:.2f} deg), more than {START_TOL_DEG} deg: plan the path "
-                                      "from the arm's current posture")
+        # waypoint 1 more than START_TOL_DEG from the arm: plan the path from the arm's current posture
+        raise Refused(M.OUT_OF_RANGE, f"joint {j + 1} is {gaps[j]:.2f} deg from where the arm is")
 
 
 def _inside(waypoints, limits):
@@ -614,9 +611,8 @@ def _inside(waypoints, limits):
     for k, w in enumerate(waypoints[1:], 2):
         for j, (q, (lo, hi)) in enumerate(zip(w, limits)):
             if not lo <= q <= hi:
-                raise Refused(M.OUT_OF_RANGE, f"waypoint {k}, joint {j + 1} = {q:.2f} deg is outside its limit "
-                                              f"{lo:.2f} ... {hi:.2f} deg (the controller's range less the arm node's "
-                                              "margin, in model degrees)")
+                # the limit = the controller's range less the arm node's margin, in model degrees
+                raise Refused(M.OUT_OF_RANGE, f"waypoint {k}: joint {j + 1} at {q:.2f} outside {lo:.2f}…{hi:.2f} deg")
 
 
 # ============================================================================================================ ROS link
@@ -781,10 +777,10 @@ class RosArmLink(ArmLink):
             # accepted later, it would move unwatched: cancel it the moment it is
             sent.add_done_callback(lambda f: f.result() is not None and f.result().accepted
                                    and f.result().cancel_goal_async())
-            raise LinkError(f"the arm node did not answer the goal within {ACCEPT_WAIT_S:.0f} s")
+            raise LinkError(f"no goal answer from the arm node in {ACCEPT_WAIT_S:.0f} s")
         handle = sent.result()
         if handle is None or not handle.accepted:
-            raise LinkError("rejected by the arm node (busy, fault, teach mode or not enabled)")
+            raise LinkError("rejected by the arm node (busy, fault, teach, disabled)")
         goal.attach(handle)
         self._handle = handle
         return goal

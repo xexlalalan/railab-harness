@@ -69,6 +69,16 @@ class Run:
             self.stop_reason = reason
             self._stop.set()
 
+    def note(self, words: str) -> None:
+        """What the device did on the stop, after the stop's reason when the two fit MAX_WORDS, else only in the
+        module's log (2026-11-21: a reason a person reads says at most 10 words)."""
+        joined = f"{self.stop_reason}; {words}"
+        self.stop_reason = M.fit(joined, self.stop_reason)
+        if self.stop_reason != joined:
+            log = getattr(self._module, "log", None)
+            if log is not None:
+                log(f"{self._module.name}: {joined}")
+
 
 class Module:
     TYPE = "module"
@@ -233,7 +243,7 @@ class Module:
         with self._lock:
             mode = self._mode()
             if mode == M.MODE_FAULT and action != M.CLEAR_FAULT:
-                raise Refused(M.FAULT, f"in fault {self._fault['code']}: {self._fault['reason']}")
+                raise Refused(M.FAULT, M.join(f"in fault {self._fault['code']}", self._fault["reason"]))
             if mode == M.MODE_BUSY:
                 raise Refused(M.BUSY, f"{self._current['do']} (request {self._current['id']}) is running")
             if action == M.CLEAR_FAULT:
@@ -296,7 +306,7 @@ class Module:
         """Take told facts. Every hook is asked before anything is stored: all of the set, or none."""
         with self._lock:
             if self._fault is not None:
-                raise Refused(M.FAULT, f"in fault {self._fault['code']}: {self._fault['reason']}")
+                raise Refused(M.FAULT, M.join(f"in fault {self._fault['code']}", self._fault["reason"]))
             for field, value in fields.items():
                 hook = getattr(self, "set_" + field, None)
                 if hook is not None:

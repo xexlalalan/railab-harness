@@ -24,7 +24,7 @@ class Zones:
             for zone in zones:
                 owner = zone.split("/", 1)[0]
                 if owner != holder[0] and not self._online(owner):
-                    return f"{zone}: {owner} is offline, what it was doing there is unknown"
+                    return f"{zone}: {owner} offline, its motion there unknown"
                 others = [h for h in self._held.get(zone, {}) if h != holder]
                 if others:
                     return f"{zone} is held by {others[0][0]} (request {others[0][1]})"

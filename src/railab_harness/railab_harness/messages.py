@@ -64,6 +64,21 @@ class Refused(Exception):
         self.code, self.reason = code, reason
 
 
+# THE WORDS A PERSON READS (operator 2026-11-21: "所有报错信息不能超过10个单词。捡重要的信息说"): a reason says at most
+# MAX_WORDS whitespace words; a head and a tail that do not fit together = the tail (the specific words) alone.
+MAX_WORDS = 10
+
+
+def fit(long: str, short: str) -> str:
+    """`long` when it says at most MAX_WORDS words, else `short`."""
+    return long if len(long.split()) <= MAX_WORDS else short
+
+
+def join(head: str, tail, sep: str = ": ") -> str:
+    """'head: tail' when it says at most MAX_WORDS words, else the tail alone."""
+    return fit(f"{head}{sep}{tail}", str(tail))
+
+
 def accept(rid) -> dict:
     return {"id": rid, "accepted": True}
 

@@ -224,7 +224,7 @@ class Connection:
 
     # ------------------------------------------------------------ in
     def _read(self) -> None:
-        buffer, why = b"", "the client closed the connection"
+        buffer, why = b"", "the client closed the link"
         try:
             while True:
                 data = self.sock.recv(65536)
@@ -339,7 +339,7 @@ class Connection:
         claims = envelope.get("claims")
         why = None
         if stray:
-            why = f"an envelope has no {', '.join(stray)} (it has {', '.join(ENVELOPE_KEYS)})"
+            why = f"an envelope has no {', '.join(stray[:3])}"   # (it has ENVELOPE_KEYS); <= 10 words (2026-11-21)
         elif claims is not None and (not isinstance(claims, list) or not all(isinstance(z, str) for z in claims)):
             why = "claims is a list of zone names"
         if why is not None:

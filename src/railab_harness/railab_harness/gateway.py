@@ -121,7 +121,8 @@ class Gateway:
             if kept:
                 self._keeper = None
         if kept:
-            self.stop_all(f"client {client} disconnected: {why} (it had given control up while an action ran)")
+            print(f"gateway: {client} had given control up while an action ran", file=sys.stderr, flush=True)
+            self.stop_all(f"client {client} disconnected: {why}")
 
     def ping(self, client: str) -> None:
         """A client with nothing to say still says it is alive."""
@@ -211,7 +212,7 @@ class Gateway:
             return M.refuse(rid, M.NO_LEASE, f"control is {holder}'s" if holder else "take control first"), False
         describe = self.registry.describe(module) if isinstance(module, str) else None
         if describe is None:
-            return M.refuse(rid, M.OFFLINE, f"no module {module!r} has announced itself"), False
+            return M.refuse(rid, M.OFFLINE, f"no module {module!r} announced"), False
         if not is_stop and not self.registry.online(module):
             return M.refuse(rid, M.OFFLINE, f"{module} has gone silent"), False
         if not isinstance(claims, list) or not all(isinstance(zone, str) for zone in claims):
@@ -339,7 +340,7 @@ class Gateway:
                 return
             self._keeper = None   # its actions are over, or it fell silent
         if running:
-            self.stop_all(f"client {client} silent (it had given control up while an action ran)")
+            self.stop_all(f"client {client} silent, had given control up")
 
     def _say_offline(self) -> None:
         for module in self.registry.went_offline():

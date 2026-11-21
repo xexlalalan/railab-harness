@@ -230,7 +230,8 @@ def main():
     c.wait_ready(camera=not a.check_convention or a.tag_id is not None)
     st = c.status
     if not (st.ok and st.all_enabled):
-        print(f"refused: the arm must be holding (press Hold; ok={st.ok} enabled={st.all_enabled} errors={list(st.errors)} fault='{st.fault}')")
+        print(f"arm status: ok={st.ok} enabled={st.all_enabled} errors={list(st.errors)} fault='{st.fault}'")
+        print("refused: the arm must be holding: press Hold")       # <= 10 words: the gateway's job message
         sys.exit(2)
 
     if a.check_convention:
@@ -250,8 +251,8 @@ def main():
     if a.target == "charuco":
         m = c.board(max_age=1.0)
         if m is None:
-            print("refused: the ChArUco board is not in view from the start pose (or no /camera/charuco: harness_msgs and "
-                  "harness_vision of 2026-11-16 built, camera node restarted?); point the camera at it, hold, retry")
+            print("(no /camera/charuco? harness_msgs and harness_vision of 2026-11-16 built, camera node restarted?)")
+            print("refused: ChArUco board not in view: aim the camera, retry")
             sys.exit(2)
         board = {"dictionary": m.dictionary, "squares": [int(m.squares_x), int(m.squares_y)],
                  "square_m": float(m.square_m), "marker_m": float(m.marker_m)}
@@ -264,7 +265,7 @@ def main():
             sys.exit(2)
         t = c.tag(a.tag_id)
         if t is None:
-            print(f"refused: tag {a.tag_id} not visible from the start pose; drag the arm so it is, hold, retry")
+            print(f"refused: tag {a.tag_id} not visible: drag the arm there, Hold")
             sys.exit(2)
         print(f"start: tag {a.tag_id} at {t.distance_m*1000:.0f} mm, {t.size_px:.0f} px, reproj {t.reproj_err_px:.2f} px")
     start_posture(c, a, board)                # the start-posture check + the re-pose (2026-11-17 / 18): before any motion

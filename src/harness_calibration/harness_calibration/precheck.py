@@ -46,7 +46,7 @@ REPOSE_TRAVEL_MAX_MM = 400.0                     # the fingertip + camera travel
 TARGET_CLEAR_M = 0.06                            # the tip / camera keep this from the target's plane on the way
 PLAIN_FIX = "the arm will first turn its wrist to a better position by itself (the camera stays on the board)"
 PLAIN_FIX_PROGRESS = "turning the wrist to a better position first (the camera stays on the board)"
-PLAIN_FAIL = "move the camera a little closer / more in front of the board and press again"
+PLAIN_FAIL = "move the camera closer, more in front of the board"     # <= 10 words (2026-11-21)
 PLAIN_NO_TARGET = "point the camera at the board and press again"
 JOINT_WORDS = {1: ("turn", "the base"), 2: ("move", "the shoulder"), 3: ("move", "the elbow"), 4: ("turn", "the wrist"),
                5: ("bend", "the wrist"), 6: ("turn", "the hand")}
