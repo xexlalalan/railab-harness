@@ -6,6 +6,6 @@
   <maintainer email="xexlalalan@gmail.com">bunny-harness</maintainer>
   <license>Proprietary</license>
   <depend>rclpy</depend><depend>std_srvs</depend><depend>std_msgs</depend><depend>harness_msgs</depend>
-  <depend>trajectory_msgs</depend><depend>builtin_interfaces</depend><depend>harness_arm</depend>
+  <depend>trajectory_msgs</depend><depend>builtin_interfaces</depend><depend>harness_arm</depend><exec_depend>railab_harness</exec_depend>
   <export><build_type>ament_python</build_type></export>
 </package>

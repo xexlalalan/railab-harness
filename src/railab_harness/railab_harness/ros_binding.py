@@ -288,12 +288,16 @@ def reply_from_msg(rid, message) -> dict:
     return M.refuse(rid, message.code, message.reason)
 
 
+def split_seconds(t: float) -> tuple:
+    """Float seconds -> (sec, nanosec), nanosec in [0, 1e9): THE ONE converter for ROS stamps / durations (2026-11-22:
+    harness_planner.demo.to_msg kept its own copy without the carry — a sample a hair under a whole second encoded as
+    (s, 0), its time fell back ~1 s and the arm node refused "time_from_start must increase strictly")."""
+    sec, nanosec = divmod(int(round(float(t) * 1e9)), 1_000_000_000)
+    return int(sec), int(nanosec)
+
+
 def _put_stamp(stamp, t: float) -> None:
-    sec = int(math.floor(t))
-    nanosec = int(round((t - sec) * 1e9))
-    if nanosec >= 1_000_000_000:
-        sec, nanosec = sec + 1, nanosec - 1_000_000_000
-    stamp.sec, stamp.nanosec = sec, nanosec
+    stamp.sec, stamp.nanosec = split_seconds(t)
 
 
 def state_to_msg(message, state: dict):

@@ -49,13 +49,14 @@ def describe(tr, out):
 def to_msg(tr):
     from builtin_interfaces.msg import Duration
     from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+    from railab_harness.ros_binding import split_seconds   # THE ONE seconds -> (sec, nanosec) converter
     jt = JointTrajectory()
     jt.joint_names = list(JOINT_NAMES)
     for t, q in zip(tr.t, tr.q):
         p = JointTrajectoryPoint()
         p.positions = [float(x) for x in q]
-        sec = int(math.floor(t))
-        p.time_from_start = Duration(sec=sec, nanosec=int(round((t - sec) * 1e9)) % 1000000000)
+        sec, nanosec = split_seconds(t)
+        p.time_from_start = Duration(sec=sec, nanosec=nanosec)
         jt.points.append(p)
     return jt
 
