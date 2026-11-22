@@ -60,8 +60,10 @@ piper:
     traj_stream_speed_percent: 60  # the controller's speed ceiling while a timed trajectory streams (the trajectory's own
                                    # timing limits the motion; 30 % ~ 0.94 rad/s on j1 would clip the 1.40). move_j /
                                    # move_pose requests keep max_speed_percent
-    traj_tracking_error_rad: 0.30  # freeze + fail when |measured - commanded| exceeds this on any joint (0.15 until
-                                   # 2026-11-18, operator: "直接把这个误差也放宽一倍" — with the faster paths)
+    traj_tracking_error_rad: 0.45  # freeze + fail when |measured - commanded| exceeds this on any joint (0.15 until
+                                   # 2026-11-18, operator: "直接把这个误差也放宽一倍" — with the faster paths; 0.30 until
+                                   # 2026-11-22, operator: "单纯把跟踪误差调大" — j1 stopped at 0.301 / 0.379 in its
+                                   # 1.40 rad/s sweeps and recovered)
     traj_start_tol_rad: 0.2        # the first point must be this close to the current joints (0.05 until 2026-11-19)
     traj_max_points: 20000
     # --- e-stop button (2026-10-24): its normally-closed contact carries the 5 V of this USB mouse (lsusb vendor:product);
