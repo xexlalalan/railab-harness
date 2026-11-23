@@ -729,16 +729,19 @@ class Gateway:
                 yaml.safe_dump(doc, f, sort_keys=False)
         return res
 
-    def follow_joints(self, conn, wps_deg, label, abort, speed: float = 1.0, corner_deg=None, blend=False, speeds=None):
+    def follow_joints(self, conn, wps_deg, label, abort, speed: float = 1.0, corner_deg=None, blend=False, speeds=None,
+                      times_s=None):
         """arm.follow_joints: a planner's joint path (corrected-model degrees) -> validated, streamed trajectory
         (`speed` x the teach speed / acceleration, `corner_deg` the stop-at-corner turn: FOLLOW_SPEED_MAX / _CORNER_MAX).
         blend (2026-11-19, THE SMOOTH PATH, the workflow repo's docs/plans/no_pause_motion.md): ONE motion through all
         waypoints, at rest only at the first and the last (trajectory.plan_smooth_path; corner_deg unused); `speeds` =
         one factor per segment (K - 1), each clamped and capped like `speed` (missing = `speed` for every segment).
-        Without blend / speeds: exactly as before."""
+        times_s (2026-11-23, THE TIMED PATH): the caller's own timing, one time per waypoint — streamed as given
+        (trajectory.plan_timed_path; speed / corner_deg unused), every sample within timed_caps().
+        Without blend / speeds / times_s: exactly as before."""
         import numpy as np
-        from harness_planner.demo import load_model, to_msg
-        from harness_planner.trajectory import PlanError, plan_joint_path, plan_smooth_path
+        from harness_planner.demo import load_model
+        from harness_planner.trajectory import PlanError, plan_joint_path, plan_smooth_path, plan_timed_path
         q = self.joints_rad()
         if q is None:
             raise RuntimeError("no arm feedback")
@@ -751,6 +754,10 @@ class Gateway:
             if (not isinstance(speeds, list) or len(speeds) != len(wps_deg) - 1
                     or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in speeds)):
                 raise ValueError("speeds needs %d numbers (one per segment)" % (len(wps_deg) - 1))
+        if times_s is not None:
+            if (not isinstance(times_s, list) or len(times_s) != len(wps_deg)
+                    or any(isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) for x in times_s)):
+                raise ValueError("times_s needs %d numbers (one per waypoint)" % len(wps_deg))
         off = np.array(self.kin.offsets, float)
         W = np.radians(np.array(wps_deg, float)) - off             # corrected-model angles -> controller joints
         lo = np.array([l[0] for l in self.limits]) + 0.02
@@ -773,6 +780,15 @@ class Gateway:
         if d0 > FOLLOW_START_TOL_RAD:
             raise said(RuntimeError("refused: the path starts %.1f deg from the arm; re-plan" % math.degrees(d0)),
                        "the path starts %.1f deg from where the arm is; plan it from the current posture" % math.degrees(d0))
+        if times_s is not None:                          # THE TIMED PATH (2026-11-23): as given, from where the arm is
+            kin, lim = load_model(ROOT)
+            lim.max_joint_vel_rad_s, lim.max_joint_acc_rad_s2 = self.timed_caps()
+            try:
+                tr = plan_timed_path(self.kin, W, times_s, lim, rate_hz=float(self.P.get("traj_rate_hz", 100.0)),
+                                     start_q=qa, from_outside=True, max_points=int(self.P.get("traj_max_points", 20000)))
+            except PlanError as e:
+                raise said(RuntimeError("refused: %s" % e), getattr(e, "detail", ""))
+            return self.stream_plan(tr, label, abort)
         W[0] = qin
         seg_k = None
         if blend:                                        # each segment's factor, like `speed` (THE SMOOTH PATH)
@@ -800,6 +816,23 @@ class Gateway:
                 tr = plan_joint_path(self.kin, W, lim, from_outside=True, corner_deg=corner)
         except PlanError as e:
             raise said(RuntimeError("refused: %s" % e), getattr(e, "detail", ""))
+        return self.stream_plan(tr, label, abort)
+
+    def timed_caps(self):
+        """THE TIMED PATH's caps (2026-11-23), (speed rad/s, acceleration rad/s^2) per joint: the speed = what the gateway
+        plans at most (FOLLOW_VEL_CAP_RAD_S, j1 x FOLLOW_J1_FACTOR), never above the arm node's gate (piper.yaml
+        traj_max_joint_vel_rad_s, j1 x traj_j1_vel_factor; the node refuses past it + 10 %); the acceleration = the
+        smooth path's at the top speed factor (TEACH_ACC_RAD_S2 x FOLLOW_SPEED_MAX, j1 x FOLLOW_J1_FACTOR). Today
+        1.40 / 0.70 rad/s and 2.8 / 1.4 rad/s^2 (j1 / the others)."""
+        import numpy as np
+        f = np.array([FOLLOW_J1_FACTOR, 1.0, 1.0, 1.0, 1.0, 1.0])
+        gate = float(self.P.get("traj_max_joint_vel_rad_s", 0.6)) * np.array(
+            [float(self.P.get("traj_j1_vel_factor", 1.0)), 1.0, 1.0, 1.0, 1.0, 1.0])
+        return np.minimum(FOLLOW_VEL_CAP_RAD_S * f, gate), TEACH_ACC_RAD_S2 * FOLLOW_SPEED_MAX * f
+
+    def stream_plan(self, tr, label, abort):
+        """A planned trajectory through /arm/follow_trajectory as this job; the abort event cancels it (the arm freezes)."""
+        from harness_planner.demo import to_msg
         if not self.ac_t.wait_for_server(timeout_sec=3.0):
             raise RuntimeError("/arm/follow_trajectory not available")
         g = self.FollowTrajectory.Goal(trajectory=to_msg(tr), label=label or "twin path")
@@ -1665,10 +1698,13 @@ class Conn(socketserver.StreamRequestHandler):
             wps, label = a.get("waypoints_model_deg"), str(a.get("label") or "")
             speed, corner = float(a.get("speed") or 1.0), a.get("corner_deg")
             blend, speeds = bool(a.get("blend")), a.get("speeds")          # THE SMOOTH PATH (2026-11-19)
+            times = a.get("times_s")                                       # THE TIMED PATH (2026-11-23)
             if speeds is not None and not blend:
                 raise ValueError("speeds needs blend: true")
+            if times is not None and (blend or speeds is not None):
+                raise ValueError("times_s excludes blend and speeds")
             return self.job("arm.follow_joints",
-                            lambda ev: gw.follow_joints(self, wps, label, ev, speed, corner, blend, speeds))
+                            lambda ev: gw.follow_joints(self, wps, label, ev, speed, corner, blend, speeds, times))
         if cmd == "arm.gripper":
             self.need("control")
             from harness_msgs.srv import SetGripper

@@ -789,3 +789,90 @@ def _span_min(lim_seg, ja, jb):
     for i in wide:
         out[i] = lim_seg[lo[i]:hi[i] + 1].min(axis=0)
     return out
+
+
+# ---------------------------------------------------------------------------------- the timed path
+# THE TIMED PATH (2026-11-23, the station's hand SHAKE: the base joint alone oscillating ~±0.85° at 2 Hz for 60 s; the
+# re-timed paths stop at every reversal and the smooth path rounds such a shake flat): arm.follow_joints {times_s} = the
+# caller's own timing, one time per waypoint. NO re-timing, NO corner rounding: a C2 cubic spline through every knot
+# (clamped: zero velocity at both ends; position, velocity and acceleration continuous), sampled at the arm node's stream
+# rate. Checked, never changed: at rest at both ends (the first / last segment's speed), the spline within dev_rad of the
+# knots' straight lines (knots dense enough that what the twin checked is what streams), every sample's joint limits,
+# speed and acceleration within lim's (one number or one per joint), the point count. The arm's offset from the first
+# waypoint (within the caller's start tolerance) is faded out over the first fade_s (minimum jerk; refused when the fade
+# alone would break a cap), so the stream starts exactly where the arm is.
+TIMED_REST_DEG_S = 0.5            # the first / last segment of a timed path: at rest = no joint faster than this
+TIMED_DEV_RAD = SMOOTH_DEV_RAD    # the streamed curve within this of the knots' straight lines, per joint
+TIMED_FADE_S = 0.5                # the arm's offset from the first waypoint faded out over this (at most half the path)
+
+
+def plan_timed_path(kin, waypoints, times_s, lim: Limits, rate_hz: float = 100.0, start_q=None,
+                    from_outside: bool = False, max_points=None, rest_deg_s: float = TIMED_REST_DEG_S,
+                    dev_rad: float = TIMED_DEV_RAD, fade_s: float = TIMED_FADE_S) -> Trajectory:
+    """THE TIMED PATH: waypoints (rad, K x 6) at times_s (K seconds from the path's start: the first 0, strictly
+    increasing) streamed as given — a clamped C2 cubic spline through every knot sampled at rate_hz, no re-timing, no
+    rounding. start_q: where the arm is (its offset from waypoint 0 faded out over the first fade_s). lim's joint speed /
+    acceleration = the caps every sample keeps (one number or one per joint). Raises PlanError (<= 10 words) naming the
+    number; validated like every other trajectory."""
+    import time as _time
+    t_start = _time.perf_counter()
+    W = np.asarray(waypoints, float)
+    T = np.asarray(times_s, float)
+    if W.ndim != 2 or W.shape[1] != 6 or len(W) < 2:
+        raise PlanError("a timed path needs at least 2 waypoints", "of 6 joints")
+    if T.shape != (len(W),) or not np.isfinite(T).all() or not np.isfinite(W).all():
+        raise PlanError("times_s needs one number per waypoint", "%d waypoints" % len(W))
+    if abs(T[0]) > 1e-9:
+        raise PlanError("times_s must start at 0", "it starts at %.6f s" % T[0])
+    dT = np.diff(T)
+    if (dT <= 0).any():
+        k = int(np.argmax(dT <= 0))
+        raise PlanError("times_s must increase strictly (waypoint %d)" % (k + 2), "%.6f s after %.6f s" % (T[k + 1], T[k]))
+    rest = math.radians(rest_deg_s)
+    v_in, v_out = (float(np.abs(W[1] - W[0]).max() / dT[0]), float(np.abs(W[-1] - W[-2]).max() / dT[-1]))
+    if v_in > rest:
+        raise PlanError("path not at rest at its start (%.1f deg/s)" % math.degrees(v_in),
+                        "the first segment's fastest joint; at most %.1f deg/s" % rest_deg_s)
+    if v_out > rest:
+        raise PlanError("path not at rest at its end (%.1f deg/s)" % math.degrees(v_out),
+                        "the last segment's fastest joint; at most %.1f deg/s" % rest_deg_s)
+    D = float(T[-1])
+    n = max(2, int(math.ceil(D * rate_hz)) + 1)
+    if max_points is not None and n > int(max_points):
+        raise PlanError("path too long: %d samples > %d" % (n, int(max_points)),
+                        "%.1f s at %.0f Hz" % (D, rate_hz))
+    t = np.linspace(0.0, D, n)
+    sp = CubicSpline(T, W, axis=0, bc_type="clamped")
+    q = sp(t)
+    q[0], q[-1] = W[0], W[-1]
+    ql = np.column_stack([np.interp(t, T, W[:, j]) for j in range(6)])
+    e = np.abs(q - ql)
+    dev = float(e.max())
+    if dev > dev_rad:
+        i = int(e.max(axis=1).argmax())
+        raise PlanError("knots too sparse: %.2f deg off their lines" % math.degrees(dev),
+                        "t = %.2f s; send more waypoints" % t[i])
+    off = 0.0
+    tf = min(fade_s, D / 2.0)
+    if start_q is not None:
+        d = np.asarray(start_q, float) - W[0]
+        off = float(np.abs(d).max())
+        if off > 1e-12:
+            vlim, alim = _per_joint(lim.max_joint_vel_rad_s), _per_joint(lim.max_joint_acc_rad_s2)
+            r = max(float((1.875 * np.abs(d) / tf / vlim).max()), float((5.774 * np.abs(d) / tf ** 2 / alim).max()))
+            if r > 0.5:                                   # the fade alone may take at most half a cap
+                raise PlanError("the path starts %.1f deg from the arm" % math.degrees(off),
+                                "faded out over %.2f s it would take %.0f %% of a joint cap" % (tf, 100 * r))
+            tau = np.clip(t / tf, 0.0, 1.0)
+            q += np.outer(1.0 - (10 * tau ** 3 - 15 * tau ** 4 + 6 * tau ** 5), d)
+    traj = Trajectory(t, q, [("timed path", 0, len(t))], {})
+    traj.report = validate(kin, traj, lim, from_outside=from_outside)
+    traj.report.update({
+        "timed": True, "segments": 1, "samples": len(t), "rate_hz": rate_hz, "duration_s": round(D, 3),
+        "waypoints": len(W), "interp": "cubic spline C2, clamped (at rest) ends",
+        "max_knot_line_deviation_deg": round(math.degrees(dev), 4), "start_offset_deg": round(math.degrees(off), 3),
+        "start_fade_s": round(tf, 3) if off > 1e-12 else 0.0,
+        "caps_speed_rad_s": [round(float(x), 3) for x in _per_joint(lim.max_joint_vel_rad_s)],
+        "caps_acc_rad_s2": [round(float(x), 3) for x in _per_joint(lim.max_joint_acc_rad_s2)],
+        "plan_s": round(_time.perf_counter() - t_start, 3)})
+    return traj
