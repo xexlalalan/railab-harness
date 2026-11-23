@@ -109,8 +109,8 @@ NOT_PORTED = {
 TEACH_VEL_RAD_S, TEACH_ACC_RAD_S2 = 0.35, 0.7   # joint speed / acceleration at factor 1
 SPEED_MIN, SPEED_MAX = 0.25, 2.0                # a segment's factor (the gateway: max(0.25, min(FOLLOW_SPEED_MAX, k)))
 FOLLOW_VEL_CAP_RAD_S = 0.70                     # under the arm node's gate piper.yaml traj_max_joint_vel_rad_s 0.75
-FOLLOW_J1_FACTOR = 2.0                          # the base joint at twice the others' speed and acceleration (the node's
-                                                # gate: traj_j1_vel_factor)
+# each joint x its factor of THE PER-JOINT SPEED FACTORS (2026-11-23): piper.yaml traj_joint_vel_factors, read through
+# harness_arm.kinematics.joint_vel_factors from this model's P — no copy here (the j1 factor's copy is gone)
 
 
 class PathRefused(Exception):
@@ -219,10 +219,11 @@ class ArmModel:
         """The timed trajectory (controller joints, rad) through every waypoint, each segment at its own factor:
         THE COPY of the old gateway's blend branch (see the constants above). Raises PathRefused."""
         import numpy as np
+        from harness_arm.kinematics import joint_vel_factors
         from harness_planner.trajectory import PlanError, plan_smooth_path
 
         ks = np.array(speeds, float)
-        f = np.array([FOLLOW_J1_FACTOR, 1.0, 1.0, 1.0, 1.0, 1.0])     # j1 first (THE BASE JOINT TWICE AS FAST)
+        f = joint_vel_factors(self.P)                                   # THE PER-JOINT SPEED FACTORS (piper.yaml)
         sv = np.minimum(TEACH_VEL_RAD_S * ks, FOLLOW_VEL_CAP_RAD_S)[:, None] * f
         sa = (TEACH_ACC_RAD_S2 * ks)[:, None] * f
         try:

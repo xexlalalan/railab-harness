@@ -23,7 +23,8 @@ sys.path[:0] = [os.path.join(ROOT, "src", p) for p in ("railab_harness", "harnes
 
 import numpy as np  # noqa: E402
 
-from harness_arm.kinematics import PiperKinematics  # noqa: E402
+import yaml  # noqa: E402
+from harness_arm.kinematics import PiperKinematics, joint_vel_factors  # noqa: E402
 from harness_modules import arm_module as A  # noqa: E402
 from harness_planner.trajectory import Limits  # noqa: E402
 from railab_harness import messages as M  # noqa: E402
@@ -39,7 +40,9 @@ SYNTH_MDH = [(0.123, 0.0, 0.0, 0.0), (0.0, 0.0, -math.pi / 2, -3.0058), (0.0, 0.
 OFFSETS = [0.0, 0.0, 0.0, 0.0, math.radians(7.5), 0.0]   # a joint-5 zero offset, as calib/kinematics.yaml has
 START_RAD = [0.2, 1.2, -1.0, 0.1, 0.3, -0.2]            # where the fake arm stands (controller joints)
 GAP_MAX_MM = 89.6
-CAP_RAD_S = [A.FOLLOW_VEL_CAP_RAD_S * A.FOLLOW_J1_FACTOR] + [A.FOLLOW_VEL_CAP_RAD_S] * 5   # at factor 2
+with open(os.path.join(ROOT, "src", "harness_arm", "config", "piper.yaml")) as _f:   # THE PER-JOINT SPEED FACTORS:
+    FACTORS = yaml.safe_load(_f)["piper"]["ros__parameters"]["traj_joint_vel_factors"]  # the arm node's own list
+CAP_RAD_S = list(A.FOLLOW_VEL_CAP_RAD_S * joint_vel_factors({"traj_joint_vel_factors": FACTORS}))   # at factor 2
 RID = itertools.count(1)
 
 
@@ -574,7 +577,8 @@ def main():
     lim = Limits(tcp_offset_m=0.1441, floor_enabled=False, workspace_min=(-5.0, -5.0, -5.0),
                  workspace_max=(5.0, 5.0, 5.0), ik_margin_rad=0.02)
     c = types.SimpleNamespace(bus=LocalBus(), fake=FakeArm(), progress=collections.defaultdict(list))
-    c.model = A.ArmModel(PiperKinematics(SYNTH_MDH, OFFSETS), lim, {"gripper_max_m": GAP_MAX_MM / 1000.0})
+    c.model = A.ArmModel(PiperKinematics(SYNTH_MDH, OFFSETS), lim, {"gripper_max_m": GAP_MAX_MM / 1000.0,
+                                                                    "traj_joint_vel_factors": FACTORS})
 
     def heard(state):
         if state.get("current"):

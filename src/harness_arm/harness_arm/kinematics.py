@@ -25,6 +25,18 @@ JOINT_LIMITS_RAD = [(-2.687, 2.687), (0.0, 3.403), (-3.054, 0.0),
                     (-1.745, 1.745), (-1.222, 1.222), (-2.094, 2.094)]
 
 
+def joint_vel_factors(P) -> np.ndarray:
+    """THE PER-JOINT SPEED FACTORS (2026-11-23): piper.yaml `traj_joint_vel_factors` = each joint's speed AND acceleration
+    as a multiple of the common number — the arm node's gate (traj_max_joint_vel_rad_s x it), the gateway's and the arm
+    module's planned caps (speed and acceleration). THE ONE READER (the node, tools/gateway_server.py, arm_module).
+    Missing = 1 for every joint. Today [2, 1, 1, 1, 3, 3]: the base joint twice (2026-11-19), the two wrist joints next to
+    the gripper three times (2026-11-23)."""
+    f = np.asarray(P.get("traj_joint_vel_factors", [1.0] * 6), float).reshape(-1)
+    if f.shape != (6,) or not np.all(np.isfinite(f)) or (f <= 0).any():
+        raise ValueError("traj_joint_vel_factors needs six positive numbers")
+    return f
+
+
 def _link(d, a, alpha, theta):
     ca, sa, ct, st = math.cos(alpha), math.sin(alpha), math.cos(theta), math.sin(theta)
     return np.array([[ct, -st, 0.0, a],

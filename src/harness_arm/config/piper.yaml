@@ -55,11 +55,22 @@ piper:
     traj_rate_hz: 100.0            # move_j re-targeted this often while a trajectory runs
     traj_max_joint_vel_rad_s: 0.75 # refuse trajectories faster than this (+10 %) between points (0.6 until 2026-11-18,
                                    # operator: "保持网关上限速度，把机械臂节点的速度硬上限提高" — the gateway's paths at 0.70)
-    traj_j1_vel_factor: 2.0        # the base joint's gate = traj_max_joint_vel_rad_s x this (2026-11-19, operator: "机械臂基座那个
-                                   # 关节，速度加倍": the gateway plans j1 at 2 x the others, 1.40 rad/s at its speed 2)
-    traj_stream_speed_percent: 60  # the controller's speed ceiling while a timed trajectory streams (the trajectory's own
-                                   # timing limits the motion; 30 % ~ 0.94 rad/s on j1 would clip the 1.40). move_j /
-                                   # move_pose requests keep max_speed_percent
+    # THE PER-JOINT SPEED FACTORS (2026-11-23) — THE ONE PLACE: j1 … j6's speed AND acceleration as a multiple of the
+    # common number, read by harness_arm.kinematics.joint_vel_factors for the arm node's gate (traj_max_joint_vel_rad_s x
+    # it + 10 %), the gateway's arm.follow_joints (its plain / smooth / timed paths: speed and acceleration caps) and the
+    # middle layer's arm_module. j1 2 (2026-11-19, operator: "机械臂基座那个关节，速度加倍"; was traj_j1_vel_factor, gone),
+    # j5 / j6 3 (2026-11-23, operator: "最靠近夹爪的那两个关节，限速提高3倍", acceleration too): at the gateway's speed 2
+    # 1.40 / 0.70 / 0.70 / 0.70 / 2.10 / 2.10 rad/s, 2.8 / 1.4 / 1.4 / 1.4 / 4.2 / 4.2 rad/s^2
+    traj_joint_vel_factors: [2.0, 1.0, 1.0, 1.0, 3.0, 3.0]
+    traj_stream_speed_percent: 85  # the controller's speed ceiling while a timed trajectory streams (the trajectory's own
+                                   # timing limits the motion). move_j / move_pose requests keep max_speed_percent.
+                                   # THE RULE: the ceiling >= the gate's fastest joint, so nothing the gate passes is
+                                   # clipped. The controller's own per-joint max (read 2026-11-23, firmware S-V1.9-0, all six
+                                   # joints): max_joint_spd 3.0 rad/s (the SDK's top, 0-3000 x 0.001), max_joint_acc 5.0
+                                   # rad/s^2 (the SDK's top, 0-500 x 0.01). The gate's fastest = 0.75 x 1.1 x 3 = 2.475 rad/s
+                                   # (j5 / j6) = 82.5 % of 3.0 -> 85 % (2.55 rad/s; 4.25 rad/s^2 if the percent scales the
+                                   # acceleration too, >= the planned 4.2). 30 until 2026-11-19, 60 until 2026-11-23 (1.80
+                                   # rad/s: would clip j5 / j6's planned 2.10)
     traj_tracking_error_rad: 0.45  # freeze + fail when |measured - commanded| exceeds this on any joint (0.15 until
                                    # 2026-11-18, operator: "直接把这个误差也放宽一倍" — with the faster paths; 0.30 until
                                    # 2026-11-22, operator: "单纯把跟踪误差调大" — j1 stopped at 0.301 / 0.379 in its

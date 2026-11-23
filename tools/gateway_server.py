@@ -168,10 +168,11 @@ FOLLOW_SPEED_MAX, FOLLOW_CORNER_MAX = 2.0, 45.0
 # "point 329: joint 5 would turn at 0.70 rad/s > 0.66" when it was 0.6; the operator then raised it to 0.75): the path is
 # planned to at most this = 2 x TEACH_VEL_RAD_S
 FOLLOW_VEL_CAP_RAD_S = 0.70
-# THE BASE JOINT TWICE AS FAST (2026-11-19, operator: "机械臂基座那个关节，速度加倍"): arm.follow_joints plans j1 with
-# FOLLOW_J1_FACTOR x the others' speed AND acceleration (the cap too: 1.40 rad/s at speed 2) — the arm node's gate
-# follows (piper.yaml traj_j1_vel_factor), and the controller's ceiling while it streams (traj_stream_speed_percent)
-FOLLOW_J1_FACTOR = 2.0
+# THE PER-JOINT SPEED FACTORS (2026-11-23; THE BASE JOINT TWICE AS FAST of 2026-11-19 folded in): arm.follow_joints
+# plans every joint at its factor x the speed AND acceleration above (the cap too) — piper.yaml traj_joint_vel_factors,
+# read by harness_arm.kinematics.joint_vel_factors (the arm node's gate reads the same list; no copy here):
+# [2, 1, 1, 1, 3, 3] = 1.40 / 0.70 / 0.70 / 0.70 / 2.10 / 2.10 rad/s at speed 2. The controller's ceiling while it
+# streams: piper.yaml traj_stream_speed_percent
 FOLLOW_START_TOL_RAD = 0.35      # its first waypoint: this close to where the arm is (0.1 until 2026-11-19, relaxed)
 FOLLOW_CLAMP_RAD = math.radians(10.0)  # waypoints beyond the controller limits by up to this are clamped inside (3 until 2026-11-19)
 FOLLOW_RECOVER_RAD = math.radians(20.0) # an arm held past a limit by up to this: the path first brings it back inside (6 until 2026-11-19)
@@ -740,6 +741,7 @@ class Gateway:
         (trajectory.plan_timed_path; speed / corner_deg unused), every sample within timed_caps().
         Without blend / speeds / times_s: exactly as before."""
         import numpy as np
+        from harness_arm.kinematics import joint_vel_factors
         from harness_planner.demo import load_model
         from harness_planner.trajectory import PlanError, plan_joint_path, plan_smooth_path, plan_timed_path
         q = self.joints_rad()
@@ -802,7 +804,7 @@ class Gateway:
         from harness_planner.trajectory import CORNER_DEG
         k = max(0.25, min(FOLLOW_SPEED_MAX, float(speed or 1.0)))
         v = min(TEACH_VEL_RAD_S * k, FOLLOW_VEL_CAP_RAD_S)
-        f = np.array([FOLLOW_J1_FACTOR, 1.0, 1.0, 1.0, 1.0, 1.0])     # j1 first (THE BASE JOINT TWICE AS FAST)
+        f = joint_vel_factors(self.P)                    # THE PER-JOINT SPEED FACTORS (piper.yaml)
         lim.max_joint_vel_rad_s = v * f
         lim.max_joint_acc_rad_s2 = TEACH_ACC_RAD_S2 * k * f
         corner = max(CORNER_DEG, min(FOLLOW_CORNER_MAX, float(corner_deg or CORNER_DEG)))
@@ -819,15 +821,15 @@ class Gateway:
         return self.stream_plan(tr, label, abort)
 
     def timed_caps(self):
-        """THE TIMED PATH's caps (2026-11-23), (speed rad/s, acceleration rad/s^2) per joint: the speed = what the gateway
-        plans at most (FOLLOW_VEL_CAP_RAD_S, j1 x FOLLOW_J1_FACTOR), never above the arm node's gate (piper.yaml
-        traj_max_joint_vel_rad_s, j1 x traj_j1_vel_factor; the node refuses past it + 10 %); the acceleration = the
-        smooth path's at the top speed factor (TEACH_ACC_RAD_S2 x FOLLOW_SPEED_MAX, j1 x FOLLOW_J1_FACTOR). Today
-        1.40 / 0.70 rad/s and 2.8 / 1.4 rad/s^2 (j1 / the others)."""
+        """THE TIMED PATH's caps (2026-11-23), (speed rad/s, acceleration rad/s^2) per joint, each x its factor of THE
+        PER-JOINT SPEED FACTORS (piper.yaml traj_joint_vel_factors): the speed = what the gateway plans at most
+        (FOLLOW_VEL_CAP_RAD_S), never above the arm node's gate (traj_max_joint_vel_rad_s; the node refuses past it
+        + 10 %); the acceleration = the smooth path's at the top speed factor (TEACH_ACC_RAD_S2 x FOLLOW_SPEED_MAX).
+        Today [1.40, 0.70, 0.70, 0.70, 2.10, 2.10] rad/s and [2.8, 1.4, 1.4, 1.4, 4.2, 4.2] rad/s^2."""
         import numpy as np
-        f = np.array([FOLLOW_J1_FACTOR, 1.0, 1.0, 1.0, 1.0, 1.0])
-        gate = float(self.P.get("traj_max_joint_vel_rad_s", 0.6)) * np.array(
-            [float(self.P.get("traj_j1_vel_factor", 1.0)), 1.0, 1.0, 1.0, 1.0, 1.0])
+        from harness_arm.kinematics import joint_vel_factors
+        f = joint_vel_factors(self.P)
+        gate = float(self.P.get("traj_max_joint_vel_rad_s", 0.6)) * f
         return np.minimum(FOLLOW_VEL_CAP_RAD_S * f, gate), TEACH_ACC_RAD_S2 * FOLLOW_SPEED_MAX * f
 
     def stream_plan(self, tr, label, abort):

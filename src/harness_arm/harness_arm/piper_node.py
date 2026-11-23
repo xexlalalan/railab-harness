@@ -60,12 +60,13 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rcl_interfaces.msg import ParameterDescriptor
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
 from std_srvs.srv import Trigger
 
 from harness_msgs.action import FollowTrajectory, MoveJ, MovePose
-from harness_arm.kinematics import PiperKinematics, T_from_xyzrpy, xyzrpy_from_T, pose_error
+from harness_arm.kinematics import PiperKinematics, T_from_xyzrpy, xyzrpy_from_T, pose_error, joint_vel_factors
 from harness_msgs.msg import ArmStatus, GripperStatus
 from harness_msgs.srv import GripperCalibrate, SetGripper, SetJoints, SetSpeed
 
@@ -181,13 +182,15 @@ class PiperNode(Node):
             ("kinematics_file", ""), ("kinematics_model", "piper"), ("ik_limit_margin_rad", 0.02),
             ("linear_step_m", 0.02), ("linear_step_rad", 0.1), ("stall_s", 2.0), ("pose_total_jump_rad", 2.5),
             ("traj_rate_hz", 100.0), ("traj_max_joint_vel_rad_s", 0.6), ("traj_tracking_error_rad", 0.15),
-            ("traj_j1_vel_factor", 1.0), ("traj_stream_speed_percent", 30),
+            ("traj_joint_vel_factors", [1.0] * 6, ParameterDescriptor(dynamic_typing=True)),  # 2 or 2.0 both
+            ("traj_stream_speed_percent", 30),
             ("traj_start_tol_rad", 0.05), ("traj_max_points", 20000),
             ("smooth_joint_vel_rad_s", 3.0), ("smooth_tool_vel_m_s", 0.5), ("smooth_tool_vel_rad_s", 3.0),
             ("smooth_acc_per_s", 2.0), ("smooth_knot_s", 0.04), ("smooth_knot_jump_rad", 0.15),
             ("estop_usb_id", ""), ("estop_poll_s", 0.02),
         ])
         self.P = {x.name: x.value for x in p}
+        self.vel_f = joint_vel_factors(self.P)   # THE PER-JOINT SPEED FACTORS (a bad list: the node does not start)
         self.cb = ReentrantCallbackGroup()
         self.sdk = threading.Lock()      # serialises SDK *commands*
         self.motion = threading.Lock()   # one motion goal at a time
@@ -1167,12 +1170,11 @@ class PiperNode(Node):
             i, j = bad[0]
             return f"point {i}: joint {j + 1} at {math.degrees(q[i, j]):.1f} deg is outside its limits"
         v = np.abs(np.diff(q, axis=0)) / np.diff(t)[:, None]
-        vmax = float(self.P["traj_max_joint_vel_rad_s"]) * 1.1 * np.ones(6)
-        vmax[0] *= float(self.P["traj_j1_vel_factor"])        # the base joint's own (2026-11-19: twice the others)
+        # each joint's own: traj_max_joint_vel_rad_s x its traj_joint_vel_factors (2026-11-23; j1 2, j5 / j6 3) + 10 %
+        vmax = float(self.P["traj_max_joint_vel_rad_s"]) * 1.1 * self.vel_f
         if (v > vmax).any():
             i, j = np.unravel_index((v / vmax).argmax(), v.shape)
-            return (f"point {i + 1}: joint {j + 1} would turn at {v[i, j]:.2f} rad/s > {vmax[j]:.2f} "
-                    f"(traj_max_joint_vel_rad_s{' x traj_j1_vel_factor' if j == 0 else ''} + 10 %)")
+            return f"point {i + 1}: joint {j + 1} at {v[i, j]:.2f} rad/s > {vmax[j]:.2f}"
         for i in (range(len(t)) if geometry else ()):
             with warnings.catch_warnings():          # a level gripper is exactly at the rpy gimbal lock; the rotation is still right
                 warnings.simplefilter("ignore", UserWarning)
@@ -1246,7 +1248,8 @@ class PiperNode(Node):
             if not all(s["enabled"]):
                 return False, "arm is not enabled (harness arm hold first)", 0.0, 0.0
             # the controller's own ceiling while a TIMED trajectory streams (its timing limits the motion):
-            # traj_stream_speed_percent (2026-11-19: 60, so the base joint's 1.4 rad/s is not clipped; was max_speed_percent 30)
+            # traj_stream_speed_percent (2026-11-19: 60, so the base joint's 1.4 rad/s is not clipped; was max_speed_percent 30;
+            # 2026-11-23: 85, so nothing the gate passes is clipped — j5 / j6 up to 2.475 rad/s; see piper.yaml)
             speed = max(int(self.P["max_speed_percent"]), int(self.P["traj_stream_speed_percent"]))
             with self.sdk:
                 self.robot.set_speed_percent(speed)
