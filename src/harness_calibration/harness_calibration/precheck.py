@@ -43,6 +43,19 @@ REPOSE_VIEW_MM = 25.0                            # each reachable view above MIN
 REPOSE_TRAVEL_MAX_MM = 400.0                     # the fingertip + camera travel at most this on a re-pose (a cluttered
                                                  # cell: the harness knows only the floor and the target)
 
+# THE STOP (2026-11-22): the gateway's background start-posture check runs while the arm is idle; a job / a run command
+# that starts meanwhile must not wait for it (the next path's plan_smooth_path was ~5 s late on a round of the re-pose
+# search). `stop` (a callable, optional; the routines pass none) is polled before every view and every re-pose candidate:
+# True = raise Interrupted at once, no result.
+class Interrupted(Exception):
+    """The check was stopped by its caller's `stop()` (no result)."""
+
+
+def _check_stop(stop):
+    if stop is not None and stop():
+        raise Interrupted()
+
+
 TARGET_CLEAR_M = 0.06                            # the tip / camera keep this from the target's plane on the way
 PLAIN_FIX = "the arm will first turn its wrist to a better position by itself (the camera stays on the board)"
 PLAIN_FIX_PROGRESS = "turning the wrist to a better position first (the camera stays on the board)"
@@ -85,15 +98,16 @@ def joint_margins(kin, q):
              "margin": round(math.degrees(min(v - l, h - v)), 1)} for i, (v, (l, h)) in enumerate(zip(q, kin.limits))]
 
 
-def precheck(kin, q, P, trans=0.04, tilt_deg=15.0, roll_deg=20.0, min_reachable=MIN_REACHABLE):
+def precheck(kin, q, P, trans=0.04, tilt_deg=15.0, roll_deg=20.0, min_reachable=MIN_REACHABLE, stop=None):
     """{ok, reachable, of, joints [{j, value, limit [lo, hi], margin} deg], unreachable [names], why} for joints q (rad,
     the controller's = /joint_states) with model kin (harness_arm PiperKinematics, the corrected one) and the arm node's
-    parameters P (config/piper.yaml)."""
+    parameters P (config/piper.yaml). stop: see Interrupted."""
     joints = joint_margins(kin, q)
     close = sorted([j for j in joints if j["margin"] < math.degrees(REFUSE_MARGIN_RAD)], key=lambda j: j["margin"])
     views = viewpoints(kin.fk(list(q)), trans, math.radians(tilt_deg), math.radians(roll_deg))
     bad, hit = [], {}
     for name, Tv in views:
+        _check_stop(stop)
         why, j = _view_why(kin, q, Tv, P)
         if why:
             bad.append({"view": name, "why": why})
@@ -215,9 +229,10 @@ def vias(kin, P, q0, q1):
 
 
 def repose_search(kin, q, P, X, T_cam_target, trans=0.04, tilt_deg=15.0, roll_deg=20.0, min_reachable=MIN_REACHABLE,
-                  exclude=()):
+                  exclude=(), stop=None):
     """The best posture that keeps the camera on the target (see the module's text), or None: {q, roll_deg, orbit,
-    flip, margin_deg, reachable, of, motion_deg, vias, score}. No motion. exclude = postures tried already."""
+    flip, margin_deg, reachable, of, motion_deg, vias, score}. No motion. exclude = postures tried already. stop: see
+    Interrupted (polled before every candidate)."""
     q = np.asarray(q, float)
     m = float(P.get("ik_limit_margin_rad", 0.02))
     Tc = kin.fk(list(q)) @ X
@@ -242,6 +257,7 @@ def repose_search(kin, q, P, X, T_cam_target, trans=0.04, tilt_deg=15.0, roll_de
             Tc2[:3, 3] = B + Rm @ (Tc[:3, 3] - B)
             Tf2 = Tc2 @ Xi
             for seed, is_flip in seeds:
+                _check_stop(stop)
                 q2, pe, ae = kin.ik(Tf2, list(seed), margin=m)
                 if pe > 1e-3 or ae > 5e-3:
                     continue
@@ -264,7 +280,8 @@ def repose_search(kin, q, P, X, T_cam_target, trans=0.04, tilt_deg=15.0, roll_de
     cands.sort(key=lambda c: c["cost"])
     best = None
     for c in cands[:REPOSE_KEEP]:
-        pc = precheck(kin, c["q"], P, trans=trans, tilt_deg=tilt_deg, roll_deg=roll_deg, min_reachable=min_reachable)
+        pc = precheck(kin, c["q"], P, trans=trans, tilt_deg=tilt_deg, roll_deg=roll_deg, min_reachable=min_reachable,
+                      stop=stop)
         if not pc["ok"]:
             continue
         c = dict(c, reachable=pc["reachable"], of=pc["of"], cost=c["cost"] - REPOSE_VIEW_MM * (pc["reachable"] - min_reachable))
@@ -277,17 +294,17 @@ def repose_search(kin, q, P, X, T_cam_target, trans=0.04, tilt_deg=15.0, roll_de
     return best
 
 
-def assess(kin, q, P, X=None, T_cam_target=None, **kw):
+def assess(kin, q, P, X=None, T_cam_target=None, stop=None, **kw):
     """precheck + the re-pose search: adds fixable, needs_repose, words (plain, for the page) and repose (the plan);
-    ok = the routine can go (as is, or after the re-pose)."""
-    pc = precheck(kin, q, P, **kw)
+    ok = the routine can go (as is, or after the re-pose). stop: see Interrupted."""
+    pc = precheck(kin, q, P, stop=stop, **kw)
     pc.update(fixable=pc["ok"], needs_repose=False, words="", repose=None)
     if pc["ok"]:
         return pc
     if X is None or T_cam_target is None:
         pc["words"] = PLAIN_NO_TARGET
         return pc
-    rp = repose_search(kin, q, P, X, T_cam_target, **kw)
+    rp = repose_search(kin, q, P, X, T_cam_target, stop=stop, **kw)
     if rp is None:
         pc["words"] = PLAIN_FAIL
         return pc

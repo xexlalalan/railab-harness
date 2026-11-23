@@ -10,6 +10,8 @@ Contract: PROJECT_SPEC.md "2026-10-22 — Twin control gateway".
   {"id": 4, "cmd": "arm.check_j", "args": {"joints_deg": [...]}}     dry run, nothing moves
   {"id": 5, "cmd": "arm.move_j", "args": {"joints_deg": [...], "speed_percent": 10}}
   {"id": 6, "cmd": "arm.hold"} / "arm.gripper" {gap_mm, force_n, speed_mm_s?: ramped, else full speed} / "bunny.housing" {to} / "bunny.platform" {steps}
+      arm.gripper + "end": "contact" (2026-11-22, a close): the ramp stops at contact, the target is set at once, the reply
+      after GRIP_CONTACT_SQUEEZE_S with "contact": true|false; an empty close answers only within 1 mm of the target or stopped
   {"id": 7, "cmd": "arm.jog_pose", "args": {"tip_mm_deg": [x, y, z, rx, ry, rz], "speed_percent": 10}}
   {"id": 8, "cmd": "arm.jog_gripper", "args": {"gap_mm": 30, "force_n": 1}}
       LIVE driving from the twin's sliders: answered at once; the LATEST target wins — the gateway moves the
@@ -86,6 +88,18 @@ PORT = int(os.environ.get("GATEWAY_PORT", 7803))
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 KEY_FILE = os.path.expanduser("~/.config/railab-harness/gateway.key")
 GRIP_RAMP_STEP_M = 0.0015       # arm.gripper speed_mm_s: the ramp's step (within the node's 2 mm tolerance), one every step / speed s
+# arm.gripper {"end": "contact"} (2026-11-22, a real run: a close to 0 mm took ~10 s — the long PLA L fingers with thick
+# rubber pads BEND, so the jaws kept following the ramp, 17 mm past contact on a 23 mm vial, and the node answered only when
+# the motor had finished bending them): the ramp stops AT CONTACT (a step answers stalled, or the jaws, once under way, lag
+# the ramp by more than one step), the final target is set at once at the same effort and the reply comes after
+# GRIP_CONTACT_SQUEEZE_S (the node keeps that target: the squeeze goes on during the lift). Jaws still closing faster than
+# GRIP_FREE_MM_S then = no contact after all (they ran free): waited for like an empty close. AN EMPTY CLOSE answers only
+# once the jaws read within GRIP_DONE_TOL_M of the target or have stopped (GRIP_STILL_M in GRIP_STILL_S) — never early
+# inside the node's 2 mm tolerance (the station calls a gap <= 1 mm "nothing in the jaws"; an empty close reads 0.0).
+GRIP_CONTACT_SQUEEZE_S = 0.8
+GRIP_FREE_MM_S = 10.0
+GRIP_DONE_TOL_M = 0.001
+GRIP_STILL_M, GRIP_STILL_S = 0.0003, 0.4
 PIPER_YAML = os.path.join(ROOT, "src", "harness_arm", "config", "piper.yaml")
 # the calibration / planner packages from source, so a new module there needs no colcon rebuild
 sys.path[:0] = [os.path.join(ROOT, "src", "harness_calibration"), os.path.join(ROOT, "src", "harness_planner")]
@@ -128,8 +142,19 @@ ABS_MIN_CORNERS = 20
 BACKUP_DIR = os.path.join(ROOT, "calib", "handeye_backups")
 ABS_POSITIONS = 5
 PRECHECK_S = 1.0                 # state.calib_precheck: recomputed this often while the arm holds (the joints moved
-PRECHECK_SAME_DEG = 0.2          # ... more than this, or older than PRECHECK_MAX_AGE_S)
+PRECHECK_SAME_DEG = 0.2          # ... more than this, or the target moved and the result is older than PRECHECK_MAX_AGE_S)
 PRECHECK_MAX_AGE_S = 30.0
+PRECHECK_SAME_TARGET_MM, PRECHECK_SAME_TARGET_DEG = 5.0, 2.0     # the target (board / tag) in the camera: "not moved"
+# THE CHECK STEPS ASIDE (2026-11-22, a real run: the next path started ~5 s late — the start-posture check's re-pose search,
+# 24 rolls x 9 orbits, ran in this process beside arm.follow_joints' plan_smooth_path on a busy 4-core i5): no round while a
+# job / a gateway motion / a live jog / a RUN COMMAND runs, nor within PRECHECK_HOLDOFF_S after the last run command began or
+# ended (a station run = a chain of these with gaps of ~0.1-3 s: arrival checks, the Bunny's state reads; a dose is a job);
+# a round under way stops between two candidates when one starts (precheck.Interrupted; the state keeps the last result).
+# And an idle arm is not re-assessed every PRECHECK_MAX_AGE_S any more: only when the joints or the target moved.
+PRECHECK_HOLDOFF_S = 10.0
+RUN_CMDS = frozenset(("arm.move_j", "arm.follow_joints", "arm.move_linear", "arm.move_tip", "arm.gripper", "teach.fine",
+                      "bunny.housing", "bunny.platform", "bunny.platform_set", "bunny.tare", "bunny.weigh_to",
+                      "bunny.dispense_volume"))
 CHARUCO_JOINTS_DT_S = 0.2        # camera.charuco.pose_base: the joints sample used was received at most this far from the
                                  # board's frame (the joints arrive at 100 Hz; a moving arm would skew the pose)
 HANDEYE_SETTLE_S = 3.0           # wait after every hand-eye move before the images (operator: the arm shakes ~3 s)
@@ -385,6 +410,76 @@ class Gateway:
             return None, None
         return [float(best[1].position[best[1].name.index(j)]) for j in JOINTS], abs(best[0] - t)
 
+    def grip_to_contact(self, gap, force, speed, g):
+        """arm.gripper {end: "contact"}, a close (see GRIP_CONTACT_SQUEEZE_S; g = the jaws' last reading or None) ->
+        {gap_mm, stalled, contact, message}: gap_mm = the jaws' reading when answering; contact = something holds them
+        short of the target (stalled = contact)."""
+        from harness_msgs.srv import SetGripper
+        t0 = time.time()
+        timeout = float(self.P.get("gripper_timeout_s", 10.0))
+        at = None                                        # the jaws' reading at contact (m)
+        if speed > 0 and g is not None and float(g.width_m) - gap > GRIP_RAMP_STEP_M:      # a ramped close
+            w0 = w = float(g.width_m)
+            t_last = time.time()
+            while w - gap > GRIP_RAMP_STEP_M:
+                w -= GRIP_RAMP_STEP_M
+                r = self.call(SetGripper, "/arm/gripper", SetGripper.Request(width_m=w, force=force, timeout_s=2.0), 10)
+                t_last += GRIP_RAMP_STEP_M / speed
+                time.sleep(max(0.0, t_last - time.time()))
+                gn = self.fresh("grip", 2.0)
+                now_w = float(gn.width_m) if gn is not None else float(r.width_m)
+                # (lag counts once the jaws are under way: a slow start is not a contact; held at the start = stalled)
+                if r.stalled or (gn is not None and w0 - now_w >= GRIP_RAMP_STEP_M and now_w > w + GRIP_RAMP_STEP_M):
+                    at = now_w
+                    break
+        if at is not None:
+            # the final target at once, at the same effort (the node's answer not awaited: 0.1 s); the node keeps it
+            # after this reply, so the squeeze goes on during the lift
+            t_sq = time.time()
+            self.call(SetGripper, "/arm/gripper", SetGripper.Request(width_m=gap, force=force, timeout_s=0.1), 10)
+            got = self.grip_wait(gap, t_sq + timeout, t_min=GRIP_CONTACT_SQUEEZE_S, since=t_sq,
+                                 still_m=GRIP_FREE_MM_S / 1000.0 * 0.1, still_s=0.1)
+            if got is not None and got - gap > GRIP_DONE_TOL_M:
+                msg = "contact at %.1f mm, held at %.1f mm" % (at * 1000, got * 1000)
+                print("arm.gripper: %s (%.2f s)" % (msg, time.time() - t0), flush=True)
+                return {"gap_mm": round(got * 1000, 2), "stalled": True, "contact": True, "message": msg}
+            print("arm.gripper: lag at %.1f mm, then closed to the target: no contact" % (at * 1000), flush=True)
+        # no contact on the way (an empty close, no ramp, an opening): the final target, the node's own answer, then
+        # never early inside its tolerance
+        r = self.call(SetGripper, "/arm/gripper", SetGripper.Request(width_m=gap, force=force), timeout + 10)
+        if not r.success:
+            raise RuntimeError(r.message)
+        if r.stalled:
+            got = float(r.width_m)
+        else:
+            got = self.grip_wait(gap, time.time() + 2.0, still_m=GRIP_STILL_M, still_s=GRIP_STILL_S)
+            got = float(r.width_m) if got is None else got
+        contact = bool(r.stalled) and got - gap > GRIP_DONE_TOL_M
+        msg = r.message if r.stalled else "width %.1f mm" % (got * 1000)
+        print("arm.gripper: %s (%.2f s, contact %s)" % (msg, time.time() - t0, contact), flush=True)
+        return {"gap_mm": round(got * 1000, 2), "stalled": bool(r.stalled), "contact": contact, "message": msg}
+
+    def grip_wait(self, gap, deadline, still_m, still_s, t_min=0.0, since=None):
+        """The jaws' reading (m) once t_min has passed (from `since`, default now) and they read within GRIP_DONE_TOL_M of
+        gap or moved less than still_m over the last still_s; at the deadline in any case (None: no reading at all)."""
+        t0 = time.time() if since is None else since
+        hist, w = [], None
+        while True:
+            gn, now = self.fresh("grip", 2.0), time.time()
+            if gn is not None:
+                w = float(gn.width_m)
+                hist.append((now, w))
+                while len(hist) > 2 and now - hist[1][0] >= still_s:
+                    hist.pop(0)                          # (hist[0] = the newest sample at least still_s old)
+                if now - t0 >= t_min:
+                    if abs(w - gap) <= GRIP_DONE_TOL_M:
+                        return w
+                    if now - hist[0][0] >= still_s and abs(w - hist[0][1]) < still_m:
+                        return w
+            if now >= deadline:
+                return w
+            time.sleep(0.02)
+
     def precheck_target(self):
         """The calibration target in the camera (4 x 4, its centre): the ChArUco board when seen with >= 20 corners,
         else the largest tag in view, else None."""
@@ -400,12 +495,13 @@ class Gateway:
             return T_from_pose_msg(max(m.tags, key=lambda t: t.size_px).pose)
         return None
 
-    def update_precheck(self, force=False):
+    def update_precheck(self, force=False, stop=None):
         """state.calib_precheck (2026-11-17 / 18): the calibrations' start-posture check + the re-pose search
         (harness_calibration/precheck.py assess, the same the routines run before any motion) for where the arm holds
         now: the joints' margins always; the 15 views and, when they fail, the search for a posture the arm can turn to
         by itself (keeping the camera on the target) while the arm holds (recomputed when the joints moved). ok = the
-        routine can go (as is or after its own re-pose); words = plain, for the page; why = technical, for the logs."""
+        routine can go (as is or after its own re-pose); words = plain, for the page; why = technical, for the logs.
+        stop (precheck_worker's gate): polled between candidates -> precheck.Interrupted, nothing updated."""
         from harness_calibration import precheck as PC
         from harness_calibration.handeye import VIEW_SET
         now, q = time.time(), self.joints_rad()
@@ -421,15 +517,17 @@ class Gateway:
                   "words": "aim the camera at the board, then press Hold"}
         else:
             last = getattr(self, "_pc_last", None)
-            if (not force and last is not None and now - last[0] < PRECHECK_MAX_AGE_S
-                    and max(abs(a - c) for a, c in zip(q, last[1])) < math.radians(PRECHECK_SAME_DEG)):
+            T = self.precheck_target()
+            if not force and last is not None and precheck_reusable(self, last, q, T, now):
                 pc = last[2]
+                self._pc_last = (now,) + tuple(last[1:])        # still the result for what the arm holds and sees now
             else:
-                pc = PC.assess(self.kin, q, self.P, self.Tfc, self.precheck_target())
+                pc = PC.assess(self.kin, q, self.P, self.Tfc, T, stop=stop)
                 rp = pc.pop("repose")
                 pc["repose"] = None if rp is None else {k: rp[k] for k in ("roll_deg", "orbit", "flip", "margin_deg",
                                                                            "reachable", "of", "motion_deg")}
-                self._pc_last = (now, list(q), pc)
+                # (checked at, joints, result, target, model, hand-eye, computed at); precheck_cached reads the first three
+                self._pc_last = (now, list(q), pc, T, self.kin, self.Tfc, now)
         self.precheck = dict(pc, **base)
         return self.precheck
 
@@ -923,6 +1021,8 @@ ctl = {"conn": None, "motion": None}     # control lease (a Conn) and the gatewa
 jog = {"pose": None, "grip": None, "busy": False, "error": "", "last": None, "ev": threading.Event()}
 # the one running job (calib.handeye / teach.fine / arm.follow_joints) and the last result
 JOB = {"busy": False, "kind": "", "lines": [], "result": None, "proc": None, "abort": threading.Event(), "why": ""}
+# run commands (RUN_CMDS) in flight and when the last one began / ended (THE CHECK STEPS ASIDE); 0.0 = none since the start
+ACT, ACT_LOCK = {"n": 0, "t": 0.0}, threading.Lock()
 
 
 def abort_job(why):
@@ -1156,15 +1256,56 @@ def bunny_failed(what, message, outcome_words):
     return "%s %s" % (what, outcome_words)
 
 
+def precheck_reusable(g, last, q, T, now):
+    """The last assessment still holds (update_precheck): the same joints (PRECHECK_SAME_DEG), the same model and hand-eye,
+    and the target where it was (PRECHECK_SAME_TARGET_MM / _DEG; seen / not seen alike) — a moved target only once the
+    result is PRECHECK_MAX_AGE_S old (a flickering tag must not re-run the search every second)."""
+    import numpy as np
+    if max(abs(a - c) for a, c in zip(q, last[1])) >= math.radians(PRECHECK_SAME_DEG):
+        return False
+    if len(last) < 7 or last[4] is not g.kin or last[5] is not g.Tfc:
+        return False
+    T0 = last[3]
+    if T0 is None and T is None:
+        return True
+    if T0 is not None and T is not None:
+        R = np.asarray(T0)[:3, :3].T @ np.asarray(T)[:3, :3]
+        ang = math.degrees(math.acos(max(-1.0, min(1.0, (float(np.trace(R)) - 1.0) / 2.0))))
+        if (float(np.linalg.norm(np.asarray(T)[:3, 3] - np.asarray(T0)[:3, 3])) * 1000.0 < PRECHECK_SAME_TARGET_MM
+                and ang < PRECHECK_SAME_TARGET_DEG):
+            return True
+    return now - last[6] < PRECHECK_MAX_AGE_S
+
+
+def run_activity(delta):
+    """A run command (RUN_CMDS) began (+1) / ended (-1): precheck_quiet's count and clock."""
+    with ACT_LOCK:
+        ACT["n"] += delta
+        ACT["t"] = time.time()
+
+
+def precheck_quiet():
+    """The start-posture check may run (THE CHECK STEPS ASIDE): no job, no gateway motion, no live jog, no run command
+    in flight, the last one PRECHECK_HOLDOFF_S ago."""
+    if JOB["busy"] or ctl["motion"] or jog["busy"] or jog["pose"] or jog["grip"]:
+        return False
+    with ACT_LOCK:
+        return ACT["n"] <= 0 and time.time() - ACT["t"] >= PRECHECK_HOLDOFF_S
+
+
 def precheck_worker():
-    """state.calib_precheck at ~1 Hz (not while a job moves the arm)."""
+    """state.calib_precheck at ~1 Hz while the harness is quiet (precheck_quiet); a round stops between two candidates
+    when a job or a run command starts (precheck.Interrupted: the state keeps the last full result)."""
+    busy = lambda: not precheck_quiet()   # noqa: E731
     while True:
         time.sleep(PRECHECK_S)
-        if JOB["busy"]:
+        if busy():
             continue
         try:
-            gw.update_precheck()
+            gw.update_precheck(stop=busy)
         except Exception as e:  # noqa: BLE001  the state says it, the worker goes on
+            if type(e).__name__ == "Interrupted":       # (harness_calibration.precheck.Interrupted)
+                continue
             gw.precheck = {"ok": False, "reachable": None, "why": "start-posture check failed: %s" % e, "at": round(time.time(), 2)}
 
 
@@ -1352,6 +1493,9 @@ class Conn(socketserver.StreamRequestHandler):
 
     def dispatch(self, req):
         rid, cmd, args = req.get("id"), req.get("cmd"), req.get("args") or {}
+        run_cmd = cmd in RUN_CMDS                 # (the start-posture check steps aside: precheck_quiet)
+        if run_cmd:
+            run_activity(+1)
         try:
             res = self.run(cmd, args, rid)
             self.send({"id": rid, "ok": True, "result": res})
@@ -1361,6 +1505,9 @@ class Conn(socketserver.StreamRequestHandler):
                 rep["detail"] = e.detail
                 print("%s: %s (%s)" % (cmd, e, e.detail), flush=True)
             self.send(rep)
+        finally:
+            if run_cmd:
+                run_activity(-1)
 
     def need(self, level):
         if level == "key" and self.access != "control":
@@ -1527,7 +1674,12 @@ class Conn(socketserver.StreamRequestHandler):
             from harness_msgs.srv import SetGripper
             gap, force = float(a["gap_mm"]) / 1000.0, float(a.get("force_n") or 0.0)
             speed = float(a.get("speed_mm_s") or 0.0) / 1000.0
+            end = a.get("end")
+            if end not in (None, "", "contact"):
+                raise ValueError('arm.gripper end: "contact" or none')
             g = gw.fresh("grip", 2.0)
+            if end == "contact" and (g is None or gap < float(g.width_m)):     # a close: stop the ramp at contact
+                return gw.grip_to_contact(gap, force, speed, g)
             if speed > 0 and g is not None:
                 # a moderate closing / opening speed (twin 2026-10-25: closed at full speed the vial was gripped wrong):
                 # the gripper has no speed setting, so the target gap is RAMPED from where the jaws are at `speed`,
@@ -1545,7 +1697,10 @@ class Conn(socketserver.StreamRequestHandler):
             r = gw.call(SetGripper, "/arm/gripper", SetGripper.Request(width_m=gap, force=force), 20)
             if not r.success:
                 raise RuntimeError(r.message)
-            return {"gap_mm": round(r.width_m * 1000, 2), "stalled": r.stalled, "message": r.message}
+            out = {"gap_mm": round(r.width_m * 1000, 2), "stalled": r.stalled, "message": r.message}
+            if end:                                      # (an opening asked with end "contact")
+                out["contact"] = bool(r.stalled)
+            return out
         if cmd == "arm.gripper_release":   # the gripper motor only: the jaws go free, the arm keeps holding
             self.need("control")
             jog["grip"] = None
