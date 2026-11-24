@@ -109,6 +109,7 @@ TEACH_TAGS = os.path.join(ROOT, "calib", "teach", "tags.yaml")      # teach.fine
 CV_FAMILIES = ("tag16h5", "tag25h9", "tag36h11")   # the only families stored before 2026-11-16 (records without a family)
 VERSION = 5
 DEADMAN_S = 10.0                 # (3 until 2026-11-19, relaxed: a network hiccup froze the arm)
+PUMP_ERR_LOG_S = 10.0            # a connection's state pump logs a skipped tick at most this often (2026-11-24)
 HOLDER_STALE_S = 10.0     # a control holder silent this long (no ping, no command) can be taken over
 JOINTS = ["joint%d" % i for i in range(1, 7)]
 ARM_ACTIONS = ("/arm/move_j", "/arm/move_pose", "/arm/follow_trajectory")
@@ -405,8 +406,18 @@ class Gateway:
         return v
 
     def joints_near(self, t):
-        """(joints rad, |received - t| s) of the /joint_states sample received nearest to time t, or (None, None)."""
-        best = min(self.joint_hist, key=lambda e: abs(e[0] - t), default=None)
+        """(joints rad, |received - t| s) of the /joint_states sample received nearest to time t, or (None, None).
+        THREAD SAFETY (2026-11-24): the joint-state callback appends to joint_hist while this runs (the state pump, the
+        precheck worker): min() with a Python key over the live deque raised "deque mutated during iteration" and killed
+        the connection's state pump. A snapshot first (list() = one C-level copy under the GIL; retried if it ever races)."""
+        snap = []
+        for _ in range(5):
+            try:
+                snap = list(self.joint_hist)
+                break
+            except RuntimeError:
+                continue
+        best = min(snap, key=lambda e: abs(e[0] - t), default=None)
         if best is None or not all(j in best[1].name for j in JOINTS):
             return None, None
         return [float(best[1].position[best[1].name.index(j)]) for j in JOINTS], abs(best[0] - t)
@@ -1060,10 +1071,13 @@ JOB = {"busy": False, "kind": "", "lines": [], "result": None, "proc": None, "ab
 ACT, ACT_LOCK = {"n": 0, "t": 0.0}, threading.Lock()
 
 
-def abort_job(why):
-    """Stop the running job: its abort flag, SIGINT to its process group, every arm goal cancelled (the arm freezes)."""
+def abort_job(why, caller=""):
+    """Stop the running job: its abort flag, SIGINT to its process group, every arm goal cancelled (the arm freezes).
+    caller (2026-11-24) = who asked (stop / arm.release / nodes.restart / the dead-man and why): logged with the reason
+    in /tmp/gateway.log, so an aborted job's cause is on disk, not only in state.calib."""
     if not JOB["busy"]:
         return False
+    print("%s job aborted: %s - %s (by %s)" % (time.strftime("%H:%M:%S"), JOB["kind"], why, caller or "?"), flush=True)
     JOB["why"] = why
     JOB["abort"].set()
     p = JOB.get("proc")
@@ -1260,7 +1274,7 @@ def nodes_restart(want):
         raise said(ValueError("nodes.restart: unknown node %r" % want), "one of %s or \"all\"" % ", ".join(names))
     if set(todo) & {"piper", "camera", "gateway"}:
         jog["pose"] = jog["grip"] = None
-        abort_job("nodes.restart %s" % want)
+        abort_job("nodes.restart %s" % want, "nodes.restart")
         if "piper" in todo and ctl["motion"]:      # a motion the gateway started (no job): its goal cancelled
             gw.cancel_arm()
     script = "sleep 0.5; " + "; ".join("%s nodes restart %s" % (CLI, n) for n in todo)
@@ -1480,15 +1494,31 @@ class Conn(socketserver.StreamRequestHandler):
                 gw.cancel_arm()
 
     def pump_state(self):
+        # 2026-11-24: one failing tick (gw.state() / json.dumps raising) is skipped, never the end of the pump - the
+        # connection stayed open with no state, the station looked frozen, a reconnect closed the controller and the
+        # dead-man aborted the hand-eye job. One log line per PUMP_ERR_LOG_S at most, with the count since the last one.
+        errs, err_logged = 0, 0.0
         while self.alive:
-            if self.sub_rate > 0:
-                st = gw.state()
-                c = ctl["conn"]
-                st["control"] = {"held_by": c.client if c else None, "you": c is self,
-                                 "jog": {"busy": jog["busy"] or bool(jog["pose"]), "error": jog["error"]}}
-                st["event"], st["t"] = "state", round(time.time(), 3)
-                self.send(st)
-                time.sleep(1.0 / self.sub_rate)
+            rate = self.sub_rate                # read once: a subscribe may set it to 0 meanwhile
+            if rate > 0:
+                try:
+                    st = gw.state()
+                    c = ctl["conn"]
+                    st["control"] = {"held_by": c.client if c else None, "you": c is self,
+                                     "jog": {"busy": jog["busy"] or bool(jog["pose"]), "error": jog["error"]}}
+                    st["event"], st["t"] = "state", round(time.time(), 3)
+                    self.send(st)
+                except Exception as e:     # noqa: BLE001  this tick skipped, the pump goes on
+                    errs += 1
+                    if time.time() - err_logged >= PUMP_ERR_LOG_S:
+                        import traceback
+                        tb = traceback.extract_tb(e.__traceback__)
+                        at = "%s:%d" % (os.path.basename(tb[-1].filename), tb[-1].lineno) if tb else "?"
+                        print("%s state pump %s %s: tick skipped (%d since last line): %s: %s at %s"
+                              % (time.strftime("%H:%M:%S"), self.client, self.peer, errs, type(e).__name__, e, at),
+                              flush=True)
+                        errs, err_logged = 0, time.time()
+                time.sleep(1.0 / rate)
             else:
                 time.sleep(0.2)
 
@@ -1572,7 +1602,7 @@ class Conn(socketserver.StreamRequestHandler):
             return gw.state()
         if cmd == "stop":                  # anyone, never refused
             jog["pose"] = jog["grip"] = None
-            aborted = abort_job("stopped (stop)")
+            aborted = abort_job("stopped (stop)", "stop from %s %s" % (self.client, self.peer))
             r = {"cancelled": gw.cancel_arm(), "job_aborted": aborted}
             b = gw.fresh("bunny", 3.0)
             if b and (b.get("dispensing") or b.get("busy")):
@@ -1638,7 +1668,7 @@ class Conn(socketserver.StreamRequestHandler):
         if cmd == "arm.release":           # operator 2026-10-23: one click; joints 1-6 only, the gripper keeps holding
             self.need("control")
             jog["pose"] = jog["grip"] = None
-            abort_job("the arm was released")
+            abort_job("the arm was released", "arm.release from %s %s" % (self.client, self.peer))
             return gw.trigger("/arm/disable", 15)
         if cmd == "calib.handeye":
             self.need("control")
@@ -1840,7 +1870,10 @@ class Conn(socketserver.StreamRequestHandler):
         def watch():
             while not done.wait(0.1):
                 if not self.alive or time.time() - self.last_rx > DEADMAN_S:
-                    abort_job("dead-man: controller silent for %.0f s - arm frozen" % DEADMAN_S)
+                    abort_job("dead-man: controller silent for %.0f s - arm frozen" % DEADMAN_S,
+                              "dead-man: %s, %s %s" % ("connection closed" if not self.alive else
+                                                       "silent %.1f s" % (time.time() - self.last_rx),
+                                                       self.client, self.peer))
                     with lock:
                         if ctl["conn"] is self:
                             ctl["conn"] = None
@@ -1852,9 +1885,10 @@ class Conn(socketserver.StreamRequestHandler):
                 JOB["result"] = dict(r, kind=kind) if isinstance(r, dict) else r
                 return r
             except Exception as e:     # noqa: BLE001  reported to the caller / in state.calib
-                JOB["result"] = {"ok": False, "kind": kind, "message": str(e)}
+                res = {"ok": False, "kind": kind, "message": str(e)}
                 if getattr(e, "detail", ""):
-                    JOB["result"]["detail"] = e.detail
+                    res["detail"] = e.detail
+                JOB["result"] = res        # whole, never changed after: the state pump's json.dumps may read it now
                 raise
             finally:
                 done.set()
